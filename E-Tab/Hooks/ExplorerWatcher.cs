@@ -34,6 +34,8 @@ public sealed class ExplorerWatcher : IDisposable
     private int _mainExplorerProcessId;
     private Timer? _explorerCheckTimer;
     private Timer? _pollTimer;
+    private nint _eventObjectShowHookId;
+    private WinEventDelegate? _eventObjectShowHookCallback;
     private bool _polling;
     private bool _disposed;
 
@@ -69,6 +71,16 @@ public sealed class ExplorerWatcher : IDisposable
         _shellPathComparer = new ShellPathComparer();
         _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
+
+        _eventObjectShowHookCallback = OnWindowShown;
+        _eventObjectShowHookId = WinApi.SetWinEventHook(
+            WinApi.EVENT_OBJECT_SHOW,
+            WinApi.EVENT_OBJECT_SHOW,
+            0,
+            _eventObjectShowHookCallback,
+            0,
+            0,
+            0);
 
         PollShellCore();
         _pollTimer = new Timer(PollShell, null, 0, 150);
@@ -184,19 +196,61 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            if (_knownTopLevelWindows.Count == 0) return true;
+            if (_knownTopLevelWindows.Count == 0)
+            {
+                Helper.ShowWindow(hwnd, removeCache: true);
+                return true;
+            }
         }
 
         var location = TryGetLocation(item);
         if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
+        {
+            Helper.ShowWindow(hwnd, removeCache: true);
             return true;
+        }
 
         if (GetTabHandle(item) == 0) return false;
-        if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1) return true;
+        if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1)
+        {
+            Helper.ShowWindow(hwnd, removeCache: true);
+            return true;
+        }
 
         Helper.HideWindow(hwnd);
+        ScheduleShowFallback(hwnd);
         _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
         return true;
+    }
+
+    private void OnWindowShown(
+        nint hWinEventHook,
+        uint eventType,
+        nint hWnd,
+        int idObject,
+        int idChild,
+        uint dwEventThread,
+        uint dwmsEventTime)
+    {
+        if (idObject != 0 || idChild != 0) return;
+        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
+
+        lock (_itemsLock)
+        {
+            if (_knownTopLevelWindows.Count < 1) return;
+        }
+
+        Helper.HideWindow(hWnd);
+        ScheduleShowFallback(hWnd);
+    }
+
+    private static void ScheduleShowFallback(nint hWnd)
+    {
+        _ = Task.Delay(3_000).ContinueWith(_ =>
+        {
+            if (Helper.HiddenWindows.ContainsKey(hWnd))
+                Helper.ShowWindow(hWnd, removeCache: true);
+        }, TaskScheduler.Default);
     }
 
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
@@ -268,6 +322,7 @@ public sealed class ExplorerWatcher : IDisposable
                 }
 
                 RemoveItem(item);
+                Helper.HiddenWindows.TryRemove(sourceHwnd, out _);
             }
             else
             {
@@ -592,6 +647,16 @@ public sealed class ExplorerWatcher : IDisposable
             _pollTimer.Dispose();
             _pollTimer = null;
         }
+
+        if (_eventObjectShowHookCallback != null)
+        {
+            WinApi.UnhookWinEvent(_eventObjectShowHookId);
+            _eventObjectShowHookCallback = null;
+        }
+
+        // Never leave windows hidden when the watcher stops.
+        foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
+            Helper.ShowWindow(hWnd, removeCache: true);
 
         lock (_itemsLock)
         {
