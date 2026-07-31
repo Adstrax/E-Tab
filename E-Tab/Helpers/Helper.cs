@@ -114,7 +114,7 @@ public static class Helper
     public static bool ShowWindow(nint hWnd, bool removeCache)
     {
         if (!HiddenWindows.TryGetValue(hWnd, out var originalPos))
-            return false;
+            return WinApi.ShowWindow(hWnd, WinApi.SW_SHOWNOACTIVATE);
 
         if (removeCache)
             HiddenWindows.TryRemove(hWnd, out _);

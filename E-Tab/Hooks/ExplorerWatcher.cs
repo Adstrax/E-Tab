@@ -187,7 +187,7 @@ public sealed class ExplorerWatcher : IDisposable
 
             if (_knownTopLevelWindows.Count == 0)
                 _mainWindowHandle = 0;
-            else if (!_knownTopLevelWindows.Contains(_mainWindowHandle))
+            else if (!_knownTopLevelWindows.Contains(_mainWindowHandle) || !WinApi.IsWindowVisible(_mainWindowHandle))
                 _mainWindowHandle = GetMainWindowHWnd(0);
         }
     }
@@ -208,7 +208,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            if (_knownTopLevelWindows.Count == 0)
+            if (!HasVisibleExplorerWindow(hwnd))
             {
                 Helper.ShowWindow(hwnd, removeCache: true);
                 return true;
@@ -249,12 +249,24 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            if (_knownTopLevelWindows.Count < 1) return;
+            if (_knownTopLevelWindows.Contains(hWnd)) return;
+            if (!HasVisibleExplorerWindow(hWnd)) return;
         }
 
         Helper.HideWindow(hWnd);
         ScheduleShowFallback(hWnd);
         _syncContext.Post(_ => PollShell(null), null);
+    }
+
+    private static bool HasVisibleExplorerWindow(nint except)
+    {
+        foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
+        {
+            if (hWnd == except) continue;
+            if (WinApi.IsWindowVisible(hWnd)) return true;
+        }
+
+        return false;
     }
 
     private static void ScheduleShowFallback(nint hWnd)
@@ -442,19 +454,18 @@ public sealed class ExplorerWatcher : IDisposable
 
     private nint GetMainWindowHWnd(nint otherThan)
     {
-        if (Helper.IsFileExplorerWindow(_mainWindowHandle))
+        if (Helper.IsFileExplorerWindow(_mainWindowHandle) && WinApi.IsWindowVisible(_mainWindowHandle))
             return _mainWindowHandle;
 
         var allWindows = WinApi.FindAllWindowsEx("CabinetWClass");
         _mainWindowHandle = allWindows
             .Where(h => h != otherThan)
+            .Where(h => WinApi.IsWindowVisible(h))
             .Reverse()
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
             .FirstOrDefault();
 
-        if (_mainWindowHandle != 0) return _mainWindowHandle;
-
-        return Helper.IsFileExplorerWindow(otherThan) ? otherThan : 0;
+        return _mainWindowHandle;
     }
 
     private nint GetTabHandle(object item)
