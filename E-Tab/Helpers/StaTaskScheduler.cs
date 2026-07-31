@@ -64,7 +64,9 @@ public sealed class StaTaskScheduler : TaskScheduler, IDisposable
     public void Dispose()
     {
         _tasks.CompleteAdding();
-        _staThread.Join();
+        // The STA thread can be blocked in a COM call; it is a background
+        // thread, so the process can still exit without waiting for it.
+        _staThread.Join(TimeSpan.FromSeconds(2));
         _tasks.Dispose();
     }
 }
