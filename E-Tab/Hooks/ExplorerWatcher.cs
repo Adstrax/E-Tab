@@ -20,7 +20,7 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly SynchronizationContext _syncContext;
     private readonly object _itemsLock = new();
     private readonly object _processLock = new();
-    private readonly Dictionary<object, WindowInfo> _shellItems = new();
+    private readonly Dictionary<nint, WindowInfo> _tabInfos = new();
     private readonly Dictionary<nint, object> _tabToItem = new();
     private readonly HashSet<nint> _knownTopLevelWindows = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
@@ -95,7 +95,7 @@ public sealed class ExplorerWatcher : IDisposable
             0);
 
         PollShellCore();
-        _pollTimer = new Timer(PollShell, null, 0, 75);
+        _pollTimer = new Timer(PollShell, null, 0, 250);
     }
 
     private void PollShell(object? state)
@@ -163,26 +163,37 @@ public sealed class ExplorerWatcher : IDisposable
             _knownTopLevelWindows.RemoveWhere(h => !currentTopLevel.Contains(h));
             _knownTopLevelWindows.UnionWith(recognizedWindows);
 
-            var current = new HashSet<object>(currentItems.Select(x => x.Item));
-            foreach (var item in _shellItems.Keys.Where(k => !current.Contains(k)).ToList())
-                RemoveItemCore(item);
-
+            var currentTabHandles = new HashSet<nint>();
             foreach (var (item, hwnd) in currentItems)
             {
-                if (_shellItems.TryGetValue(item, out var info))
+                var tabHandle = GetTabHandle(item);
+                if (tabHandle == 0) continue;
+                currentTabHandles.Add(tabHandle);
+                _tabToItem[tabHandle] = item;
+
+                if (_tabInfos.TryGetValue(tabHandle, out var info))
                 {
                     info.WindowHandle = hwnd;
-                    UpdateTabMapping(item, info);
+                    info.TabHandle = tabHandle;
                     continue;
                 }
 
                 var newInfo = new WindowInfo
                 {
                     WindowHandle = hwnd,
-                    Location = TryGetLocation(item)
+                    TabHandle = tabHandle,
+                    Location = _tabInfos.Count == 0 && WinApi.IsWindowVisible(hwnd) &&
+                               WinApi.IsWindowHasClassName(hwnd, "CabinetWClass")
+                        ? TryGetLocation(item)
+                        : null
                 };
-                _shellItems[item] = newInfo;
-                UpdateTabMapping(item, newInfo);
+                _tabInfos[tabHandle] = newInfo;
+            }
+
+            foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
+            {
+                _tabToItem.Remove(staleTab);
+                _tabInfos.Remove(staleTab);
             }
 
             if (_knownTopLevelWindows.Count == 0)
@@ -256,6 +267,9 @@ public sealed class ExplorerWatcher : IDisposable
         Helper.HideWindow(hWnd);
         ScheduleShowFallback(hWnd);
         _syncContext.Post(_ => PollShell(null), null);
+        _ = Task.Delay(60).ContinueWith(
+            _ => _syncContext.Post(_ => PollShell(null), null),
+            TaskScheduler.Default);
     }
 
     private static bool HasVisibleExplorerWindow(nint except)
@@ -316,7 +330,11 @@ public sealed class ExplorerWatcher : IDisposable
                     return;
 
                 var tabItem = await Helper.DoUntilNotDefaultAsync(
-                    () => GetItemByTabHandle(newTabHandle),
+                    () =>
+                    {
+                        PollShell(null);
+                        return GetItemByTabHandle(newTabHandle);
+                    },
                     2_000,
                     50);
                 if (tabItem == null)
@@ -358,6 +376,29 @@ public sealed class ExplorerWatcher : IDisposable
 
     private nint SearchForTab(string targetPath)
     {
+        lock (_itemsLock)
+        {
+            foreach (var (handle, info) in _tabInfos.ToList())
+            {
+                if (!Helper.IsTimeUp(info.CreatedAt, 2_000)) continue;
+                if (info.TabHandle == 0) continue;
+
+                var comparePath = info.Location;
+                if (comparePath == null && _tabToItem.TryGetValue(info.TabHandle, out var tabItem))
+                {
+                    comparePath = TryGetLocation(tabItem);
+                    if (comparePath != null)
+                        info.Location = comparePath;
+                }
+                if (comparePath == null) continue;
+                if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase))
+                    return info.TabHandle;
+            }
+        }
+
+        if (IsFileSystemPath(targetPath))
+            return 0;
+
         nint targetPidl = 0;
         try
         {
@@ -366,13 +407,14 @@ public sealed class ExplorerWatcher : IDisposable
 
             lock (_itemsLock)
             {
-                foreach (var (item, info) in _shellItems.ToList())
+                foreach (var (handle, info) in _tabInfos.ToList())
                 {
                     if (!Helper.IsTimeUp(info.CreatedAt, 2_000)) continue;
                     if (info.TabHandle == 0) continue;
 
-                    var comparePath = info.Location ?? TryGetLocation(item);
+                    var comparePath = info.Location;
                     if (comparePath == null) continue;
+                    if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase)) continue;
                     if (_shellPathComparer.IsEquivalent(targetPath, comparePath, targetPidl))
                         return info.TabHandle;
                 }
@@ -389,6 +431,12 @@ public sealed class ExplorerWatcher : IDisposable
             if (targetPidl != 0)
                 Marshal.FreeCoTaskMem(targetPidl);
         }
+    }
+
+    private static bool IsFileSystemPath(string path)
+    {
+        if (path.StartsWith(@"\\", StringComparison.Ordinal)) return true;
+        return path.Length >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
     }
 
     private async Task SelectTabByHandle(nint windowHandle, nint tabHandle)
@@ -493,31 +541,15 @@ public sealed class ExplorerWatcher : IDisposable
             return _tabToItem.TryGetValue(tabHandle, out var item) ? item : null;
     }
 
-    private void UpdateTabMapping(object item, WindowInfo info)
-    {
-        var tabHandle = GetTabHandle(item);
-        if (tabHandle == 0) return;
-        if (tabHandle == info.TabHandle) return;
-
-        if (info.TabHandle != 0)
-            _tabToItem.Remove(info.TabHandle);
-
-        info.TabHandle = tabHandle;
-        _tabToItem[tabHandle] = item;
-    }
-
     private void RemoveItem(object item)
     {
+        var tabHandle = GetTabHandle(item);
         lock (_itemsLock)
-            RemoveItemCore(item);
-    }
-
-    private void RemoveItemCore(object item)
-    {
-        if (!_shellItems.Remove(item, out var info)) return;
-
-        if (info.TabHandle != 0)
-            _tabToItem.Remove(info.TabHandle);
+        {
+            if (tabHandle == 0) return;
+            _tabToItem.Remove(tabHandle);
+            _tabInfos.Remove(tabHandle);
+        }
     }
 
     private static nint GetWindowHandle(object item)
@@ -692,7 +724,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            _shellItems.Clear();
+            _tabInfos.Clear();
             _tabToItem.Clear();
             _knownTopLevelWindows.Clear();
         }

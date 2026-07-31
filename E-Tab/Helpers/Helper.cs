@@ -141,6 +141,18 @@ public static class Helper
         if (location.IndexOf('%') > -1)
             location = Environment.ExpandEnvironmentVariables(location);
 
+        if (location.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                location = new Uri(location).LocalPath;
+            }
+            catch
+            {
+                location = location.Substring("file:".Length);
+            }
+        }
+
         if (location.StartsWith("::", StringComparison.Ordinal))
             location = $"shell:{location}";
         else if (location.StartsWith("{", StringComparison.Ordinal))
