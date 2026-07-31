@@ -8,8 +8,10 @@ namespace ETab.WinAPI;
 
 public static class WinApi
 {
+    public const int EVENT_OBJECT_CREATE = 0x8000;
     public const int EVENT_OBJECT_SHOW = 0x8002;
     public const int WM_COMMAND = 0x111;
+    public const int SW_HIDE = 0;
     public const int SW_SHOWNOACTIVATE = 4;
 
     public const uint SWP_NOSIZE = 0x0001;

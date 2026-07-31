@@ -34,7 +34,9 @@ public sealed class ExplorerWatcher : IDisposable
     private int _mainExplorerProcessId;
     private Timer? _explorerCheckTimer;
     private Timer? _pollTimer;
+    private nint _eventObjectCreateHookId;
     private nint _eventObjectShowHookId;
+    private WinEventDelegate? _eventObjectCreateHookCallback;
     private WinEventDelegate? _eventObjectShowHookCallback;
     private bool _polling;
     private bool _disposed;
@@ -72,6 +74,16 @@ public sealed class ExplorerWatcher : IDisposable
         _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
 
+        _eventObjectCreateHookCallback = OnWindowShown;
+        _eventObjectCreateHookId = WinApi.SetWinEventHook(
+            WinApi.EVENT_OBJECT_CREATE,
+            WinApi.EVENT_OBJECT_CREATE,
+            0,
+            _eventObjectCreateHookCallback,
+            0,
+            0,
+            0);
+
         _eventObjectShowHookCallback = OnWindowShown;
         _eventObjectShowHookId = WinApi.SetWinEventHook(
             WinApi.EVENT_OBJECT_SHOW,
@@ -83,7 +95,7 @@ public sealed class ExplorerWatcher : IDisposable
             0);
 
         PollShellCore();
-        _pollTimer = new Timer(PollShell, null, 0, 150);
+        _pollTimer = new Timer(PollShell, null, 0, 75);
     }
 
     private void PollShell(object? state)
@@ -242,6 +254,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         Helper.HideWindow(hWnd);
         ScheduleShowFallback(hWnd);
+        _syncContext.Post(_ => PollShell(null), null);
     }
 
     private static void ScheduleShowFallback(nint hWnd)
@@ -648,9 +661,17 @@ public sealed class ExplorerWatcher : IDisposable
             _pollTimer = null;
         }
 
+        if (_eventObjectCreateHookCallback != null)
+        {
+            if (_eventObjectCreateHookId != 0)
+                WinApi.UnhookWinEvent(_eventObjectCreateHookId);
+            _eventObjectCreateHookCallback = null;
+        }
+
         if (_eventObjectShowHookCallback != null)
         {
-            WinApi.UnhookWinEvent(_eventObjectShowHookId);
+            if (_eventObjectShowHookId != 0)
+                WinApi.UnhookWinEvent(_eventObjectShowHookId);
             _eventObjectShowHookCallback = null;
         }
 

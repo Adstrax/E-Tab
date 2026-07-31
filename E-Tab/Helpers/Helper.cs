@@ -89,28 +89,38 @@ public static class Helper
 
     public static void HideWindow(nint hWnd)
     {
-        HiddenWindows.GetOrAdd(hWnd, static handle =>
-        {
-            if (!WinApi.GetWindowRect(handle, out var originalPos))
-                return (RECT?)null;
+        if (HiddenWindows.TryGetValue(hWnd, out var existing) && existing != null)
+            return;
 
+        var originalPos = WinApi.GetWindowRect(hWnd, out var rect) ? (RECT?)rect : null;
+        if (originalPos != null)
+        {
             const uint flags = WinApi.SWP_HIDEWINDOW |
                                WinApi.SWP_NOSIZE |
                                WinApi.SWP_NOZORDER |
                                WinApi.SWP_NOACTIVATE |
                                WinApi.SWP_FRAMECHANGED;
-            WinApi.SetWindowPos(handle, 0, -32_000, -32_000, 0, 0, flags);
-            return originalPos;
-        });
+            WinApi.SetWindowPos(hWnd, 0, -32_000, -32_000, 0, 0, flags);
+        }
+        else
+        {
+            // The window may be too new for GetWindowRect, so hide it directly.
+            WinApi.ShowWindow(hWnd, WinApi.SW_HIDE);
+        }
+
+        HiddenWindows[hWnd] = originalPos;
     }
 
     public static bool ShowWindow(nint hWnd, bool removeCache)
     {
-        if (!HiddenWindows.TryGetValue(hWnd, out var originalPos) || originalPos is not { } position)
+        if (!HiddenWindows.TryGetValue(hWnd, out var originalPos))
             return false;
 
         if (removeCache)
             HiddenWindows.TryRemove(hWnd, out _);
+
+        if (originalPos is not { } position)
+            return WinApi.ShowWindow(hWnd, WinApi.SW_SHOWNOACTIVATE);
 
         const uint flags = WinApi.SWP_SHOWWINDOW |
                            WinApi.SWP_NOSIZE |
