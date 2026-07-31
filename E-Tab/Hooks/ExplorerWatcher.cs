@@ -34,8 +34,6 @@ public sealed class ExplorerWatcher : IDisposable
     private int _mainExplorerProcessId;
     private Timer? _explorerCheckTimer;
     private Timer? _pollTimer;
-    private nint _eventObjectShowHookId;
-    private WinEventDelegate? _eventObjectShowHookCallback;
     private bool _polling;
     private bool _disposed;
 
@@ -71,16 +69,6 @@ public sealed class ExplorerWatcher : IDisposable
         _shellPathComparer = new ShellPathComparer();
         _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
-
-        _eventObjectShowHookCallback = OnWindowShown;
-        _eventObjectShowHookId = WinApi.SetWinEventHook(
-            WinApi.EVENT_OBJECT_SHOW,
-            WinApi.EVENT_OBJECT_SHOW,
-            0,
-            _eventObjectShowHookCallback,
-            0,
-            0,
-            0);
 
         PollShellCore();
         _pollTimer = new Timer(PollShell, null, 0, 150);
@@ -138,16 +126,18 @@ public sealed class ExplorerWatcher : IDisposable
             // ShellWindows can be temporarily unavailable during Explorer restart.
         }
 
+        var recognizedWindows = new HashSet<nint>();
         foreach (var hwnd in currentTopLevel)
         {
-            if (!_knownTopLevelWindows.Contains(hwnd))
-                HandleNewTopLevelWindow(hwnd, currentItems);
+            if (_knownTopLevelWindows.Contains(hwnd)) continue;
+            if (HandleNewTopLevelWindow(hwnd, currentItems))
+                recognizedWindows.Add(hwnd);
         }
 
         lock (_itemsLock)
         {
-            _knownTopLevelWindows.Clear();
-            _knownTopLevelWindows.UnionWith(currentTopLevel);
+            _knownTopLevelWindows.RemoveWhere(h => !currentTopLevel.Contains(h));
+            _knownTopLevelWindows.UnionWith(recognizedWindows);
 
             var current = new HashSet<object>(currentItems.Select(x => x.Item));
             foreach (var item in _shellItems.Keys.Where(k => !current.Contains(k)).ToList())
@@ -178,7 +168,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
-    private void HandleNewTopLevelWindow(nint hwnd, List<(object Item, nint Hwnd)> items)
+    private bool HandleNewTopLevelWindow(nint hwnd, List<(object Item, nint Hwnd)> items)
     {
         object? item = null;
         foreach (var (candidate, candidateHwnd) in items)
@@ -190,22 +180,23 @@ public sealed class ExplorerWatcher : IDisposable
             }
         }
 
-        if (item == null) return;
+        if (item == null) return false;
 
         lock (_itemsLock)
         {
-            if (_knownTopLevelWindows.Count == 0) return;
+            if (_knownTopLevelWindows.Count == 0) return true;
         }
 
         var location = TryGetLocation(item);
         if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
-            return;
+            return true;
 
-        if (GetTabHandle(item) == 0) return;
-        if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1) return;
+        if (GetTabHandle(item) == 0) return false;
+        if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1) return true;
 
         Helper.HideWindow(hwnd);
         _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
+        return true;
     }
 
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
@@ -226,36 +217,35 @@ public sealed class ExplorerWatcher : IDisposable
                     var windowHandle = WinApi.GetParent(existingTab);
                     await SelectTabByHandle(windowHandle, existingTab);
                     WinApi.RestoreWindowToForeground(windowHandle);
+                    converted = true;
+                    return;
                 }
-                else
+
+                var mainWindowHWnd = GetMainWindowHWnd(0);
+                if (mainWindowHWnd == 0)
                 {
-                    var mainWindowHWnd = GetMainWindowHWnd(0);
-                    if (mainWindowHWnd == 0)
-                    {
-                        await OpenNewWindow(target);
-                    }
-                    else
-                    {
-                        var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
-                        await RequestToOpenNewTab(mainWindowHWnd);
-
-                        var newTabHandle = await Helper.ListenForNewExplorerTabAsync(mainWindowHWnd, currentTabs, 2_000);
-                        if (newTabHandle != 0)
-                        {
-                            var tabItem = await Helper.DoUntilNotDefaultAsync(
-                                () => GetItemByTabHandle(newTabHandle),
-                                2_000,
-                                50);
-                            if (tabItem != null)
-                            {
-                                await Navigate(tabItem, target);
-                                SelectItems(tabItem, TryGetSelectedItems(item));
-                            }
-                        }
-
-                        WinApi.RestoreWindowToForeground(mainWindowHWnd);
-                    }
+                    await OpenNewWindow(target);
+                    converted = true;
+                    return;
                 }
+
+                var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
+                await RequestToOpenNewTab(mainWindowHWnd);
+
+                var newTabHandle = await Helper.ListenForNewExplorerTabAsync(mainWindowHWnd, currentTabs, 2_000);
+                if (newTabHandle == 0)
+                    return;
+
+                var tabItem = await Helper.DoUntilNotDefaultAsync(
+                    () => GetItemByTabHandle(newTabHandle),
+                    2_000,
+                    50);
+                if (tabItem == null)
+                    return;
+
+                await Navigate(tabItem, target);
+                SelectItems(tabItem, TryGetSelectedItems(item));
+                WinApi.RestoreWindowToForeground(mainWindowHWnd);
 
                 converted = true;
             }
@@ -573,26 +563,6 @@ public sealed class ExplorerWatcher : IDisposable
         return (dynamic)Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!)!;
     }
 
-    private void OnWindowShown(
-        nint hWinEventHook,
-        uint eventType,
-        nint hWnd,
-        int idObject,
-        int idChild,
-        uint dwEventThread,
-        uint dwmsEventTime)
-    {
-        if (idObject != 0 || idChild != 0) return;
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
-
-        lock (_itemsLock)
-        {
-            if (_knownTopLevelWindows.Count < 1) return;
-        }
-
-        Helper.HideWindow(hWnd);
-    }
-
     private Task RunInStaThread(Action action)
     {
         return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
@@ -621,12 +591,6 @@ public sealed class ExplorerWatcher : IDisposable
         {
             _pollTimer.Dispose();
             _pollTimer = null;
-        }
-
-        if (_eventObjectShowHookCallback != null)
-        {
-            WinApi.UnhookWinEvent(_eventObjectShowHookId);
-            _eventObjectShowHookCallback = null;
         }
 
         lock (_itemsLock)
