@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "E-Tab", "E-Tab\E-Tab.csproj", "{B3C7E1D0-4B5E-4F0A-9C3B-1E2A5D6F8A90}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B3C7E1D0-4B5E-4F0A-9C3B-1E2A5D6F8A90}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3C7E1D0-4B5E-4F0A-9C3B-1E2A5D6F8A90}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3C7E1D0-4B5E-4F0A-9C3B-1E2A5D6F8A90}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3C7E1D0-4B5E-4F0A-9C3B-1E2A5D6F8A90}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D3F2A8E0-7C51-4B8A-9D4E-21C05F6B7A32}
+	EndGlobalSection
+EndGlobal
