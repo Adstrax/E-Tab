@@ -95,9 +95,10 @@ public sealed class ExplorerWatcher : IDisposable
             0);
 
         PollShellCore();
-        // Poll faster than the default 250ms so new Explorer windows are
-        // picked up as quickly as possible after they appear.
-        _pollTimer = new Timer(PollShell, null, 0, 100);
+        // Keep the background poll at 250ms: new windows are already caught
+        // immediately by the WinEvent hooks, and a faster timer measurably
+        // increases idle CPU usage without a visible latency benefit.
+        _pollTimer = new Timer(PollShell, null, 0, 250);
     }
 
     private void PollShell(object? state)
