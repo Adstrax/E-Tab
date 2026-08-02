@@ -23,6 +23,7 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly Dictionary<nint, WindowInfo> _tabInfos = new();
     private readonly Dictionary<nint, object> _tabToItem = new();
     private readonly HashSet<nint> _knownTopLevelWindows = new();
+    private readonly HashSet<nint> _pendingConversions = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
     private readonly ProcessWatcher _processWatcher;
     private readonly StaTaskScheduler _staTaskScheduler;
@@ -244,6 +245,8 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         Helper.HideWindow(hwnd);
+        lock (_itemsLock)
+            _pendingConversions.Add(hwnd);
         ScheduleShowFallback(hwnd);
         _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
         return true;
@@ -286,10 +289,17 @@ public sealed class ExplorerWatcher : IDisposable
         return false;
     }
 
-    private static void ScheduleShowFallback(nint hWnd)
+    private void ScheduleShowFallback(nint hWnd)
     {
         _ = Task.Delay(3_000).ContinueWith(_ =>
         {
+            // If the conversion is still in progress, leave the window hidden;
+            // ConvertToTabAsync restores it when it completes or fails.
+            lock (_itemsLock)
+            {
+                if (_pendingConversions.Contains(hWnd)) return;
+            }
+
             if (Helper.HiddenWindows.ContainsKey(hWnd))
                 Helper.ShowWindow(hWnd, removeCache: true);
         }, TaskScheduler.Default);
@@ -371,6 +381,9 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 Helper.ShowWindow(sourceHwnd, removeCache: true);
             }
+
+            lock (_itemsLock)
+                _pendingConversions.Remove(sourceHwnd);
         }
     }
 
@@ -756,6 +769,7 @@ public sealed class ExplorerWatcher : IDisposable
             _tabInfos.Clear();
             _tabToItem.Clear();
             _knownTopLevelWindows.Clear();
+            _pendingConversions.Clear();
         }
 
         _shellPathComparer?.Dispose();
