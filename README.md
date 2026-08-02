@@ -17,7 +17,7 @@ Windows 11 File Explorer 增强工具，基于 [w4po/ExplorerTabUtility](https:/
 
 - Windows 11 22H2（Build 22621）或更高版本
 - File Explorer 标签页功能已启用
-- 构建需要 .NET 8 SDK
+- 构建需要 .NET 10 SDK
 
 ## 构建
 
@@ -27,7 +27,7 @@ dotnet build -c Release
 
 ## 版本规则
 
-当前版本：`1.0.6`
+当前版本：`1.1.0`（基于 .NET 10）
 
 每次增加新功能时，需要同时：
 
