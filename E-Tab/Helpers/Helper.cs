@@ -80,11 +80,13 @@ public static class Helper
     public static Task<nint> ListenForNewExplorerTabAsync(
         nint window,
         IReadOnlyCollection<nint> currentTabs,
-        int searchTimeMs = 1_000)
+        int searchTimeMs = 1_000,
+        int sleepMs = 20)
     {
         return DoUntilNotDefaultAsync(
             () => GetAllExplorerTabs(window).Except(currentTabs).FirstOrDefault(),
-            searchTimeMs);
+            searchTimeMs,
+            sleepMs);
     }
 
     public static void HideWindow(nint hWnd)

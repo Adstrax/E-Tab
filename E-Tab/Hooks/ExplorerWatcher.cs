@@ -95,7 +95,9 @@ public sealed class ExplorerWatcher : IDisposable
             0);
 
         PollShellCore();
-        _pollTimer = new Timer(PollShell, null, 0, 250);
+        // Poll faster than the default 250ms so new Explorer windows are
+        // picked up as quickly as possible after they appear.
+        _pollTimer = new Timer(PollShell, null, 0, 100);
     }
 
     private void PollShell(object? state)
@@ -325,18 +327,15 @@ public sealed class ExplorerWatcher : IDisposable
                 var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
                 await RequestToOpenNewTab(mainWindowHWnd);
 
-                var newTabHandle = await Helper.ListenForNewExplorerTabAsync(mainWindowHWnd, currentTabs, 2_000);
+                var newTabHandle = await Helper.ListenForNewExplorerTabAsync(
+                    mainWindowHWnd,
+                    currentTabs,
+                    2_000,
+                    sleepMs: 10);
                 if (newTabHandle == 0)
                     return;
 
-                var tabItem = await Helper.DoUntilNotDefaultAsync(
-                    () =>
-                    {
-                        PollShell(null);
-                        return GetItemByTabHandle(newTabHandle);
-                    },
-                    2_000,
-                    50);
+                var tabItem = await WaitForTabItemAsync(newTabHandle, 2_000);
                 if (tabItem == null)
                     return;
 
@@ -539,6 +538,35 @@ public sealed class ExplorerWatcher : IDisposable
     {
         lock (_itemsLock)
             return _tabToItem.TryGetValue(tabHandle, out var item) ? item : null;
+    }
+
+    /// <summary>
+    /// Waits for the Shell item of a newly created tab to be registered.
+    /// Polls the shell synchronously on the STA thread so the enumeration is
+    /// guaranteed to have completed before each lookup, instead of queuing an
+    /// asynchronous poll that may lag behind the check.
+    /// </summary>
+    private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+        while (!Helper.IsTimeUp(startTicks, timeMs))
+        {
+            try
+            {
+                await RunInStaThread(PollShellCore);
+            }
+            catch
+            {
+                // Explorer can be in a transient state during tab creation.
+            }
+
+            var item = GetItemByTabHandle(tabHandle);
+            if (item != null) return item;
+
+            await Task.Delay(15);
+        }
+
+        return null;
     }
 
     private void RemoveItem(object item)
