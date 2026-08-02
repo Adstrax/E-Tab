@@ -11,6 +11,8 @@ public partial class TrayMenuWindow : Window
     public TrayMenuWindow()
     {
         InitializeComponent();
+        var version = typeof(TrayMenuWindow).Assembly.GetName().Version;
+        VersionText.Text = version == null ? string.Empty : $"v{version.ToString(3)}";
     }
 
     public void ShowAtCursor()

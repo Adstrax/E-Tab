@@ -11,6 +11,8 @@ public partial class SettingsWindow : Window
     public SettingsWindow()
     {
         InitializeComponent();
+        var version = typeof(SettingsWindow).Assembly.GetName().Version;
+        VersionText.Text = version == null ? "E-Tab" : $"E-Tab v{version.ToString(3)}";
         Loaded += (_, _) =>
         {
             _suppressToggle = true;

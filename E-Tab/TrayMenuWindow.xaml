@@ -74,7 +74,8 @@
                         <TextBlock Text="E-Tab"
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
-                        <TextBlock Text="v1.0.6"
+                        <TextBlock x:Name="VersionText"
+                                   Text="v1.2.2"
                                    Foreground="#A7ADB5"
                                    FontSize="11"/>
                     </StackPanel>
@@ -88,7 +89,7 @@
                          Height="8"
                          Fill="#4CC84C"
                          VerticalAlignment="Center"/>
-                <TextBlock Text="已启用 · 文件夹打开为新标签页"
+                <TextBlock Text="Active · Folders open in new tabs"
                            Foreground="#D7DADE"
                            FontSize="12.5"
                            Margin="10,0,0,0"/>
@@ -97,16 +98,16 @@
             <Border Height="1" Background="#1FFFFFFF" Margin="8,0"/>
 
             <Button x:Name="SettingsButton"
-                    Content="设置"
+                    Content="Settings"
                     Style="{StaticResource MenuButtonStyle}"
                     Margin="0,4,0,0"
-                    AutomationProperties.Name="设置"
+                    AutomationProperties.Name="Settings"
                     AutomationProperties.AutomationId="SettingsButton"
                     Click="SettingsButton_Click"/>
             <Button x:Name="ExitButton"
-                    Content="退出"
+                    Content="Exit"
                     Style="{StaticResource MenuButtonStyle}"
-                    AutomationProperties.Name="退出"
+                    AutomationProperties.Name="Exit"
                     AutomationProperties.AutomationId="ExitButton"
                     Click="ExitButton_Click"/>
         </StackPanel>

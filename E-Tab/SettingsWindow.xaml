@@ -1,7 +1,7 @@
 <Window x:Class="ETab.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="E-Tab 设置"
+        Title="E-Tab Settings"
         Width="440"
         SizeToContent="Height"
         WindowStyle="None"
@@ -79,10 +79,10 @@
                            Source="pack://application:,,,/Icon.ico"
                            RenderOptions.BitmapScalingMode="HighQuality"/>
                     <StackPanel Margin="12,0,0,0">
-                        <TextBlock Text="E-Tab 设置"
+                        <TextBlock Text="E-Tab Settings"
                                    FontSize="16"
                                    FontWeight="SemiBold"/>
-                        <TextBlock Text="文件夹打开为新标签页"
+                        <TextBlock Text="Open folders in new tabs"
                                    Foreground="#A7ADB5"
                                    FontSize="12"
                                    Margin="0,3,0,0"/>
@@ -115,7 +115,7 @@
                              Height="8"
                              Fill="#4CC84C"
                              VerticalAlignment="Center"/>
-                    <TextBlock Text="已启用 · 新文件夹窗口自动转为标签页"
+                    <TextBlock Text="Active · New folder windows become tabs"
                                Foreground="#D7DADE"
                                FontSize="13"
                                Margin="10,0,0,0"/>
@@ -124,10 +124,10 @@
 
             <Grid Grid.Row="2" Margin="0,22,0,0">
                 <StackPanel>
-                    <TextBlock Text="开机自动启动"
+                    <TextBlock Text="Start with Windows"
                                FontSize="14"
                                FontWeight="SemiBold"/>
-                    <TextBlock Text="登录 Windows 后自动在托盘运行 E-Tab"
+                    <TextBlock Text="Run E-Tab in the tray after signing in"
                                Foreground="#A7ADB5"
                                FontSize="12"
                                Margin="0,4,0,0"/>
@@ -137,14 +137,15 @@
                               Style="{StaticResource Win11ToggleStyle}"
                               HorizontalAlignment="Right"
                               VerticalAlignment="Center"
-                              AutomationProperties.Name="开机自动启动"
+                              AutomationProperties.Name="Start with Windows"
                               AutomationProperties.AutomationId="AutoStartToggle"
                               Checked="AutoStartToggle_Changed"
                               Unchecked="AutoStartToggle_Changed"/>
             </Grid>
 
-            <TextBlock Grid.Row="3"
-                       Text="E-Tab v1.0.6"
+            <TextBlock x:Name="VersionText"
+                       Grid.Row="3"
+                       Text="E-Tab v1.2.2"
                        Foreground="#8A9099"
                        FontSize="11"
                        Margin="0,24,0,0"/>

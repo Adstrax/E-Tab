@@ -19,7 +19,7 @@ public sealed class TrayIcon : IDisposable
         _notifyIcon = new NotifyIcon
         {
             Icon = icon,
-            Text = "E-Tab - 文件夹自动在新标签页打开",
+            Text = "E-Tab - Open folders in new tabs",
             Visible = true
         };
 
