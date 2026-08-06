@@ -321,10 +321,22 @@ public sealed class ExplorerWatcher : IDisposable
                 if (existingTab != 0)
                 {
                     var windowHandle = WinApi.GetParent(existingTab);
-                    await SelectTabByHandle(windowHandle, existingTab);
-                    WinApi.RestoreWindowToForeground(windowHandle);
-                    converted = true;
-                    return;
+                    if (windowHandle != 0 && WinApi.IsWindow(windowHandle) && WinApi.IsWindow(existingTab))
+                    {
+                        await SelectTabByHandle(windowHandle, existingTab);
+
+                        // Only treat the conversion as done when the tab is
+                        // still alive and attached to the same window. If the
+                        // window was closed while we were selecting the tab,
+                        // fall through to the normal path so the source
+                        // window is restored instead of silently disappearing.
+                        if (WinApi.IsWindow(existingTab) && WinApi.GetParent(existingTab) == windowHandle)
+                        {
+                            WinApi.RestoreWindowToForeground(windowHandle);
+                            converted = true;
+                            return;
+                        }
+                    }
                 }
 
                 var mainWindowHWnd = GetMainWindowHWnd(0);
@@ -346,20 +358,45 @@ public sealed class ExplorerWatcher : IDisposable
                 if (newTabHandle == 0)
                     return;
 
-                var tabItem = await WaitForTabItemAsync(newTabHandle, 2_000);
+                // Give slow Explorer extra time to register the new tab's
+                // Shell item before giving up, so a half-created tab is not
+                // left at the default location.
+                var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
                 if (tabItem == null)
                     return;
 
-                await Navigate(tabItem, target);
-                SelectItems(tabItem, TryGetSelectedItems(item));
-                WinApi.RestoreWindowToForeground(mainWindowHWnd);
+                try
+                {
+                    await Navigate(tabItem, target);
+                    SelectItems(tabItem, TryGetSelectedItems(item));
+                }
+                catch
+                {
+                    // Navigation failed (Explorer may be closing or busy).
+                    // Close the half-created tab so no stray default tab is
+                    // left behind, then restore the source window.
+                    if (Helper.GetAllExplorerTabs(mainWindowHWnd).Count() > 1)
+                        TryQuitTabItem(tabItem);
+                    return;
+                }
 
-                converted = true;
+                // If the target window disappeared mid-conversion, restore
+                // the source window instead of pretending the tab exists.
+                if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == mainWindowHWnd)
+                {
+                    WinApi.RestoreWindowToForeground(mainWindowHWnd);
+                    converted = true;
+                }
             }
             finally
             {
                 _toOpenWindowsLock.Release();
             }
+        }
+        catch
+        {
+            // Any unexpected failure leaves converted = false, so the
+            // finally block below restores the source window.
         }
         finally
         {
@@ -384,6 +421,18 @@ public sealed class ExplorerWatcher : IDisposable
 
             lock (_itemsLock)
                 _pendingConversions.Remove(sourceHwnd);
+        }
+    }
+
+    private static void TryQuitTabItem(object tabItem)
+    {
+        try
+        {
+            ((dynamic)tabItem).Quit();
+        }
+        catch
+        {
+            // The tab may already be gone.
         }
     }
 
