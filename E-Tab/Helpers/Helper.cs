@@ -166,9 +166,9 @@ public static class Helper
 
     public static string GetDefaultExplorerLocation(ShellPathComparer? shellPathComparer = null)
     {
-        var id = Registry.CurrentUser
-            .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")
-            ?.GetValue("LaunchTo") as int? ?? 1;
+        using var advancedKey = Registry.CurrentUser.OpenSubKey(
+            @"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+        var id = advancedKey?.GetValue("LaunchTo") as int? ?? 1;
 
         var location = id switch
         {
@@ -216,7 +216,12 @@ public static class Helper
                 if (proc.StartTime < bestStart)
                 {
                     bestStart = proc.StartTime;
+                    best?.Dispose();
                     best = proc;
+                }
+                else
+                {
+                    proc.Dispose();
                 }
             }
             catch

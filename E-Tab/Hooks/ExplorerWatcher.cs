@@ -39,7 +39,7 @@ public sealed class ExplorerWatcher : IDisposable
     private nint _eventObjectShowHookId;
     private WinEventDelegate? _eventObjectCreateHookCallback;
     private WinEventDelegate? _eventObjectShowHookCallback;
-    private bool _polling;
+    private int _polling;
     private bool _disposed;
 
     public ExplorerWatcher()
@@ -54,7 +54,7 @@ public sealed class ExplorerWatcher : IDisposable
 
     private void CheckForMainExplorer(object? state)
     {
-        var process = Helper.GetMainExplorerProcess();
+        using var process = Helper.GetMainExplorerProcess();
         if (process == null) return;
 
         _explorerCheckTimer?.Dispose();
@@ -67,6 +67,13 @@ public sealed class ExplorerWatcher : IDisposable
             _mainExplorerProcessId = process.Id;
             RunInStaThread(InitializeShellObjects).GetAwaiter().GetResult();
         }
+
+        // Install the WinEvent hooks on the UI thread. Out-of-context hook
+        // callbacks are delivered on the thread that registered the hook, and
+        // that thread must pump Windows messages. The WPF UI thread does, while
+        // the dedicated STA scheduler thread does not (which previously left
+        // these callbacks undelivered).
+        _syncContext.Post(_ => InstallWinEventHooks(), null);
     }
 
     private void InitializeShellObjects()
@@ -74,6 +81,18 @@ public sealed class ExplorerWatcher : IDisposable
         _shellPathComparer = new ShellPathComparer();
         _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
+
+        PollShellCore();
+        // Keep the background poll at 250ms: new windows are also caught
+        // immediately by the WinEvent hooks, so a faster timer only increases
+        // idle CPU usage without a visible latency benefit.
+        _pollTimer = new Timer(PollShell, null, 0, 250);
+    }
+
+    private void InstallWinEventHooks()
+    {
+        if (_disposed) return;
+        if (_eventObjectCreateHookId != 0 || _eventObjectShowHookId != 0) return;
 
         _eventObjectCreateHookCallback = OnWindowShown;
         _eventObjectCreateHookId = WinApi.SetWinEventHook(
@@ -94,19 +113,13 @@ public sealed class ExplorerWatcher : IDisposable
             0,
             0,
             0);
-
-        PollShellCore();
-        // Keep the background poll at 250ms: new windows are already caught
-        // immediately by the WinEvent hooks, and a faster timer measurably
-        // increases idle CPU usage without a visible latency benefit.
-        _pollTimer = new Timer(PollShell, null, 0, 250);
     }
 
     private void PollShell(object? state)
     {
-        if (_disposed || _shellApp == null || _polling) return;
+        if (_disposed || _shellApp == null) return;
+        if (Interlocked.CompareExchange(ref _polling, 1, 0) != 0) return;
 
-        _polling = true;
         try
         {
             RunInStaThread(PollShellCore).GetAwaiter().GetResult();
@@ -117,7 +130,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
         finally
         {
-            _polling = false;
+            Interlocked.Exchange(ref _polling, 0);
         }
     }
 
@@ -272,9 +285,12 @@ public sealed class ExplorerWatcher : IDisposable
 
         Helper.HideWindow(hWnd);
         ScheduleShowFallback(hWnd);
-        _syncContext.Post(_ => PollShell(null), null);
+
+        // Poll the shell off the UI thread: PollShell blocks on the STA
+        // scheduler, and this callback now runs on the UI thread.
+        ThreadPool.QueueUserWorkItem(_ => PollShell(null));
         _ = Task.Delay(60).ContinueWith(
-            _ => _syncContext.Post(_ => PollShell(null), null),
+            _ => ThreadPool.QueueUserWorkItem(_ => PollShell(null)),
             TaskScheduler.Default);
     }
 
@@ -342,8 +358,10 @@ public sealed class ExplorerWatcher : IDisposable
                 var mainWindowHWnd = GetMainWindowHWnd(0);
                 if (mainWindowHWnd == 0)
                 {
-                    await OpenNewWindow(target);
-                    converted = true;
+                    // No visible Explorer window is available to merge into.
+                    // Restore the source window instead of opening a brand-new
+                    // one, so a window does not "reappear" right after the user
+                    // closes File Explorer.
                     return;
                 }
 
@@ -799,6 +817,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (_eventObjectCreateHookId != 0)
                 WinApi.UnhookWinEvent(_eventObjectCreateHookId);
+            _eventObjectCreateHookId = 0;
             _eventObjectCreateHookCallback = null;
         }
 
@@ -806,6 +825,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (_eventObjectShowHookId != 0)
                 WinApi.UnhookWinEvent(_eventObjectShowHookId);
+            _eventObjectShowHookId = 0;
             _eventObjectShowHookCallback = null;
         }
 
