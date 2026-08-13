@@ -82,7 +82,7 @@ public sealed class ExplorerWatcher : IDisposable
         _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
 
-        PollShellCore();
+        PollShellCore(convertNewWindows: false);
         // Keep the background poll at 250ms: new windows are also caught
         // immediately by the WinEvent hooks, so a faster timer only increases
         // idle CPU usage without a visible latency benefit.
@@ -122,7 +122,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         try
         {
-            RunInStaThread(PollShellCore).GetAwaiter().GetResult();
+            RunInStaThread(() => PollShellCore()).GetAwaiter().GetResult();
         }
         catch
         {
@@ -134,7 +134,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
-    private void PollShellCore()
+    private void PollShellCore(bool convertNewWindows = true)
     {
         if (_shellApp == null) return;
 
@@ -168,11 +168,22 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         var recognizedWindows = new HashSet<nint>();
-        foreach (var hwnd in currentTopLevel)
+        if (convertNewWindows)
         {
-            if (_knownTopLevelWindows.Contains(hwnd)) continue;
-            if (HandleNewTopLevelWindow(hwnd, currentItems))
-                recognizedWindows.Add(hwnd);
+            foreach (var hwnd in currentTopLevel)
+            {
+                if (_knownTopLevelWindows.Contains(hwnd)) continue;
+                if (HandleNewTopLevelWindow(hwnd, currentItems))
+                    recognizedWindows.Add(hwnd);
+            }
+        }
+        else
+        {
+            // Initial snapshot: record every already-open window as known so
+            // the first poll does not collapse the user's existing windows
+            // into tabs (which caused a flash on first launch and a garbled
+            // window on first close).
+            recognizedWindows.UnionWith(currentTopLevel);
         }
 
         lock (_itemsLock)
@@ -634,7 +645,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             try
             {
-                await RunInStaThread(PollShellCore);
+                await RunInStaThread(() => PollShellCore());
             }
             catch
             {

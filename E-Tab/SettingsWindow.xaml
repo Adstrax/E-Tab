@@ -145,7 +145,7 @@
 
             <TextBlock x:Name="VersionText"
                        Grid.Row="3"
-                       Text="E-Tab v1.3.0"
+                       Text="E-Tab v1.3.1"
                        Foreground="#8A9099"
                        FontSize="11"
                        Margin="0,24,0,0"/>
