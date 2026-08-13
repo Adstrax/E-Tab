@@ -47,6 +47,7 @@ public sealed class TrayIcon : IDisposable
         foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
             Helper.ShowWindow(hWnd, removeCache: true);
 
+        Log.Info("Exit requested from tray menu.");
         // Use a graceful shutdown so App.OnExit runs and releases the tray
         // icon, WinEvent hooks, COM objects and the single-instance mutex.
         System.Windows.Application.Current.Shutdown();

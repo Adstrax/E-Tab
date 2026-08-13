@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Windows;
 
 namespace ETab;
@@ -18,8 +19,7 @@ public partial class TrayMenuWindow : Window
     public void ShowAtCursor()
     {
         var cursor = System.Windows.Forms.Cursor.Position;
-        using var graphics = System.Drawing.Graphics.FromHwnd(IntPtr.Zero);
-        var dpiScale = graphics.DpiX / 96.0;
+        var dpiScale = GetDpiScaleAt(cursor);
 
         Left = cursor.X / dpiScale - Width + 14;
         Top = cursor.Y / dpiScale - Height - 4;
@@ -31,6 +31,23 @@ public partial class TrayMenuWindow : Window
         Show();
         Activate();
     }
+
+    private static double GetDpiScaleAt(System.Drawing.Point point)
+    {
+        const uint monitorDefaultToNearest = 2;
+        const int effectiveDpi = 0;
+
+        var monitor = MonitorFromPoint(point, monitorDefaultToNearest);
+        if (monitor == 0) return 1.0;
+        if (GetDpiForMonitor(monitor, effectiveDpi, out var dpiX, out _) != 0) return 1.0;
+        return dpiX / 96.0;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint MonitorFromPoint(System.Drawing.Point pt, uint dwFlags);
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(nint hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
     private void OnDeactivated(object sender, EventArgs e)
     {

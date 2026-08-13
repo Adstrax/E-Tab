@@ -16,6 +16,9 @@ public sealed class ExplorerWatcher : IDisposable
 {
     private const string ControlPanelLocation = "shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}";
     private static Guid ShellBrowserGuid = typeof(IShellBrowser).GUID;
+    private const int FastPollMs = 200;
+    private const int IdlePollMs = 1000;
+    private const int FastPollDurationMs = 3000;
 
     private readonly SynchronizationContext _syncContext;
     private readonly object _itemsLock = new();
@@ -40,6 +43,7 @@ public sealed class ExplorerWatcher : IDisposable
     private WinEventDelegate? _eventObjectCreateHookCallback;
     private WinEventDelegate? _eventObjectShowHookCallback;
     private int _polling;
+    private long _fastPollUntilTicks;
     private bool _disposed;
 
     public ExplorerWatcher()
@@ -83,10 +87,9 @@ public sealed class ExplorerWatcher : IDisposable
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
 
         PollShellCore(convertNewWindows: false);
-        // Keep the background poll at 250ms: new windows are also caught
-        // immediately by the WinEvent hooks, so a faster timer only increases
-        // idle CPU usage without a visible latency benefit.
-        _pollTimer = new Timer(PollShell, null, 0, 250);
+        _fastPollUntilTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FastPollDurationMs / 1000;
+        _pollTimer = new Timer(PollShell, null, 0, FastPollMs);
+        Log.Info($"Explorer watcher initialized (explorer PID {_mainExplorerProcessId}).");
     }
 
     private void InstallWinEventHooks()
@@ -124,13 +127,43 @@ public sealed class ExplorerWatcher : IDisposable
         {
             RunInStaThread(() => PollShellCore()).GetAwaiter().GetResult();
         }
-        catch
+        catch (Exception ex)
         {
-            // Explorer can be in a transient state during restart.
+            Log.Warn($"Shell poll failed: {ex.Message}");
         }
         finally
         {
             Interlocked.Exchange(ref _polling, 0);
+            AdjustPollInterval();
+        }
+    }
+
+    private void RequestFastPoll()
+    {
+        _fastPollUntilTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FastPollDurationMs / 1000;
+        try
+        {
+            _pollTimer?.Change(FastPollMs, FastPollMs);
+        }
+        catch
+        {
+            // The timer may already be disposed during shutdown.
+        }
+    }
+
+    private void AdjustPollInterval()
+    {
+        if (_disposed || _pollTimer == null) return;
+
+        var fast = Stopwatch.GetTimestamp() < _fastPollUntilTicks;
+        var interval = fast ? FastPollMs : IdlePollMs;
+        try
+        {
+            _pollTimer.Change(interval, interval);
+        }
+        catch
+        {
+            // The timer may already be disposed during shutdown.
         }
     }
 
@@ -272,6 +305,7 @@ public sealed class ExplorerWatcher : IDisposable
         lock (_itemsLock)
             _pendingConversions.Add(hwnd);
         ScheduleShowFallback(hwnd);
+        RequestFastPoll();
         _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
         return true;
     }
@@ -296,6 +330,8 @@ public sealed class ExplorerWatcher : IDisposable
 
         Helper.HideWindow(hWnd);
         ScheduleShowFallback(hWnd);
+        RequestFastPoll();
+        Log.Info($"New Explorer window detected (0x{hWnd:X}).");
 
         // Poll the shell off the UI thread: PollShell blocks on the STA
         // scheduler, and this callback now runs on the UI thread.
@@ -343,6 +379,8 @@ public sealed class ExplorerWatcher : IDisposable
                 var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
                 if (string.IsNullOrWhiteSpace(target))
                     return;
+
+                Log.Info($"Merging 0x{sourceHwnd:X} into '{target}'.");
 
                 var existingTab = SearchForTab(target);
                 if (existingTab != 0)
@@ -399,11 +437,12 @@ public sealed class ExplorerWatcher : IDisposable
                     await Navigate(tabItem, target);
                     SelectItems(tabItem, TryGetSelectedItems(item));
                 }
-                catch
+                catch (Exception ex)
                 {
                     // Navigation failed (Explorer may be closing or busy).
                     // Close the half-created tab so no stray default tab is
                     // left behind, then restore the source window.
+                    Log.Warn($"Navigation failed for '{target}': {ex.Message}");
                     if (Helper.GetAllExplorerTabs(mainWindowHWnd).Count() > 1)
                         TryQuitTabItem(tabItem);
                     return;
@@ -422,10 +461,11 @@ public sealed class ExplorerWatcher : IDisposable
                 _toOpenWindowsLock.Release();
             }
         }
-        catch
+        catch (Exception ex)
         {
             // Any unexpected failure leaves converted = false, so the
             // finally block below restores the source window.
+            Log.Warn($"Conversion failed for 0x{sourceHwnd:X}: {ex}");
         }
         finally
         {
@@ -600,7 +640,6 @@ public sealed class ExplorerWatcher : IDisposable
         _mainWindowHandle = allWindows
             .Where(h => h != otherThan)
             .Where(h => WinApi.IsWindowVisible(h))
-            .Reverse()
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
             .FirstOrDefault();
 
@@ -811,6 +850,7 @@ public sealed class ExplorerWatcher : IDisposable
             if (e.ProcessId != _mainExplorerProcessId) return;
 
             _mainExplorerProcessId = 0;
+            Log.Warn("Explorer process terminated; reinitializing watcher.");
             DisposeShellObjects();
             StartExplorerProcessCheck();
         }
@@ -868,6 +908,7 @@ public sealed class ExplorerWatcher : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        Log.Info("Explorer watcher disposed.");
 
         _explorerCheckTimer?.Dispose();
         _explorerCheckTimer = null;

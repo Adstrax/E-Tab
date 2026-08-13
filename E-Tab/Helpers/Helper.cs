@@ -67,11 +67,6 @@ public static class Helper
         return window != 0 && WinApi.IsWindowHasClassName(window, "CabinetWClass");
     }
 
-    public static IEnumerable<nint> GetAllExplorerWindows()
-    {
-        return WinApi.FindAllWindowsEx("CabinetWClass");
-    }
-
     public static IEnumerable<nint> GetAllExplorerTabs(nint window)
     {
         return WinApi.FindAllWindowsEx("ShellTabWindowClass", window);

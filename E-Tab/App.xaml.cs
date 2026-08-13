@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading;
 using System.Windows;
+using ETab.Helpers;
 using ETab.Hooks;
 
 namespace ETab;
@@ -18,6 +19,7 @@ public partial class App : Application
 
         if (!createdNew)
         {
+            Log.Info("Another E-Tab instance is already running; exiting.");
             MessageBox.Show(
                 "E-Tab is already running in the system tray.",
                 "E-Tab",
@@ -29,6 +31,7 @@ public partial class App : Application
 
         base.OnStartup(e);
 
+        Log.Info($"E-Tab started ({GetType().Assembly.GetName().Version}).");
         _explorerWatcher = new ExplorerWatcher();
         _trayIcon = new TrayIcon();
 
@@ -38,6 +41,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        Log.Info("E-Tab exiting.");
         _trayIcon?.Dispose();
         _explorerWatcher?.Dispose();
         _mutex?.Dispose();
