@@ -421,7 +421,7 @@ public sealed class ExplorerWatcher : IDisposable
                     mainWindowHWnd,
                     currentTabs,
                     2_000,
-                    sleepMs: 10);
+                    sleepMs: 5);
                 if (newTabHandle == 0)
                     return;
 
@@ -665,18 +665,53 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
-    private object? GetItemByTabHandle(nint tabHandle)
+    /// <summary>
+    /// Looks up the Shell item for a tab handle without running the full shell
+    /// snapshot. This is used while waiting for a newly created tab so the wait
+    /// is both faster and cheaper than a complete PollShellCore pass.
+    /// </summary>
+    private object? FindShellItemForTab(nint tabHandle)
     {
-        lock (_itemsLock)
-            return _tabToItem.TryGetValue(tabHandle, out var item) ? item : null;
+        if (_shellApp == null) return null;
+
+        object? found = null;
+        try
+        {
+            dynamic windows = ((dynamic)_shellApp).Windows();
+            var count = (int)windows.Count;
+            for (var i = 0; i < count; i++)
+            {
+                object item;
+                try
+                {
+                    item = (object)windows.Item(i);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (GetTabHandle(item) == tabHandle)
+                {
+                    found = item;
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            // ShellWindows can be temporarily unavailable during tab creation.
+        }
+
+        if (found != null)
+        {
+            lock (_itemsLock)
+                _tabToItem[tabHandle] = found;
+        }
+
+        return found;
     }
 
-    /// <summary>
-    /// Waits for the Shell item of a newly created tab to be registered.
-    /// Polls the shell synchronously on the STA thread so the enumeration is
-    /// guaranteed to have completed before each lookup, instead of queuing an
-    /// asynchronous poll that may lag behind the check.
-    /// </summary>
     private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
     {
         var startTicks = Stopwatch.GetTimestamp();
@@ -684,17 +719,15 @@ public sealed class ExplorerWatcher : IDisposable
         {
             try
             {
-                await RunInStaThread(() => PollShellCore());
+                var item = await RunInStaThread(() => FindShellItemForTab(tabHandle));
+                if (item != null) return item;
             }
             catch
             {
                 // Explorer can be in a transient state during tab creation.
             }
 
-            var item = GetItemByTabHandle(tabHandle);
-            if (item != null) return item;
-
-            await Task.Delay(15);
+            await Task.Delay(5);
         }
 
         return null;
@@ -836,6 +869,11 @@ public sealed class ExplorerWatcher : IDisposable
     private Task RunInStaThread(Action action)
     {
         return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
+    }
+
+    private Task<T> RunInStaThread<T>(Func<T> func)
+    {
+        return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
     }
 
     private void StartExplorerProcessCheck()

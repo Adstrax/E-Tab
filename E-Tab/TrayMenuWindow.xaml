@@ -75,7 +75,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v1.4.0"
+                                   Text="v1.5.0"
                                    Foreground="#A7ADB5"
                                    FontSize="11"/>
                     </StackPanel>
