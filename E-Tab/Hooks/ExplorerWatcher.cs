@@ -27,6 +27,7 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly Dictionary<nint, object> _tabToItem = new();
     private readonly HashSet<nint> _knownTopLevelWindows = new();
     private readonly HashSet<nint> _pendingConversions = new();
+    private readonly Dictionary<nint, long> _firstSeenTicks = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
     private readonly ProcessWatcher _processWatcher;
     private readonly StaTaskScheduler _staTaskScheduler;
@@ -224,6 +225,9 @@ public sealed class ExplorerWatcher : IDisposable
             _knownTopLevelWindows.RemoveWhere(h => !currentTopLevel.Contains(h));
             _knownTopLevelWindows.UnionWith(recognizedWindows);
 
+            foreach (var staleSeen in _firstSeenTicks.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
+                _firstSeenTicks.Remove(staleSeen);
+
             var currentTabHandles = new HashSet<nint>();
             foreach (var (item, hwnd) in currentItems)
             {
@@ -276,7 +280,11 @@ public sealed class ExplorerWatcher : IDisposable
             }
         }
 
-        if (item == null) return false;
+        if (item == null)
+        {
+            MarkUnconvertibleIfStale(hwnd);
+            return false;
+        }
 
         lock (_itemsLock)
         {
@@ -294,7 +302,11 @@ public sealed class ExplorerWatcher : IDisposable
             return true;
         }
 
-        if (GetTabHandle(item) == 0) return false;
+        if (GetTabHandle(item) == 0)
+        {
+            MarkUnconvertibleIfStale(hwnd);
+            return false;
+        }
         if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1)
         {
             Helper.ShowWindow(hwnd, removeCache: true);
@@ -308,6 +320,34 @@ public sealed class ExplorerWatcher : IDisposable
         RequestFastPoll();
         _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
         return true;
+    }
+
+    /// <summary>
+    /// A window that ShellWindows cannot map to a convertible item (for
+    /// example an elevated Explorer window, which a non-elevated process
+    /// cannot enumerate via COM) would otherwise be hidden on every SHOW
+    /// event and restored by the 3-second fallback, flickering forever.
+    /// After a short grace period, give up on such windows: show them and
+    /// mark them as known so OnWindowShown stops hiding them.
+    /// </summary>
+    private void MarkUnconvertibleIfStale(nint hwnd)
+    {
+        lock (_itemsLock)
+        {
+            if (!_firstSeenTicks.TryGetValue(hwnd, out var firstSeen))
+            {
+                _firstSeenTicks[hwnd] = Stopwatch.GetTimestamp();
+                return;
+            }
+
+            if (!Helper.IsTimeUp(firstSeen, 1_000))
+                return;
+
+            _firstSeenTicks.Remove(hwnd);
+            _knownTopLevelWindows.Add(hwnd);
+            Helper.ShowWindow(hwnd, removeCache: true);
+            Log.Warn($"Window 0x{hwnd:X} cannot be merged into a tab; leaving it visible.");
+        }
     }
 
     private void OnWindowShown(
@@ -928,6 +968,7 @@ public sealed class ExplorerWatcher : IDisposable
             _tabToItem.Clear();
             _knownTopLevelWindows.Clear();
             _pendingConversions.Clear();
+            _firstSeenTicks.Clear();
         }
 
         _shellPathComparer?.Dispose();
