@@ -8,9 +8,9 @@
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>1.5.1</Version>
-        <AssemblyVersion>1.5.1.0</AssemblyVersion>
-        <FileVersion>1.5.1.0</FileVersion>
+        <Version>1.5.2</Version>
+        <AssemblyVersion>1.5.2.0</AssemblyVersion>
+        <FileVersion>1.5.2.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>

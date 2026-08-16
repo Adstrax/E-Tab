@@ -1,6 +1,8 @@
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Input;
 using ETab.Helpers;
+using ETab.WinAPI;
 
 namespace ETab;
 
@@ -13,12 +15,22 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         var version = typeof(SettingsWindow).Assembly.GetName().Version;
         VersionText.Text = version == null ? "E-Tab" : $"E-Tab v{version.ToString(3)}";
+        ThemeManager.ThemeChanged += ApplyAcrylicTint;
+        SourceInitialized += (_, _) => ApplyAcrylicTint();
+        Closed += (_, _) => ThemeManager.ThemeChanged -= ApplyAcrylicTint;
         Loaded += (_, _) =>
         {
             _suppressToggle = true;
             AutoStartToggle.IsChecked = AutoStartManager.IsEnabled();
             _suppressToggle = false;
         };
+    }
+
+    private void ApplyAcrylicTint()
+    {
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == 0) return;
+        WinApi.ApplyLegacyAcrylic(handle, ThemeManager.GetAcrylicTint(tray: false));
     }
 
     private void OnTitleDrag(object sender, MouseButtonEventArgs e)

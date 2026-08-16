@@ -19,7 +19,7 @@
     <Window.Resources>
         <Style x:Key="MenuButtonStyle" TargetType="Button">
             <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="Foreground" Value="#F2F3F5"/>
+            <Setter Property="Foreground" Value="{DynamicResource EtabTextPrimary}"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="FontFamily" Value="Segoe UI Variable Text, Segoe UI"/>
             <Setter Property="FontSize" Value="13"/>
@@ -38,10 +38,10 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="#14FFFFFF"/>
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource EtabHoverOverlay}"/>
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="Chrome" Property="Background" Value="#24FFFFFF"/>
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource EtabPressedOverlay}"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -51,8 +51,8 @@
     </Window.Resources>
 
     <Border CornerRadius="8"
-            Background="#F026292F"
-            BorderBrush="#33FFFFFF"
+            Background="{DynamicResource EtabMenuOverlay}"
+            BorderBrush="{DynamicResource EtabMenuBorderBrush}"
             BorderThickness="1"
             Padding="6">
         <Border.Effect>
@@ -62,7 +62,6 @@
                               Color="#000000"
                               Opacity="0.45"/>
         </Border.Effect>
-
         <StackPanel>
             <Grid Margin="8,10,8,8">
                 <StackPanel Orientation="Horizontal">
@@ -72,30 +71,31 @@
                            RenderOptions.BitmapScalingMode="HighQuality"/>
                     <StackPanel Margin="10,0,0,0" VerticalAlignment="Center">
                         <TextBlock Text="E-Tab"
+                                   Foreground="{DynamicResource EtabTextPrimary}"
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v1.5.0"
-                                   Foreground="#A7ADB5"
+                                   Text="v1.5.2"
+                                   Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
                 </StackPanel>
             </Grid>
 
-            <Border Height="1" Background="#1FFFFFFF" Margin="8,0"/>
+            <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
             <StackPanel Orientation="Horizontal" Margin="12,10,0,10">
                 <Ellipse Width="8"
                          Height="8"
-                         Fill="#4CC84C"
+                         Fill="{DynamicResource EtabAccent}"
                          VerticalAlignment="Center"/>
                 <TextBlock Text="Active · Folders open in new tabs"
-                           Foreground="#D7DADE"
+                           Foreground="{DynamicResource EtabTextOnPill}"
                            FontSize="12.5"
                            Margin="10,0,0,0"/>
             </StackPanel>
 
-            <Border Height="1" Background="#1FFFFFFF" Margin="8,0"/>
+            <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
             <Button x:Name="SettingsButton"
                     Content="Settings"

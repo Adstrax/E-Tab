@@ -31,6 +31,7 @@ public partial class App : Application
 
         base.OnStartup(e);
 
+        ThemeManager.Initialize(this);
         Log.Info($"E-Tab started ({GetType().Assembly.GetName().Version}).");
         _explorerWatcher = new ExplorerWatcher();
         _trayIcon = new TrayIcon();

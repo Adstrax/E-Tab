@@ -1,6 +1,9 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
+using ETab.Helpers;
+using ETab.WinAPI;
 
 namespace ETab;
 
@@ -14,6 +17,16 @@ public partial class TrayMenuWindow : Window
         InitializeComponent();
         var version = typeof(TrayMenuWindow).Assembly.GetName().Version;
         VersionText.Text = version == null ? string.Empty : $"v{version.ToString(3)}";
+        ThemeManager.ThemeChanged += ApplyAcrylicTint;
+        SourceInitialized += (_, _) => ApplyAcrylicTint();
+        Closed += (_, _) => ThemeManager.ThemeChanged -= ApplyAcrylicTint;
+    }
+
+    private void ApplyAcrylicTint()
+    {
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == 0) return;
+        WinApi.ApplyLegacyAcrylic(handle, ThemeManager.GetAcrylicTint(tray: true));
     }
 
     public void ShowAtCursor()

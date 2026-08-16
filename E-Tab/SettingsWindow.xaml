@@ -16,6 +16,35 @@
         SnapsToDevicePixels="True"
         MouseLeftButtonDown="OnTitleDrag">
     <Window.Resources>
+        <Style x:Key="Win11CloseButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="{DynamicResource EtabTextSecondary}"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Chrome"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="5"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource EtabHoverOverlay}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource EtabTextPrimary}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource EtabPressedOverlay}"/>
+                                <Setter Property="Foreground" Value="{DynamicResource EtabTextPrimary}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <Style x:Key="Win11ToggleStyle" TargetType="ToggleButton">
             <Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Focusable" Value="False"/>
@@ -27,13 +56,13 @@
                                     Width="42"
                                     Height="22"
                                     CornerRadius="11"
-                                    Background="#3A3F47"
-                                    BorderBrush="#4A505A"
+                                    Background="{DynamicResource EtabToggleTrack}"
+                                    BorderBrush="{DynamicResource EtabToggleBorder}"
                                     BorderThickness="1"/>
                             <Ellipse x:Name="Thumb"
                                      Width="16"
                                      Height="16"
-                                     Fill="#F2F3F5"
+                                     Fill="{DynamicResource EtabToggleThumb}"
                                      HorizontalAlignment="Left"
                                      Margin="3,0,0,0"/>
                         </Grid>
@@ -52,8 +81,8 @@
     </Window.Resources>
 
     <Border CornerRadius="8"
-            Background="#20242A"
-            BorderBrush="#3A3F47"
+            Background="{DynamicResource EtabWindowOverlay}"
+            BorderBrush="{DynamicResource EtabBorderBrush}"
             BorderThickness="1"
             Padding="22">
         <Border.Effect>
@@ -63,7 +92,6 @@
                               Color="#000000"
                               Opacity="0.35"/>
         </Border.Effect>
-
         <Grid>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
@@ -80,10 +108,11 @@
                            RenderOptions.BitmapScalingMode="HighQuality"/>
                     <StackPanel Margin="12,0,0,0">
                         <TextBlock Text="E-Tab Settings"
+                                   Foreground="{DynamicResource EtabTextPrimary}"
                                    FontSize="16"
                                    FontWeight="SemiBold"/>
                         <TextBlock Text="Open folders in new tabs"
-                                   Foreground="#A7ADB5"
+                                   Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="12"
                                    Margin="0,3,0,0"/>
                     </StackPanel>
@@ -95,17 +124,14 @@
                         Height="28"
                         HorizontalAlignment="Right"
                         VerticalAlignment="Center"
-                        Background="Transparent"
-                        BorderThickness="0"
-                        Foreground="#A7ADB5"
+                        Style="{StaticResource Win11CloseButtonStyle}"
                         FontSize="14"
-                        Cursor="Hand"
                         Click="CloseButton_Click"/>
             </Grid>
 
             <Border Grid.Row="1"
-                    Background="#12FFFFFF"
-                    BorderBrush="#22FFFFFF"
+                    Background="{DynamicResource EtabPillBackground}"
+                    BorderBrush="{DynamicResource EtabPillBorder}"
                     BorderThickness="1"
                     CornerRadius="6"
                     Padding="12,10"
@@ -113,10 +139,10 @@
                 <StackPanel Orientation="Horizontal">
                     <Ellipse Width="8"
                              Height="8"
-                             Fill="#4CC84C"
+                             Fill="{DynamicResource EtabAccent}"
                              VerticalAlignment="Center"/>
                     <TextBlock Text="Active · New folder windows become tabs"
-                               Foreground="#D7DADE"
+                               Foreground="{DynamicResource EtabTextOnPill}"
                                FontSize="13"
                                Margin="10,0,0,0"/>
                 </StackPanel>
@@ -125,10 +151,11 @@
             <Grid Grid.Row="2" Margin="0,22,0,0">
                 <StackPanel>
                     <TextBlock Text="Start with Windows"
+                               Foreground="{DynamicResource EtabTextPrimary}"
                                FontSize="14"
                                FontWeight="SemiBold"/>
                     <TextBlock Text="Run E-Tab in the tray after signing in"
-                               Foreground="#A7ADB5"
+                               Foreground="{DynamicResource EtabTextSecondary}"
                                FontSize="12"
                                Margin="0,4,0,0"/>
                 </StackPanel>
@@ -145,8 +172,8 @@
 
             <TextBlock x:Name="VersionText"
                        Grid.Row="3"
-                       Text="E-Tab v1.5.0"
-                       Foreground="#8A9099"
+                       Text="E-Tab v1.5.2"
+                       Foreground="{DynamicResource EtabTextMuted}"
                        FontSize="11"
                        Margin="0,24,0,0"/>
         </Grid>

@@ -2,9 +2,19 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
 using ETab.Helpers;
 
 namespace ETab.WinAPI;
+
+public enum Win11Backdrop
+{
+    Mica,
+    MicaAlt,
+    Acrylic,
+}
 
 public static class WinApi
 {
@@ -22,6 +32,28 @@ public static class WinApi
     public const uint SWP_HIDEWINDOW = 0x0080;
 
     public const uint SIGDN_URL = 0x80068000;
+
+    // DWM attributes for Windows 11 system backdrop / rounded corners.
+    public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    public const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+    public const int DWMSBT_MAINWINDOW = 2; // Mica
+    public const int DWMSBT_TRANSIENTWINDOW = 3; // Acrylic (temporary window)
+    public const int DWMSBT_TABBEDWINDOW = 4; // Mica Alt (tabbed windows, e.g. File Explorer)
+    public const int DWMWCP_ROUND = 2;
+
+    public const int GWL_STYLE = -16;
+    public const long WS_CAPTION = 0x00C00000L;
+    public const long WS_SYSMENU = 0x00080000L;
+
+    public const int WTA_NONCLIENT = 1;
+    public const uint WTNCA_NODRAWCAPTION = 0x1;
+    public const uint WTNCA_NODRAWICON = 0x2;
+    public const uint WTNCA_NOMIRRORHELP = 0x8;
+    public const uint WTNCA_NOSYSMENU = 0x10;
+
+    public const int WCA_ACCENT_POLICY = 19;
+    public const int ACCENT_ENABLE_ACRYLICBLURBEHIND = 4;
 
     [DllImport("user32.dll")]
     public static extern nint SetWinEventHook(
@@ -53,6 +85,51 @@ public static class WinApi
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(nint handle, int nCmdShow);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern nint GetWindowLongPtr64(nint hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern nint SetWindowLongPtr64(nint hWnd, int nIndex, nint dwNewLong);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    private static extern int GetWindowLong32(nint hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+    private static extern int SetWindowLong32(nint hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("uxtheme.dll", ExactSpelling = true)]
+    public static extern int SetWindowThemeAttribute(nint hwnd, int eAttribute, ref WTA_OPTIONS pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll")]
+    public static extern int SetWindowCompositionAttribute(nint hwnd, ref WINDOWCOMPOSITIONATTRIBDATA data);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WTA_OPTIONS
+    {
+        public uint dwFlags;
+        public uint dwMask;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ACCENT_POLICY
+    {
+        public int AccentState;
+        public int AccentFlags;
+        public int GradientColor;
+        public int AnimationId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WINDOWCOMPOSITIONATTRIBDATA
+    {
+        public int Attribute;
+        public nint Data;
+        public int SizeOfData;
+    }
 
     [DllImport("user32.dll")]
     public static extern bool IsIconic(nint handle);
@@ -135,6 +212,108 @@ public static class WinApi
     {
         var currentClassName = GetWindowClassName(hWnd, className.Length);
         return string.Equals(currentClassName, className, comparison);
+    }
+
+    /// <summary>
+    /// Makes the WPF composition surface transparent so the DWM system backdrop
+    /// (Mica / Mica Alt / Acrylic) is actually visible. Must be called after the
+    /// window handle exists, e.g. on SourceInitialized.
+    /// </summary>
+    public static void MakeWindowBackdropVisible(Window window)
+    {
+        var hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == 0) return;
+
+        var source = HwndSource.FromHwnd(hwnd);
+        if (source?.CompositionTarget is { } target)
+            target.BackgroundColor = Colors.Transparent;
+    }
+
+    /// <summary>
+    /// Classic acrylic via SetWindowCompositionAttribute (works on Windows 10
+    /// and 11, layered windows included). Color is ABGR: 0xAABBGGRR.
+    /// </summary>
+    public static void ApplyLegacyAcrylic(nint hwnd, int gradientColor)
+    {
+        if (hwnd == 0) return;
+
+        var accent = new ACCENT_POLICY
+        {
+            AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND,
+            GradientColor = gradientColor,
+        };
+        var data = new WINDOWCOMPOSITIONATTRIBDATA
+        {
+            Attribute = WCA_ACCENT_POLICY,
+            Data = Marshal.AllocHGlobal(Marshal.SizeOf<ACCENT_POLICY>()),
+            SizeOfData = Marshal.SizeOf<ACCENT_POLICY>(),
+        };
+        try
+        {
+            Marshal.StructureToPtr(accent, data.Data, false);
+            var hr = SetWindowCompositionAttribute(hwnd, ref data);
+            if (hr != 0)
+                Log.Warn($"SetWindowCompositionAttribute(acrylic) failed: 0x{hr:X8}");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(data.Data);
+        }
+    }
+
+    /// <summary>
+    /// Makes DWM treat a visually borderless window as a native frame: keeps
+    /// WS_CAPTION so system backdrops (Mica/Acrylic), shadows and rounded
+    /// corners actually render, while hiding the drawn caption and system menu.
+    /// </summary>
+    public static void MakeWindowLookNative(nint hwnd)
+    {
+        if (hwnd == 0) return;
+
+        var style = IntPtr.Size == 8
+            ? GetWindowLongPtr64(hwnd, GWL_STYLE).ToInt64()
+            : GetWindowLong32(hwnd, GWL_STYLE);
+        style |= WS_CAPTION;
+        style &= ~WS_SYSMENU;
+        if (IntPtr.Size == 8)
+            SetWindowLongPtr64(hwnd, GWL_STYLE, new nint(style));
+        else
+            SetWindowLong32(hwnd, GWL_STYLE, (int)style);
+
+        var options = new WTA_OPTIONS
+        {
+            dwFlags = WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON | WTNCA_NOMIRRORHELP | WTNCA_NOSYSMENU,
+            dwMask = WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON | WTNCA_NOMIRRORHELP | WTNCA_NOSYSMENU,
+        };
+        SetWindowThemeAttribute(hwnd, WTA_NONCLIENT, ref options, Marshal.SizeOf<WTA_OPTIONS>());
+    }
+
+    /// <summary>
+    /// Applies a Windows 11 native system backdrop plus DWM rounded corners and
+    /// a dark-mode tint. Requires Windows 11 22H2 (Build 22621) or later; DWM
+    /// failures are logged but do not crash the app.
+    /// </summary>
+    public static void ApplyWin11Backdrop(nint hwnd, Win11Backdrop backdrop)
+    {
+        if (hwnd == 0) return;
+
+        var darkMode = 1;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref darkMode, sizeof(int));
+
+        var backdropValue = backdrop switch
+        {
+            Win11Backdrop.Acrylic => DWMSBT_TRANSIENTWINDOW,
+            Win11Backdrop.MicaAlt => DWMSBT_TABBEDWINDOW,
+            _ => DWMSBT_MAINWINDOW,
+        };
+        var hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref backdropValue, sizeof(int));
+        if (hr != 0)
+            Log.Warn($"DwmSetWindowAttribute(SYSTEMBACKDROP_TYPE={backdrop}) failed: 0x{hr:X8}");
+
+        var corner = DWMWCP_ROUND;
+        hr = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
+        if (hr != 0)
+            Log.Warn($"DwmSetWindowAttribute(WINDOW_CORNER_PREFERENCE) failed: 0x{hr:X8}");
     }
 
     public static string? GetProcessPath(int pid)
