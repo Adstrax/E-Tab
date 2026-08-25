@@ -12,6 +12,8 @@ public partial class TrayMenuWindow : Window
     public event Action? SettingsRequested;
     public event Action? ExitRequested;
 
+    private bool _suppressToggle;
+
     public TrayMenuWindow()
     {
         InitializeComponent();
@@ -41,8 +43,18 @@ public partial class TrayMenuWindow : Window
         if (Left < workArea.Left) Left = workArea.Left + 8;
         if (Top < workArea.Top) Top = workArea.Top + 8;
 
+        _suppressToggle = true;
+        AutoStartToggle.IsChecked = AutoStartManager.IsEnabled();
+        _suppressToggle = false;
+
         Show();
         Activate();
+    }
+
+    private void AutoStartToggle_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_suppressToggle) return;
+        AutoStartManager.SetEnabled(AutoStartToggle.IsChecked == true);
     }
 
     private static double GetDpiScaleAt(System.Drawing.Point point)

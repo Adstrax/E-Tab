@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="E-Tab"
         Width="264"
-        Height="172"
+        Height="214"
         WindowStyle="None"
         AllowsTransparency="True"
         Background="Transparent"
@@ -48,6 +48,39 @@
                 </Setter.Value>
             </Setter>
         </Style>
+        <Style x:Key="Win11ToggleStyle" TargetType="ToggleButton">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToggleButton">
+                        <Grid>
+                            <Border x:Name="Track"
+                                    Width="42"
+                                    Height="22"
+                                    CornerRadius="11"
+                                    Background="{DynamicResource EtabToggleTrack}"
+                                    BorderBrush="{DynamicResource EtabToggleBorder}"
+                                    BorderThickness="1"/>
+                            <Ellipse x:Name="Thumb"
+                                     Width="16"
+                                     Height="16"
+                                     Fill="{DynamicResource EtabToggleThumb}"
+                                     HorizontalAlignment="Left"
+                                     Margin="3,0,0,0"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Track" Property="Background" Value="#0067C0"/>
+                                <Setter TargetName="Track" Property="BorderBrush" Value="#0067C0"/>
+                                <Setter TargetName="Thumb" Property="HorizontalAlignment" Value="Right"/>
+                                <Setter TargetName="Thumb" Property="Margin" Value="0,0,3,0"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
     </Window.Resources>
 
     <Border CornerRadius="8"
@@ -75,7 +108,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v2.0.0"
+                                   Text="v2.1.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
@@ -94,6 +127,23 @@
                            FontSize="12.5"
                            Margin="10,0,0,0"/>
             </StackPanel>
+
+            <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
+
+            <Grid Margin="12,9,12,9">
+                <TextBlock Text="Start with Windows"
+                           Foreground="{DynamicResource EtabTextPrimary}"
+                           FontSize="13"
+                           VerticalAlignment="Center"/>
+                <ToggleButton x:Name="AutoStartToggle"
+                              Style="{StaticResource Win11ToggleStyle}"
+                              HorizontalAlignment="Right"
+                              VerticalAlignment="Center"
+                              AutomationProperties.Name="Start with Windows"
+                              AutomationProperties.AutomationId="AutoStartToggle"
+                              Checked="AutoStartToggle_Changed"
+                              Unchecked="AutoStartToggle_Changed"/>
+            </Grid>
 
             <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
