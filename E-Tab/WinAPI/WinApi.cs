@@ -104,7 +104,7 @@ public static class WinApi
     [DllImport("uxtheme.dll", ExactSpelling = true)]
     public static extern int SetWindowThemeAttribute(nint hwnd, int eAttribute, ref WTA_OPTIONS pvAttribute, int cbAttribute);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern int SetWindowCompositionAttribute(nint hwnd, ref WINDOWCOMPOSITIONATTRIBDATA data);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -251,9 +251,9 @@ public static class WinApi
         try
         {
             Marshal.StructureToPtr(accent, data.Data, false);
-            var hr = SetWindowCompositionAttribute(hwnd, ref data);
-            if (hr != 0)
-                Log.Warn($"SetWindowCompositionAttribute(acrylic) failed: 0x{hr:X8}");
+            // Returns BOOL: nonzero means success.
+            if (SetWindowCompositionAttribute(hwnd, ref data) == 0)
+                Log.Warn($"SetWindowCompositionAttribute(acrylic) failed: {Marshal.GetLastWin32Error()}");
         }
         finally
         {

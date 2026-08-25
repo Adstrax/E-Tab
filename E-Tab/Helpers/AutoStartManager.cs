@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using Microsoft.Win32;
 
 namespace ETab.Helpers;
@@ -30,7 +31,10 @@ public static class AutoStartManager
     {
         var path = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(path))
-            path = typeof(AutoStartManager).Assembly.Location;
+        {
+            var exeName = $"{typeof(AutoStartManager).Assembly.GetName().Name ?? "E-Tab"}.exe";
+            path = Path.Combine(AppContext.BaseDirectory, exeName);
+        }
 
         return $"\"{path}\"";
     }
