@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using System.Threading;
 using System.Windows;
 using ETab.Helpers;
@@ -35,9 +34,6 @@ public partial class App : Application
         Log.Info($"E-Tab started ({GetType().Assembly.GetName().Version}).");
         _explorerWatcher = new ExplorerWatcher();
         _trayIcon = new TrayIcon();
-
-        if (e.Args.Any(arg => string.Equals(arg, "--settings", StringComparison.OrdinalIgnoreCase)))
-            _trayIcon.OpenSettings();
     }
 
     protected override void OnExit(ExitEventArgs e)

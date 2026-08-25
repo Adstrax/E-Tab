@@ -9,7 +9,6 @@ namespace ETab;
 
 public partial class TrayMenuWindow : Window
 {
-    public event Action? SettingsRequested;
     public event Action? ExitRequested;
 
     private bool _suppressToggle;
@@ -81,12 +80,6 @@ public partial class TrayMenuWindow : Window
 
     private void OnDeactivated(object sender, EventArgs e)
     {
-        Close();
-    }
-
-    private void SettingsButton_Click(object sender, RoutedEventArgs e)
-    {
-        SettingsRequested?.Invoke();
         Close();
     }
 

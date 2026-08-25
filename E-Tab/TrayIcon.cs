@@ -10,7 +10,6 @@ public sealed class TrayIcon : IDisposable
 {
     private readonly NotifyIcon _notifyIcon;
     private TrayMenuWindow? _menuWindow;
-    private SettingsWindow? _settingsWindow;
 
     public TrayIcon()
     {
@@ -24,7 +23,7 @@ public sealed class TrayIcon : IDisposable
         };
 
         _notifyIcon.MouseUp += OnTrayMouseUp;
-        _notifyIcon.DoubleClick += (_, _) => OpenSettings();
+        _notifyIcon.DoubleClick += (_, _) => ShowMenu();
     }
 
     private void OnTrayMouseUp(object? sender, MouseEventArgs e)
@@ -37,7 +36,6 @@ public sealed class TrayIcon : IDisposable
     {
         _menuWindow?.Close();
         _menuWindow = new TrayMenuWindow();
-        _menuWindow.SettingsRequested += OpenSettings;
         _menuWindow.ExitRequested += ExitApplication;
         _menuWindow.ShowAtCursor();
     }
@@ -51,18 +49,6 @@ public sealed class TrayIcon : IDisposable
         // Use a graceful shutdown so App.OnExit runs and releases the tray
         // icon, WinEvent hooks, COM objects and the single-instance mutex.
         System.Windows.Application.Current.Shutdown();
-    }
-
-    public void OpenSettings()
-    {
-        if (_settingsWindow == null || !_settingsWindow.IsLoaded)
-        {
-            _settingsWindow = new SettingsWindow();
-            _settingsWindow.Closed += (_, _) => _settingsWindow = null;
-            _settingsWindow.Show();
-        }
-
-        _settingsWindow.Activate();
     }
 
     public void Dispose()

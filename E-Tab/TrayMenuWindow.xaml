@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="E-Tab"
         Width="264"
-        Height="214"
+        Height="178"
         WindowStyle="None"
         Background="Transparent"
         ResizeMode="NoResize"
@@ -100,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v2.2.0"
+                                   Text="v2.3.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
@@ -139,13 +139,6 @@
 
             <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
-            <Button x:Name="SettingsButton"
-                    Content="Settings"
-                    Style="{StaticResource MenuButtonStyle}"
-                    Margin="0,4,0,0"
-                    AutomationProperties.Name="Settings"
-                    AutomationProperties.AutomationId="SettingsButton"
-                    Click="SettingsButton_Click"/>
             <Button x:Name="ExitButton"
                     Content="Exit"
                     Style="{StaticResource MenuButtonStyle}"
