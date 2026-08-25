@@ -172,7 +172,7 @@
 
             <TextBlock x:Name="VersionText"
                        Grid.Row="3"
-                       Text="E-Tab v2.1.0"
+                       Text="E-Tab v2.2.0"
                        Foreground="{DynamicResource EtabTextMuted}"
                        FontSize="11"
                        Margin="0,24,0,0"/>

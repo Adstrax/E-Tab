@@ -19,15 +19,20 @@ public partial class TrayMenuWindow : Window
         InitializeComponent();
         var version = typeof(TrayMenuWindow).Assembly.GetName().Version;
         VersionText.Text = version == null ? string.Empty : $"v{version.ToString(3)}";
-        ThemeManager.ThemeChanged += ApplyAcrylicTint;
-        SourceInitialized += (_, _) => ApplyAcrylicTint();
-        Closed += (_, _) => ThemeManager.ThemeChanged -= ApplyAcrylicTint;
+        ThemeManager.ThemeChanged += ApplyBackdrop;
+        SourceInitialized += (_, _) => ApplyBackdrop();
+        ContentRendered += (_, _) => ApplyBackdrop();
+        Closed += (_, _) => ThemeManager.ThemeChanged -= ApplyBackdrop;
     }
 
-    private void ApplyAcrylicTint()
+    private void ApplyBackdrop()
     {
         var handle = new WindowInteropHelper(this).Handle;
         if (handle == 0) return;
+
+        WinApi.MakeWindowBackdropVisible(this);
+        WinApi.ExtendGlassFrame(handle);
+        WinApi.ApplyRoundedCorners(handle);
         WinApi.ApplyLegacyAcrylic(handle, ThemeManager.GetAcrylicTint(tray: true));
     }
 

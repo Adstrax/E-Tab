@@ -1,7 +1,7 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <SolidColorBrush x:Key="EtabWindowOverlay" Color="#CCF5F6F7"/>
-    <SolidColorBrush x:Key="EtabMenuOverlay" Color="#C7F5F6F7"/>
+    <SolidColorBrush x:Key="EtabMenuOverlay" Color="#B8F5F6F7"/>
     <SolidColorBrush x:Key="EtabBorderBrush" Color="#26000000"/>
     <SolidColorBrush x:Key="EtabMenuBorderBrush" Color="#1A000000"/>
     <SolidColorBrush x:Key="EtabTextPrimary" Color="#1B1B1F"/>

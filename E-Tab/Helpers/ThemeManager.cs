@@ -51,8 +51,8 @@ public static class ThemeManager
     public static int GetAcrylicTint(bool tray)
     {
         return IsDark
-            ? tray ? unchecked((int)0x4C2F2926) : unchecked((int)0x4C2A2420)
-            : unchecked((int)0x4CF8F6F4);
+            ? tray ? unchecked((int)0x402F2926) : unchecked((int)0x4C2A2420)
+            : tray ? unchecked((int)0x40F8F6F4) : unchecked((int)0x4CF8F6F4);
     }
 
     private static bool IsSystemDarkMode()

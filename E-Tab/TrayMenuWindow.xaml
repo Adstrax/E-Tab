@@ -5,7 +5,6 @@
         Width="264"
         Height="214"
         WindowStyle="None"
-        AllowsTransparency="True"
         Background="Transparent"
         ResizeMode="NoResize"
         ShowInTaskbar="False"
@@ -88,13 +87,6 @@
             BorderBrush="{DynamicResource EtabMenuBorderBrush}"
             BorderThickness="1"
             Padding="6">
-        <Border.Effect>
-            <DropShadowEffect BlurRadius="24"
-                              ShadowDepth="8"
-                              Direction="270"
-                              Color="#000000"
-                              Opacity="0.45"/>
-        </Border.Effect>
         <StackPanel>
             <Grid Margin="8,10,8,8">
                 <StackPanel Orientation="Horizontal">
@@ -108,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v2.1.0"
+                                   Text="v2.2.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>

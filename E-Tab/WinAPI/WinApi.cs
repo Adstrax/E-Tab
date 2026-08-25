@@ -89,6 +89,18 @@ public static class WinApi
     [DllImport("dwmapi.dll")]
     public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmExtendFrameIntoClientArea(nint hwnd, ref MARGINS pMarInset);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MARGINS
+    {
+        public int cxLeftWidth;
+        public int cxRightWidth;
+        public int cyTopHeight;
+        public int cyBottomHeight;
+    }
+
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern nint GetWindowLongPtr64(nint hWnd, int nIndex);
 
@@ -227,6 +239,37 @@ public static class WinApi
         var source = HwndSource.FromHwnd(hwnd);
         if (source?.CompositionTarget is { } target)
             target.BackgroundColor = Colors.Transparent;
+    }
+
+    /// <summary>
+    /// Extends the DWM glass frame over the whole client area so a non-layered
+    /// WPF window can be transparent and let the WCA acrylic backdrop show
+    /// through, while DWM still rounds the window corners.
+    /// </summary>
+    public static void ExtendGlassFrame(nint hwnd)
+    {
+        if (hwnd == 0) return;
+
+        var margins = new MARGINS
+        {
+            cxLeftWidth = -1,
+            cxRightWidth = -1,
+            cyTopHeight = -1,
+            cyBottomHeight = -1,
+        };
+        DwmExtendFrameIntoClientArea(hwnd, ref margins);
+    }
+
+    /// <summary>
+    /// Asks DWM to round the window corners (only applies to non-layered
+    /// windows, which also clips the acrylic backdrop to the rounded shape).
+    /// </summary>
+    public static void ApplyRoundedCorners(nint hwnd)
+    {
+        if (hwnd == 0) return;
+
+        var corner = DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
     }
 
     /// <summary>
