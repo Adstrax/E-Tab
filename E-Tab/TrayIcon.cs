@@ -9,21 +9,41 @@ namespace ETab;
 public sealed class TrayIcon : IDisposable
 {
     private readonly NotifyIcon _notifyIcon;
+    private readonly Icon _icon;
     private TrayMenuWindow? _menuWindow;
 
     public TrayIcon()
     {
-        var icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? string.Empty) ?? SystemIcons.Application;
-
+        _icon = LoadTrayIcon();
         _notifyIcon = new NotifyIcon
         {
-            Icon = icon,
+            Icon = _icon,
             Text = "E-Tab - Open folders in new tabs",
             Visible = true
         };
 
         _notifyIcon.MouseUp += OnTrayMouseUp;
         _notifyIcon.DoubleClick += (_, _) => ShowMenu();
+    }
+
+    private static Icon LoadTrayIcon()
+    {
+        try
+        {
+            var info = System.Windows.Application.GetResourceStream(
+                new Uri("pack://application:,,,/Icon.ico"));
+            if (info?.Stream is { } stream)
+            {
+                using (stream)
+                    return new Icon(stream, 32, 32);
+            }
+        }
+        catch
+        {
+            // Fall through to the default application icon.
+        }
+
+        return (Icon)SystemIcons.Application.Clone();
     }
 
     private void OnTrayMouseUp(object? sender, MouseEventArgs e)
@@ -56,5 +76,6 @@ public sealed class TrayIcon : IDisposable
         _menuWindow?.Close();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
+        _icon.Dispose();
     }
 }

@@ -8,9 +8,9 @@
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>2.3.0</Version>
-        <AssemblyVersion>2.3.0.0</AssemblyVersion>
-        <FileVersion>2.3.0.0</FileVersion>
+        <Version>3.0.0</Version>
+        <AssemblyVersion>3.0.0.0</AssemblyVersion>
+        <FileVersion>3.0.0.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>
@@ -22,6 +22,7 @@
 
     <ItemGroup>
         <Resource Include="Icon.ico"/>
+        <Resource Include="Icon-32.png"/>
     </ItemGroup>
 
 </Project>
