@@ -410,95 +410,76 @@ public sealed class ExplorerWatcher : IDisposable
 
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
     {
+        var sw = Stopwatch.StartNew();
         var converted = false;
         try
         {
-            await _toOpenWindowsLock.WaitAsync();
-            try
+            var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
+            if (string.IsNullOrWhiteSpace(target))
+                return;
+
+            Log.Info($"Merging 0x{sourceHwnd:X} into '{target}'.");
+
+            // Fast path: the folder is already open as a tab, so just select
+            // that tab instead of creating a new one.
+            var existingTab = SearchForTab(target);
+            if (existingTab != 0)
             {
-                var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
-                if (string.IsNullOrWhiteSpace(target))
-                    return;
-
-                Log.Info($"Merging 0x{sourceHwnd:X} into '{target}'.");
-
-                var existingTab = SearchForTab(target);
-                if (existingTab != 0)
+                var windowHandle = WinApi.GetParent(existingTab);
+                if (windowHandle != 0 && WinApi.IsWindow(windowHandle) && WinApi.IsWindow(existingTab))
                 {
-                    var windowHandle = WinApi.GetParent(existingTab);
-                    if (windowHandle != 0 && WinApi.IsWindow(windowHandle) && WinApi.IsWindow(existingTab))
-                    {
-                        await SelectTabByHandle(windowHandle, existingTab);
+                    await SelectTabByHandle(windowHandle, existingTab);
 
-                        // Only treat the conversion as done when the tab is
-                        // still alive and attached to the same window. If the
-                        // window was closed while we were selecting the tab,
-                        // fall through to the normal path so the source
-                        // window is restored instead of silently disappearing.
-                        if (WinApi.IsWindow(existingTab) && WinApi.GetParent(existingTab) == windowHandle)
-                        {
-                            WinApi.RestoreWindowToForeground(windowHandle);
-                            converted = true;
-                            return;
-                        }
+                    // Only treat the conversion as done when the tab is
+                    // still alive and attached to the same window. If the
+                    // window was closed while we were selecting the tab, fall
+                    // through to the normal path so the source window is
+                    // restored instead of silently disappearing.
+                    if (WinApi.IsWindow(existingTab) && WinApi.GetParent(existingTab) == windowHandle)
+                    {
+                        WinApi.RestoreWindowToForeground(windowHandle);
+                        converted = true;
+                        return;
                     }
                 }
-
-                var mainWindowHWnd = GetMainWindowHWnd(0);
-                if (mainWindowHWnd == 0)
-                {
-                    // No visible Explorer window is available to merge into.
-                    // Restore the source window instead of opening a brand-new
-                    // one, so a window does not "reappear" right after the user
-                    // closes File Explorer.
-                    return;
-                }
-
-                var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
-                await RequestToOpenNewTab(mainWindowHWnd);
-
-                var newTabHandle = await Helper.ListenForNewExplorerTabAsync(
-                    mainWindowHWnd,
-                    currentTabs,
-                    2_000,
-                    sleepMs: 5);
-                if (newTabHandle == 0)
-                    return;
-
-                // Give slow Explorer extra time to register the new tab's
-                // Shell item before giving up, so a half-created tab is not
-                // left at the default location.
-                var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
-                if (tabItem == null)
-                    return;
-
-                try
-                {
-                    await Navigate(tabItem, target);
-                    SelectItems(tabItem, TryGetSelectedItems(item));
-                }
-                catch (Exception ex)
-                {
-                    // Navigation failed (Explorer may be closing or busy).
-                    // Close the half-created tab so no stray default tab is
-                    // left behind, then restore the source window.
-                    Log.Warn($"Navigation failed for '{target}': {ex.Message}");
-                    if (Helper.GetAllExplorerTabs(mainWindowHWnd).Count() > 1)
-                        TryQuitTabItem(tabItem);
-                    return;
-                }
-
-                // If the target window disappeared mid-conversion, restore
-                // the source window instead of pretending the tab exists.
-                if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == mainWindowHWnd)
-                {
-                    WinApi.RestoreWindowToForeground(mainWindowHWnd);
-                    converted = true;
-                }
             }
-            finally
+
+            // Serialize only the tab-creation step; the item wait and the
+            // navigation can overlap between conversions so opening several
+            // folders in a row does not queue behind the first one.
+            var (targetWindow, newTabHandle) = await CreateNewTabAsync();
+            if (targetWindow == 0 || newTabHandle == 0)
+                return;
+
+            // Give slow Explorer extra time to register the new tab's Shell
+            // item before giving up, so a half-created tab is not left at the
+            // default location.
+            var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
+            if (tabItem == null)
+                return;
+
+            try
             {
-                _toOpenWindowsLock.Release();
+                await Navigate(tabItem, target);
+                SelectItems(tabItem, TryGetSelectedItems(item));
+            }
+            catch (Exception ex)
+            {
+                // Navigation failed (Explorer may be closing or busy). Close
+                // the half-created tab so no stray default tab is left
+                // behind, then restore the source window.
+                Log.Warn($"Navigation failed for '{target}': {ex.Message}");
+                if (Helper.GetAllExplorerTabs(targetWindow).Count() > 1)
+                    TryQuitTabItem(tabItem);
+                return;
+            }
+
+            // If the target window disappeared mid-conversion, restore the
+            // source window instead of pretending the tab exists.
+            if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == targetWindow)
+            {
+                WinApi.RestoreWindowToForeground(targetWindow);
+                converted = true;
             }
         }
         catch (Exception ex)
@@ -530,6 +511,38 @@ public sealed class ExplorerWatcher : IDisposable
 
             lock (_itemsLock)
                 _pendingConversions.Remove(sourceHwnd);
+        }
+
+        Log.Info($"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms (converted={converted}).");
+    }
+
+    private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync()
+    {
+        await _toOpenWindowsLock.WaitAsync();
+        try
+        {
+            var mainWindowHWnd = GetMainWindowHWnd(0);
+            if (mainWindowHWnd == 0)
+            {
+                // No visible Explorer window is available to merge into.
+                // Restore the source window instead of opening a brand-new
+                // one, so a window does not "reappear" right after the user
+                // closes File Explorer.
+                return (0, 0);
+            }
+
+            var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
+            await RequestToOpenNewTab(mainWindowHWnd);
+            var newTabHandle = await Helper.ListenForNewExplorerTabAsync(
+                mainWindowHWnd,
+                currentTabs,
+                2_000,
+                sleepMs: 5);
+            return (mainWindowHWnd, newTabHandle);
+        }
+        finally
+        {
+            _toOpenWindowsLock.Release();
         }
     }
 
@@ -755,6 +768,7 @@ public sealed class ExplorerWatcher : IDisposable
     private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
     {
         var startTicks = Stopwatch.GetTimestamp();
+        var sleepMs = 5;
         while (!Helper.IsTimeUp(startTicks, timeMs))
         {
             try
@@ -767,7 +781,11 @@ public sealed class ExplorerWatcher : IDisposable
                 // Explorer can be in a transient state during tab creation.
             }
 
-            await Task.Delay(5);
+            // Poll aggressively while the tab is young, then back off to keep
+            // the ShellWindows enumeration cheap if Explorer is slow.
+            if (Helper.IsTimeUp(startTicks, 500))
+                sleepMs = 20;
+            await Task.Delay(sleepMs);
         }
 
         return null;
