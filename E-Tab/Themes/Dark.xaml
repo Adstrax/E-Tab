@@ -17,6 +17,4 @@
     <SolidColorBrush x:Key="EtabHoverOverlay" Color="#14FFFFFF"/>
     <SolidColorBrush x:Key="EtabPressedOverlay" Color="#24FFFFFF"/>
     <SolidColorBrush x:Key="EtabAccent" Color="#4CC84C"/>
-    <BitmapImage x:Key="EtabMenuIconAutostart" UriSource="pack://application:,,,/Assets/autostart-dark.png"/>
-    <BitmapImage x:Key="EtabMenuIconExit" UriSource="pack://application:,,,/Assets/exit-dark.png"/>
 </ResourceDictionary>

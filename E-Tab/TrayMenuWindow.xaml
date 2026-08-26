@@ -100,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v3.3.0"
+                                   Text="v3.4.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
@@ -124,10 +124,11 @@
 
             <Grid Margin="12,9,12,9">
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <Image Width="16"
-                           Height="16"
-                           Source="{DynamicResource EtabMenuIconAutostart}"
-                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <TextBlock Text="&#xE72C;"
+                               FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                               FontSize="14"
+                               Foreground="{DynamicResource EtabTextSecondary}"
+                               VerticalAlignment="Center"/>
                     <TextBlock Text="Start with Windows"
                                Foreground="{DynamicResource EtabTextPrimary}"
                                FontSize="13"
@@ -152,10 +153,11 @@
                     AutomationProperties.AutomationId="ExitButton"
                     Click="ExitButton_Click">
                 <StackPanel Orientation="Horizontal">
-                    <Image Width="16"
-                           Height="16"
-                           Source="{DynamicResource EtabMenuIconExit}"
-                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <TextBlock Text="&#xE7E8;"
+                               FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                               FontSize="14"
+                               Foreground="{DynamicResource EtabTextSecondary}"
+                               VerticalAlignment="Center"/>
                     <TextBlock Text="Exit"
                                Foreground="{DynamicResource EtabTextPrimary}"
                                FontSize="13"
