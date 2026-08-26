@@ -31,6 +31,7 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
     private readonly ProcessWatcher _processWatcher;
     private readonly StaTaskScheduler _staTaskScheduler;
+    private readonly StaTaskScheduler _conversionStaTaskScheduler;
 
     private object? _shellApp;
     private ShellPathComparer? _shellPathComparer;
@@ -52,6 +53,10 @@ public sealed class ExplorerWatcher : IDisposable
         _syncContext = SynchronizationContext.Current
                        ?? throw new InvalidOperationException("ExplorerWatcher must be created on a UI thread.");
         _staTaskScheduler = new StaTaskScheduler();
+        // Conversions get their own STA thread so they never queue behind the
+        // periodic shell polls, which can hold the shared STA thread for tens
+        // of milliseconds per full enumeration.
+        _conversionStaTaskScheduler = new StaTaskScheduler();
         _processWatcher = new ProcessWatcher("explorer");
         _processWatcher.ProcessTerminated += OnExplorerProcessTerminated;
         StartExplorerProcessCheck();
@@ -411,6 +416,7 @@ public sealed class ExplorerWatcher : IDisposable
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
     {
         var sw = Stopwatch.StartNew();
+        long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0;
         var converted = false;
         try
         {
@@ -423,6 +429,7 @@ public sealed class ExplorerWatcher : IDisposable
             // Fast path: the folder is already open as a tab, so just select
             // that tab instead of creating a new one.
             var existingTab = SearchForTab(target);
+            searchMs = sw.ElapsedMilliseconds;
             if (existingTab != 0)
             {
                 var windowHandle = WinApi.GetParent(existingTab);
@@ -448,6 +455,7 @@ public sealed class ExplorerWatcher : IDisposable
             // navigation can overlap between conversions so opening several
             // folders in a row does not queue behind the first one.
             var (targetWindow, newTabHandle) = await CreateNewTabAsync();
+            createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
                 return;
 
@@ -455,6 +463,7 @@ public sealed class ExplorerWatcher : IDisposable
             // item before giving up, so a half-created tab is not left at the
             // default location.
             var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
+            itemMs = sw.ElapsedMilliseconds;
             if (tabItem == null)
                 return;
 
@@ -462,6 +471,7 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 await Navigate(tabItem, target);
                 SelectItems(tabItem, TryGetSelectedItems(item));
+                navMs = sw.ElapsedMilliseconds;
             }
             catch (Exception ex)
             {
@@ -513,7 +523,9 @@ public sealed class ExplorerWatcher : IDisposable
                 _pendingConversions.Remove(sourceHwnd);
         }
 
-        Log.Info($"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms (converted={converted}).");
+        Log.Info(
+            $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
+            $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, navigate {navMs}ms, converted={converted}).");
     }
 
     private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync()
@@ -670,7 +682,7 @@ public sealed class ExplorerWatcher : IDisposable
         Helper.BypassWinForegroundRestrictions();
 
         var target = string.IsNullOrWhiteSpace(location) ? _defaultLocation : location;
-        await RunInStaThread(() =>
+        await RunConversionInStaThread(() =>
         {
             dynamic shell = CreateShell();
             try
@@ -773,7 +785,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             try
             {
-                var item = await RunInStaThread(() => FindShellItemForTab(tabHandle));
+                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle));
                 if (item != null) return item;
             }
             catch
@@ -895,7 +907,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         object? folder = null;
-        await RunInStaThread(() =>
+        await RunConversionInStaThread(() =>
         {
             dynamic shell = CreateShell();
             try
@@ -932,6 +944,16 @@ public sealed class ExplorerWatcher : IDisposable
     private Task<T> RunInStaThread<T>(Func<T> func)
     {
         return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
+    }
+
+    private Task RunConversionInStaThread(Action action)
+    {
+        return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
+    }
+
+    private Task<T> RunConversionInStaThread<T>(Func<T> func)
+    {
+        return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
     }
 
     private void StartExplorerProcessCheck()
@@ -1013,6 +1035,7 @@ public sealed class ExplorerWatcher : IDisposable
         _processWatcher.Dispose();
         DisposeShellObjects();
         _staTaskScheduler.Dispose();
+        _conversionStaTaskScheduler.Dispose();
 
         GC.SuppressFinalize(this);
     }
