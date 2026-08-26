@@ -100,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v3.4.0"
+                                   Text="v3.5.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>

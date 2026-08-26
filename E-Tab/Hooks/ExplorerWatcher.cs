@@ -416,7 +416,7 @@ public sealed class ExplorerWatcher : IDisposable
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
     {
         var sw = Stopwatch.StartNew();
-        long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0;
+        long searchMs = 0, createMs = 0, fastMs = 0, itemMs = 0, navMs = 0;
         var converted = false;
         try
         {
@@ -459,6 +459,14 @@ public sealed class ExplorerWatcher : IDisposable
             if (targetWindow == 0 || newTabHandle == 0)
                 return;
 
+            // Fast path: drive Explorer's address bar (Ctrl+L -> path -> Enter)
+            // so the tab shows the folder without waiting for its Shell item to
+            // register. Plain file-system paths only; everything else uses the
+            // normal item-wait + Navigate2 flow below.
+            if (IsFileSystemPath(target))
+                await TryNavigateViaAddressBarAsync(targetWindow, newTabHandle, target);
+            fastMs = sw.ElapsedMilliseconds;
+
             // Give slow Explorer extra time to register the new tab's Shell
             // item before giving up, so a half-created tab is not left at the
             // default location.
@@ -467,22 +475,29 @@ public sealed class ExplorerWatcher : IDisposable
             if (tabItem == null)
                 return;
 
-            try
+            // Verify the tab ended up at the target. The address-bar fast path
+            // usually already navigated; Navigate2 only runs when it did not
+            // (e.g. the tab was still registering or the simulation failed).
+            var currentLocation = TryGetLocation(tabItem);
+            if (!string.Equals(currentLocation, target, StringComparison.OrdinalIgnoreCase))
             {
-                await Navigate(tabItem, target);
-                SelectItems(tabItem, TryGetSelectedItems(item));
-                navMs = sw.ElapsedMilliseconds;
+                try
+                {
+                    await Navigate(tabItem, target);
+                }
+                catch (Exception ex)
+                {
+                    // Navigation failed (Explorer may be closing or busy).
+                    // Close the half-created tab so no stray default tab is
+                    // left behind, then restore the source window.
+                    Log.Warn($"Navigation failed for '{target}': {ex.Message}");
+                    if (Helper.GetAllExplorerTabs(targetWindow).Count() > 1)
+                        TryQuitTabItem(tabItem);
+                    return;
+                }
             }
-            catch (Exception ex)
-            {
-                // Navigation failed (Explorer may be closing or busy). Close
-                // the half-created tab so no stray default tab is left
-                // behind, then restore the source window.
-                Log.Warn($"Navigation failed for '{target}': {ex.Message}");
-                if (Helper.GetAllExplorerTabs(targetWindow).Count() > 1)
-                    TryQuitTabItem(tabItem);
-                return;
-            }
+            SelectItems(tabItem, TryGetSelectedItems(item));
+            navMs = sw.ElapsedMilliseconds;
 
             // If the target window disappeared mid-conversion, restore the
             // source window instead of pretending the tab exists.
@@ -525,7 +540,44 @@ public sealed class ExplorerWatcher : IDisposable
 
         Log.Info(
             $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
-            $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, navigate {navMs}ms, converted={converted}).");
+            $"(search {searchMs}ms, create {createMs}ms, fast {fastMs}ms, item {itemMs}ms, " +
+            $"navigate {navMs}ms, converted={converted}).");
+    }
+
+    /// <summary>
+    /// Navigates the newly created tab through Explorer's own address bar,
+    /// bypassing the wait for the tab's Shell item to register in ShellWindows
+    /// (which can take a few hundred milliseconds). Falls back silently if the
+    /// tab is not ready or the simulation cannot run.
+    /// </summary>
+    private async Task TryNavigateViaAddressBarAsync(nint windowHandle, nint tabHandle, string target)
+    {
+        try
+        {
+            // Wait until the new tab is the active one, then bring the window
+            // to the foreground so the simulated keys land in Explorer.
+            var activeTab = await Helper.DoUntilNotDefaultAsync(
+                () => WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null),
+                h => h == tabHandle,
+                500,
+                10);
+            if (activeTab != tabHandle) return;
+
+            WinApi.RestoreWindowToForeground(windowHandle);
+            await Task.Delay(50);
+
+            Helper.BypassWinForegroundRestrictions();
+            KeyboardSimulator.SendKeyChord(VirtualKey.Control, VirtualKey.L);
+            await Task.Delay(20);
+            KeyboardSimulator.SendUnicodeText(target);
+            await Task.Delay(20);
+            KeyboardSimulator.SendKeyPress(VirtualKey.Enter);
+        }
+        catch
+        {
+            // The normal item-wait + Navigate2 path below still completes the
+            // conversion.
+        }
     }
 
     private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync()
