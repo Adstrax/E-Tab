@@ -10,7 +10,7 @@ public sealed class TrayIcon : IDisposable
 {
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _icon;
-    private TrayMenuWindow? _menuWindow;
+    private readonly TrayMenuWindow _menuWindow;
 
     public TrayIcon()
     {
@@ -24,6 +24,11 @@ public sealed class TrayIcon : IDisposable
 
         _notifyIcon.MouseUp += OnTrayMouseUp;
         _notifyIcon.DoubleClick += (_, _) => ShowMenu();
+
+        // Create the menu once up front so the very first right-click is fast
+        // too; the window is hidden instead of recreated on every open.
+        _menuWindow = new TrayMenuWindow();
+        _menuWindow.ExitRequested += ExitApplication;
     }
 
     private static Icon LoadTrayIcon()
@@ -54,9 +59,6 @@ public sealed class TrayIcon : IDisposable
 
     private void ShowMenu()
     {
-        _menuWindow?.Close();
-        _menuWindow = new TrayMenuWindow();
-        _menuWindow.ExitRequested += ExitApplication;
         _menuWindow.ShowAtCursor();
     }
 
@@ -73,7 +75,7 @@ public sealed class TrayIcon : IDisposable
 
     public void Dispose()
     {
-        _menuWindow?.Close();
+        _menuWindow.Close();
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _icon.Dispose();

@@ -100,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v3.0.0"
+                                   Text="v3.1.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
@@ -123,10 +123,17 @@
             <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
             <Grid Margin="12,9,12,9">
-                <TextBlock Text="Start with Windows"
-                           Foreground="{DynamicResource EtabTextPrimary}"
-                           FontSize="13"
-                           VerticalAlignment="Center"/>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Width="16"
+                           Height="16"
+                           Source="{DynamicResource EtabMenuIconAutostart}"
+                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <TextBlock Text="Start with Windows"
+                               Foreground="{DynamicResource EtabTextPrimary}"
+                               FontSize="13"
+                               Margin="10,0,0,0"
+                               VerticalAlignment="Center"/>
+                </StackPanel>
                 <ToggleButton x:Name="AutoStartToggle"
                               Style="{StaticResource Win11ToggleStyle}"
                               HorizontalAlignment="Right"
@@ -140,11 +147,21 @@
             <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 
             <Button x:Name="ExitButton"
-                    Content="Exit"
                     Style="{StaticResource MenuButtonStyle}"
                     AutomationProperties.Name="Exit"
                     AutomationProperties.AutomationId="ExitButton"
-                    Click="ExitButton_Click"/>
+                    Click="ExitButton_Click">
+                <StackPanel Orientation="Horizontal">
+                    <Image Width="16"
+                           Height="16"
+                           Source="{DynamicResource EtabMenuIconExit}"
+                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <TextBlock Text="Exit"
+                               Foreground="{DynamicResource EtabTextPrimary}"
+                               FontSize="13"
+                               Margin="10,0,0,0"/>
+                </StackPanel>
+            </Button>
         </StackPanel>
     </Border>
 </Window>

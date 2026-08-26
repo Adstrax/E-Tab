@@ -80,7 +80,7 @@ public partial class TrayMenuWindow : Window
 
     private void OnDeactivated(object sender, EventArgs e)
     {
-        Close();
+        Hide();
     }
 
     private void ExitButton_Click(object sender, RoutedEventArgs e)
