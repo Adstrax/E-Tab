@@ -1,6 +1,8 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using ETab.Helpers;
 
@@ -48,10 +50,29 @@ public sealed class TrayIcon : IDisposable
             {
                 using (stream)
                 {
-                    // Pick the ICO frame closest to the actual tray size so the
-                    // icon is not scaled down (which makes it look blurry).
-                    var traySize = SystemInformation.SmallIconSize;
-                    return new Icon(stream, traySize.Width, traySize.Height);
+                    // Extract the exact ICO frame matching the physical tray
+                    // size and build the HICON from it directly. Relying on
+                    // Icon(stream, w, h) can pick the wrong PNG frame and
+                    // scale it down, which is what made the tray icon blurry.
+                    var bytes = new byte[stream.Length];
+                    stream.ReadExactly(bytes);
+
+                    var frame = PickIconFrame(bytes, GetTrayIconSize());
+                    if (frame != null)
+                    {
+                        using var png = new MemoryStream(frame);
+                        using var bmp = new Bitmap(png);
+                        var handle = bmp.GetHicon();
+                        try
+                        {
+                            using var temp = Icon.FromHandle(handle);
+                            return (Icon)temp.Clone();
+                        }
+                        finally
+                        {
+                            DestroyIcon(handle);
+                        }
+                    }
                 }
             }
         }
@@ -62,6 +83,56 @@ public sealed class TrayIcon : IDisposable
 
         return (Icon)SystemIcons.Application.Clone();
     }
+
+    /// <summary>
+    /// Physical pixel size of the tray icon for the current system DPI
+    /// (16 logical px at 100%, scaled up on high-DPI displays).
+    /// </summary>
+    private static int GetTrayIconSize()
+    {
+        var dpi = GetDpiForSystem();
+        if (dpi == 0)
+            return Math.Max(16, SystemInformation.SmallIconSize.Width);
+        return Math.Max(16, (int)Math.Round(16.0 * dpi / 96.0));
+    }
+
+    /// <summary>
+    /// Picks the ICO frame whose size is closest to the target and returns its
+    /// raw PNG payload (this project's ICO stores PNG-compressed frames).
+    /// </summary>
+    private static byte[]? PickIconFrame(byte[] ico, int target)
+    {
+        var count = BitConverter.ToUInt16(ico, 4);
+        var best = -1;
+        var bestScore = int.MaxValue;
+        for (var i = 0; i < count; i++)
+        {
+            var offset = 6 + i * 16;
+            var width = ico[offset] == 0 ? 256 : ico[offset];
+            var height = ico[offset + 1] == 0 ? 256 : ico[offset + 1];
+            var score = Math.Abs(Math.Max(width, height) - target);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = i;
+            }
+        }
+
+        if (best < 0) return null;
+
+        var entry = 6 + best * 16;
+        var length = BitConverter.ToInt32(ico, entry + 8);
+        var start = BitConverter.ToInt32(ico, entry + 12);
+        var data = new byte[length];
+        Buffer.BlockCopy(ico, start, data, 0, length);
+        return data;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForSystem();
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(nint handle);
 
     private void OnTrayMouseUp(object? sender, MouseEventArgs e)
     {
