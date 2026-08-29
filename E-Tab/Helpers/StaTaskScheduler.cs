@@ -12,12 +12,12 @@ public sealed class StaTaskScheduler : TaskScheduler, IDisposable
     private readonly Thread _staThread;
     private readonly BlockingCollection<Task> _tasks = new();
 
-    public StaTaskScheduler()
+    public StaTaskScheduler(string threadName = "STA Thread")
     {
         _staThread = new Thread(Run)
         {
             IsBackground = true,
-            Name = "STA Thread"
+            Name = threadName
         };
         _staThread.SetApartmentState(ApartmentState.STA);
         _staThread.Start();

@@ -19,6 +19,7 @@ public sealed class ExplorerWatcher : IDisposable
     private const int FastPollMs = 200;
     private const int IdlePollMs = 1000;
     private const int FastPollDurationMs = 3000;
+    private const int FullShellPollIntervalMs = 5000;
 
     private readonly SynchronizationContext _syncContext;
     private readonly object _itemsLock = new();
@@ -29,7 +30,6 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly HashSet<nint> _pendingConversions = new();
     private readonly Dictionary<nint, long> _firstSeenTicks = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
-    private readonly ProcessWatcher _processWatcher;
     private readonly StaTaskScheduler _staTaskScheduler;
     private readonly StaTaskScheduler _conversionStaTaskScheduler;
 
@@ -38,6 +38,7 @@ public sealed class ExplorerWatcher : IDisposable
     private string _defaultLocation = string.Empty;
     private nint _mainWindowHandle;
     private int _mainExplorerProcessId;
+    private Process? _mainExplorerProcess;
     private Timer? _explorerCheckTimer;
     private Timer? _pollTimer;
     private nint _eventObjectCreateHookId;
@@ -46,36 +47,92 @@ public sealed class ExplorerWatcher : IDisposable
     private WinEventDelegate? _eventObjectShowHookCallback;
     private int _polling;
     private long _fastPollUntilTicks;
+    private long _lastFullShellPollTicks;
     private bool _disposed;
 
     public ExplorerWatcher()
     {
         _syncContext = SynchronizationContext.Current
                        ?? throw new InvalidOperationException("ExplorerWatcher must be created on a UI thread.");
-        _staTaskScheduler = new StaTaskScheduler();
+        _staTaskScheduler = new StaTaskScheduler("Shell poll STA");
         // Conversions get their own STA thread so they never queue behind the
         // periodic shell polls, which can hold the shared STA thread for tens
         // of milliseconds per full enumeration.
-        _conversionStaTaskScheduler = new StaTaskScheduler();
-        _processWatcher = new ProcessWatcher("explorer");
-        _processWatcher.ProcessTerminated += OnExplorerProcessTerminated;
+        _conversionStaTaskScheduler = new StaTaskScheduler("Conversion STA");
         StartExplorerProcessCheck();
     }
 
     private void CheckForMainExplorer(object? state)
     {
-        using var process = Helper.GetMainExplorerProcess();
-        if (process == null) return;
+        if (_disposed) return;
 
-        _explorerCheckTimer?.Dispose();
-        _explorerCheckTimer = null;
+        // Once the main explorer process is known, the periodic check is just
+        // a cheap liveness probe: Process.Exited normally notifies instantly,
+        // but this catches the rare case where the event is missed (or its
+        // subscription failed).
+        lock (_processLock)
+        {
+            if (_mainExplorerProcessId != 0)
+            {
+                bool exited;
+                try
+                {
+                    exited = _mainExplorerProcess is not { } p || p.HasExited;
+                }
+                catch
+                {
+                    // The Process object can be in an inconsistent state after
+                    // Explorer terminates.
+                    exited = true;
+                }
+
+                if (!exited) return;
+                HandleMainExplorerTerminated();
+                return;
+            }
+        }
+
+        var process = Helper.GetMainExplorerProcess();
+        if (process == null) return;
 
         lock (_processLock)
         {
-            if (_mainExplorerProcessId != 0) return;
+            if (_mainExplorerProcessId != 0)
+            {
+                process.Dispose();
+                return;
+            }
 
             _mainExplorerProcessId = process.Id;
+        }
+
+        try
+        {
             RunInStaThread(InitializeShellObjects).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Failed to initialize shell objects.", ex);
+            lock (_processLock)
+                _mainExplorerProcessId = 0;
+            process.Dispose();
+            return;
+        }
+
+        lock (_processLock)
+        {
+            _mainExplorerProcess?.Dispose();
+            _mainExplorerProcess = process;
+            try
+            {
+                process.EnableRaisingEvents = true;
+                process.Exited += OnMainExplorerExited;
+            }
+            catch
+            {
+                // Exit-event subscription is best effort; the periodic liveness
+                // check above still detects Explorer termination.
+            }
         }
 
         // Install the WinEvent hooks on the UI thread. Out-of-context hook
@@ -178,32 +235,50 @@ public sealed class ExplorerWatcher : IDisposable
         if (_shellApp == null) return;
 
         var currentTopLevel = WinApi.FindAllWindowsEx("CabinetWClass").ToHashSet();
-        var currentItems = new List<(object Item, nint Hwnd)>();
 
-        try
+        // The ShellWindows COM snapshot is the most expensive step: it costs
+        // several COM round-trips per open tab. At idle it is only needed to
+        // keep the tab cache fresh, so run a full pass when a new window
+        // actually appeared (which also gives us its Shell item for
+        // conversion) or every few seconds to prune closed tabs, instead of
+        // on every poll.
+        bool fullPassNeeded;
+        lock (_itemsLock)
         {
-            dynamic windows = ((dynamic)_shellApp).Windows();
-            var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
-            {
-                object item;
-                try
-                {
-                    item = (object)windows.Item(i);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                var hwnd = GetWindowHandle(item);
-                if (hwnd != 0)
-                    currentItems.Add((item, hwnd));
-            }
+            fullPassNeeded = !convertNewWindows ||
+                             Helper.IsTimeUp(_lastFullShellPollTicks, FullShellPollIntervalMs) ||
+                             currentTopLevel.Any(h => !_knownTopLevelWindows.Contains(h));
         }
-        catch
+
+        var currentItems = new List<(object Item, nint Hwnd)>();
+        if (fullPassNeeded)
         {
-            // ShellWindows can be temporarily unavailable during Explorer restart.
+            _lastFullShellPollTicks = Stopwatch.GetTimestamp();
+            try
+            {
+                dynamic windows = ((dynamic)_shellApp).Windows();
+                var count = (int)windows.Count;
+                for (var i = 0; i < count; i++)
+                {
+                    object item;
+                    try
+                    {
+                        item = (object)windows.Item(i);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    var hwnd = GetWindowHandle(item);
+                    if (hwnd != 0)
+                        currentItems.Add((item, hwnd));
+                }
+            }
+            catch
+            {
+                // ShellWindows can be temporarily unavailable during Explorer restart.
+            }
         }
 
         var recognizedWindows = new HashSet<nint>();
@@ -211,6 +286,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             foreach (var hwnd in currentTopLevel)
             {
+                if (!fullPassNeeded) break;
                 if (_knownTopLevelWindows.Contains(hwnd)) continue;
                 if (HandleNewTopLevelWindow(hwnd, currentItems))
                     recognizedWindows.Add(hwnd);
@@ -233,37 +309,40 @@ public sealed class ExplorerWatcher : IDisposable
             foreach (var staleSeen in _firstSeenTicks.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
                 _firstSeenTicks.Remove(staleSeen);
 
-            var currentTabHandles = new HashSet<nint>();
-            foreach (var (item, hwnd) in currentItems)
+            if (fullPassNeeded)
             {
-                var tabHandle = GetTabHandle(item);
-                if (tabHandle == 0) continue;
-                currentTabHandles.Add(tabHandle);
-                _tabToItem[tabHandle] = item;
-
-                if (_tabInfos.TryGetValue(tabHandle, out var info))
+                var currentTabHandles = new HashSet<nint>();
+                foreach (var (item, hwnd) in currentItems)
                 {
-                    info.WindowHandle = hwnd;
-                    info.TabHandle = tabHandle;
-                    continue;
+                    var tabHandle = GetTabHandle(item);
+                    if (tabHandle == 0) continue;
+                    currentTabHandles.Add(tabHandle);
+                    _tabToItem[tabHandle] = item;
+
+                    if (_tabInfos.TryGetValue(tabHandle, out var info))
+                    {
+                        info.WindowHandle = hwnd;
+                        info.TabHandle = tabHandle;
+                        continue;
+                    }
+
+                    var newInfo = new WindowInfo
+                    {
+                        WindowHandle = hwnd,
+                        TabHandle = tabHandle,
+                        Location = _tabInfos.Count == 0 && WinApi.IsWindowVisible(hwnd) &&
+                                   WinApi.IsWindowHasClassName(hwnd, "CabinetWClass")
+                            ? TryGetLocation(item)
+                            : null
+                    };
+                    _tabInfos[tabHandle] = newInfo;
                 }
 
-                var newInfo = new WindowInfo
+                foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
                 {
-                    WindowHandle = hwnd,
-                    TabHandle = tabHandle,
-                    Location = _tabInfos.Count == 0 && WinApi.IsWindowVisible(hwnd) &&
-                               WinApi.IsWindowHasClassName(hwnd, "CabinetWClass")
-                        ? TryGetLocation(item)
-                        : null
-                };
-                _tabInfos[tabHandle] = newInfo;
-            }
-
-            foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
-            {
-                _tabToItem.Remove(staleTab);
-                _tabInfos.Remove(staleTab);
+                    _tabToItem.Remove(staleTab);
+                    _tabInfos.Remove(staleTab);
+                }
             }
 
             if (_knownTopLevelWindows.Count == 0)
@@ -323,7 +402,11 @@ public sealed class ExplorerWatcher : IDisposable
             _pendingConversions.Add(hwnd);
         ScheduleShowFallback(hwnd);
         RequestFastPoll();
-        _syncContext.Post(_ => _ = ConvertToTabAsync(item, hwnd, location), null);
+        // Run the conversion off the UI thread: its awaits would otherwise
+        // resume on the WPF dispatcher and hold the UI thread for the whole
+        // conversion (COM lookups, navigation, keyboard simulation), delaying
+        // WinEvent hook delivery for any new window that appears meanwhile.
+        _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location));
         return true;
     }
 
@@ -626,7 +709,7 @@ public sealed class ExplorerWatcher : IDisposable
     {
         lock (_itemsLock)
         {
-            foreach (var (handle, info) in _tabInfos.ToList())
+            foreach (var (handle, info) in _tabInfos)
             {
                 if (!Helper.IsTimeUp(info.CreatedAt, 2_000)) continue;
                 if (info.TabHandle == 0) continue;
@@ -655,7 +738,7 @@ public sealed class ExplorerWatcher : IDisposable
 
             lock (_itemsLock)
             {
-                foreach (var (handle, info) in _tabInfos.ToList())
+                foreach (var (handle, info) in _tabInfos)
                 {
                     if (!Helper.IsTimeUp(info.CreatedAt, 2_000)) continue;
                     if (info.TabHandle == 0) continue;
@@ -791,6 +874,14 @@ public sealed class ExplorerWatcher : IDisposable
     {
         if (_shellApp == null) return null;
 
+        // Cheap pre-filter: only ShellWindows items hosted in the same
+        // Explorer window can be this tab's item. Comparing the item HWND
+        // (one COM property read) before the QueryService/GetWindow lookup
+        // avoids several COM round-trips per unrelated window, which matters
+        // because this runs repeatedly while waiting for the tab to register.
+        var parentWindow = WinApi.GetParent(tabHandle);
+        if (parentWindow == 0) return null;
+
         object? found = null;
         try
         {
@@ -808,11 +899,12 @@ public sealed class ExplorerWatcher : IDisposable
                     continue;
                 }
 
-                if (GetTabHandle(item) == tabHandle)
-                {
-                    found = item;
-                    break;
-                }
+                if (GetWindowHandle(item) != parentWindow) continue;
+                if (GetTabHandle(item) != tabHandle)
+                    continue;
+
+                found = item;
+                break;
             }
         }
         catch
@@ -1010,16 +1102,33 @@ public sealed class ExplorerWatcher : IDisposable
 
     private void StartExplorerProcessCheck()
     {
+        _explorerCheckTimer?.Dispose();
+        _explorerCheckTimer = null;
         _explorerCheckTimer = new Timer(CheckForMainExplorer, null, 0, 1_000);
     }
 
-    private void OnExplorerProcessTerminated(object? s, ProcessEventArgs e)
+    private void OnMainExplorerExited(object? sender, EventArgs e)
+    {
+        HandleMainExplorerTerminated();
+    }
+
+    private void HandleMainExplorerTerminated()
     {
         lock (_processLock)
         {
-            if (e.ProcessId != _mainExplorerProcessId) return;
+            if (_mainExplorerProcessId == 0) return;
 
             _mainExplorerProcessId = 0;
+            try
+            {
+                _mainExplorerProcess?.Dispose();
+            }
+            catch
+            {
+                // The process object may already be in a terminating state.
+            }
+            _mainExplorerProcess = null;
+
             Log.Warn("Explorer process terminated; reinitializing watcher.");
             DisposeShellObjects();
             StartExplorerProcessCheck();
@@ -1084,7 +1193,19 @@ public sealed class ExplorerWatcher : IDisposable
         _explorerCheckTimer?.Dispose();
         _explorerCheckTimer = null;
 
-        _processWatcher.Dispose();
+        lock (_processLock)
+        {
+            try
+            {
+                _mainExplorerProcess?.Dispose();
+            }
+            catch
+            {
+                // Ignore disposal errors during shutdown.
+            }
+            _mainExplorerProcess = null;
+        }
+
         DisposeShellObjects();
         _staTaskScheduler.Dispose();
         _conversionStaTaskScheduler.Dispose();
