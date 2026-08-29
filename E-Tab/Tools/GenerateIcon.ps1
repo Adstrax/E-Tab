@@ -27,8 +27,57 @@ function New-FolderPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$tabW, [int]$ta
     return $path
 }
 
+function Fill-RoundedRect($g, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r, $brush)
+{
+    $path = New-RoundedRectPath $x $y $w $h $r
+    $g.FillPath($brush, $path)
+    $path.Dispose()
+}
+
+function New-TrayIconBitmap([int]$size)
+{
+    # Pixel-snapped, bold two-folder mark for tray sizes (16/24/32px). Hard
+    # edges keep it crisp at 1:1, and the folders fill the canvas so it does
+    # not look small next to filled tray icons.
+    $scale = $size / 32.0
+    $bmp = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    function P([double]$value) { return [Math]::Max(0, [int][Math]::Round($value * $scale)) }
+
+    $blue = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 0, 120, 212))
+    $white = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
+
+    # Back folder (blue), peeking top-right behind the front folder.
+    Fill-RoundedRect $g (P 8) (P 6) (P 20) (P 14) (P 2) $blue
+    Fill-RoundedRect $g (P 8) (P 3) (P 9) (P 5) (P 2) $blue
+
+    # Front folder (white), bottom-left, overlapping the back folder.
+    Fill-RoundedRect $g (P 3) (P 11) (P 18) (P 14) (P 2) $white
+    Fill-RoundedRect $g (P 3) (P 8) (P 9) (P 5) (P 2) $white
+
+    if ($size -ge 24)
+    {
+        $green = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
+        $g.FillRectangle($green, (P 16), (P 19), (P 5), (P 5))
+        $green.Dispose()
+    }
+
+    $blue.Dispose()
+    $white.Dispose()
+    $g.Dispose()
+    return $bmp
+}
+
 function New-IconBitmap([int]$size)
 {
+    if ($size -le 32)
+    {
+        return New-TrayIconBitmap $size
+    }
+
     $scale = $size / 256.0
     $bmp = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
