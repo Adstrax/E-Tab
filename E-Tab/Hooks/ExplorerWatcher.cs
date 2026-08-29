@@ -655,6 +655,15 @@ public sealed class ExplorerWatcher : IDisposable
             KeyboardSimulator.SendUnicodeText(target);
             await Task.Delay(20);
             KeyboardSimulator.SendKeyPress(VirtualKey.Enter);
+
+            // Enter navigates but leaves Explorer's address bar in edit mode
+            // (focused, path selected). A short wait followed by Escape exits
+            // the edit and returns focus to the file list, so the converted
+            // tab does not keep showing the address bar in an "input" state.
+            // If the navigation has not committed yet, the location check in
+            // ConvertToTabAsync falls back to the normal Navigate2 path.
+            await Task.Delay(350);
+            KeyboardSimulator.SendKeyPress(VirtualKey.Escape);
         }
         catch
         {
