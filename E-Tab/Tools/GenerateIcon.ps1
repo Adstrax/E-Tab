@@ -42,49 +42,26 @@ function New-IconBitmap([int]$size)
         return [int][Math]::Round((($value - 128) * $fillScale + 128) * $scale)
     }
 
-    if ($size -le 32)
+    # MergeFolders (approved design): two overlapping folders (merge into
+    # tabs) + green status dot. Small sizes are scaled up around the centre
+    # (via S) so the artwork fills the canvas at tray sizes.
+    $back = New-FolderPath (S 62) (S 88) (S 164) (S 92) (S 62) (S 22) (S 20)
+    $g.FillPath(
+        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 0, 120, 212)),
+        $back)
+    $back.Dispose()
+
+    $front = New-FolderPath (S 46) (S 108) (S 164) (S 92) (S 62) (S 22) (S 20)
+    $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), $front)
+    $front.Dispose()
+
+    if ($size -ge 24)
     {
-        # Compact tray variant: filled blue tile + white folder so the icon is
-        # bold and legible at 16-32px. The large app icon keeps the approved
-        # two-folder MergeFolders design below.
-        $tile = New-RoundedRectPath (S 10) (S 10) (S 236) (S 236) (S 58)
-        $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 0, 120, 212)), $tile)
-        $tile.Dispose()
-
-        $folder = New-FolderPath (S 46) (S 102) (S 164) (S 92) (S 62) (S 22) (S 20)
-        $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), $folder)
-        $folder.Dispose()
-
-        if ($size -ge 24)
-        {
-            $dotSize = if ($size -lt 64) { 22 } else { 18 }
-            $dotX = 170 - (($dotSize - 18) / 2)
-            $dotY = 166 - (($dotSize - 18) / 2)
-            $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
-            $g.FillEllipse($dotBrush, (S $dotX), (S $dotY), (S $dotSize), (S $dotSize))
-        }
-    }
-    else
-    {
-        # MergeFolders: two overlapping folders (merge into tabs) + green status dot.
-        $back = New-FolderPath (S 62) (S 88) (S 164) (S 92) (S 62) (S 22) (S 20)
-        $g.FillPath(
-            [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 0, 120, 212)),
-            $back)
-        $back.Dispose()
-
-        $front = New-FolderPath (S 46) (S 108) (S 164) (S 92) (S 62) (S 22) (S 20)
-        $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), $front)
-        $front.Dispose()
-
-        if ($size -ge 24)
-        {
-            $dotSize = if ($size -lt 64) { 22 } else { 18 }
-            $dotX = 170 - (($dotSize - 18) / 2)
-            $dotY = 166 - (($dotSize - 18) / 2)
-            $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
-            $g.FillEllipse($dotBrush, (S $dotX), (S $dotY), (S $dotSize), (S $dotSize))
-        }
+        $dotSize = if ($size -lt 64) { 22 } else { 18 }
+        $dotX = 170 - (($dotSize - 18) / 2)
+        $dotY = 166 - (($dotSize - 18) / 2)
+        $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
+        $g.FillEllipse($dotBrush, (S $dotX), (S $dotY), (S $dotSize), (S $dotSize))
     }
 
     $g.Dispose()
