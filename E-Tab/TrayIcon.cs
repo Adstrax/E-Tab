@@ -12,6 +12,7 @@ public sealed class TrayIcon : IDisposable
     private readonly Icon _icon;
     private readonly TrayMenuWindow _menuWindow;
     private ReleaseInfo? _pendingUpdate;
+    private bool _promptOpen;
 
     public TrayIcon()
     {
@@ -25,18 +26,16 @@ public sealed class TrayIcon : IDisposable
 
         _notifyIcon.MouseUp += OnTrayMouseUp;
         _notifyIcon.DoubleClick += (_, _) => ShowMenu();
-        _notifyIcon.BalloonTipClicked += OnBalloonTipClicked;
 
         // Create the menu once up front so the very first right-click is fast
         // too; the window is hidden instead of recreated on every open.
         _menuWindow = new TrayMenuWindow();
         _menuWindow.ExitRequested += ExitApplication;
         _menuWindow.UpdateCheckRequested += () => _ = UpdateManager.CheckForUpdatesAsync();
-        _menuWindow.UpdateInstallRequested += InstallPendingUpdate;
+        _menuWindow.UpdateInstallRequested += () => StartUpdateInstall(_pendingUpdate);
 
         UpdateManager.CheckCompleted += OnCheckCompleted;
         UpdateManager.InstallCompleted += OnInstallCompleted;
-        UpdateManager.InstallFailed += OnInstallFailed;
     }
 
     private static Icon LoadTrayIcon()
@@ -48,7 +47,12 @@ public sealed class TrayIcon : IDisposable
             if (info?.Stream is { } stream)
             {
                 using (stream)
-                    return new Icon(stream, 32, 32);
+                {
+                    // Pick the ICO frame closest to the actual tray size so the
+                    // icon is not scaled down (which makes it look blurry).
+                    var traySize = SystemInformation.SmallIconSize;
+                    return new Icon(stream, traySize.Width, traySize.Height);
+                }
             }
         }
         catch
@@ -87,11 +91,7 @@ public sealed class TrayIcon : IDisposable
             case UpdateCheckStatus.UpdateAvailable:
                 _pendingUpdate = result.Release;
                 _menuWindow.SetUpdateAvailable(result.Release);
-                _notifyIcon.BalloonTipTitle = "E-Tab update available";
-                _notifyIcon.BalloonTipText =
-                    $"E-Tab {result.Release!.Version.ToString(3)} is ready. Click here to download and install.";
-                _notifyIcon.BalloonTipIcon = ToolTipIcon.Info;
-                _notifyIcon.ShowBalloonTip(10_000);
+                ShowUpdatePrompt(result.Release);
                 break;
             case UpdateCheckStatus.UpToDate:
                 _notifyIcon.BalloonTipTitle = "E-Tab is up to date";
@@ -109,19 +109,54 @@ public sealed class TrayIcon : IDisposable
         }
     }
 
-    private void OnBalloonTipClicked(object? sender, EventArgs e)
+    private void ShowUpdatePrompt(ReleaseInfo? update)
     {
-        InstallPendingUpdate();
+        if (update == null || _promptOpen) return;
+
+        _promptOpen = true;
+        try
+        {
+            var prompt = new UpdatePromptWindow(update);
+            if (prompt.ShowDialog() == true)
+                StartUpdateInstall(update);
+        }
+        finally
+        {
+            _promptOpen = false;
+        }
     }
 
-    private void InstallPendingUpdate()
+    private async void StartUpdateInstall(ReleaseInfo? update)
     {
-        if (_pendingUpdate == null) return;
+        if (update == null) return;
 
-        var update = _pendingUpdate;
         _pendingUpdate = null;
         _menuWindow.SetUpdateAvailable(null);
-        _ = UpdateManager.InstallUpdateAsync(update);
+
+        var progressWindow = new UpdateProgressWindow();
+        progressWindow.Show();
+
+        try
+        {
+            var ok = await UpdateManager.InstallUpdateAsync(
+                update,
+                new Progress<(long Received, long Total)>(p => progressWindow.SetProgress(p.Received, p.Total)),
+                status => progressWindow.Dispatcher.BeginInvoke(() => progressWindow.SetStatus(status)),
+                progressWindow.CancellationToken);
+
+            progressWindow.Close();
+            if (!ok && !progressWindow.CancellationToken.IsCancellationRequested)
+            {
+                ShowUpdateError(
+                    "The update could not be installed. Details are in " +
+                    "%LOCALAPPDATA%\\E-Tab\\logs\\E-Tab.log.");
+            }
+        }
+        catch (Exception ex)
+        {
+            progressWindow.Close();
+            ShowUpdateError($"The update could not be installed: {ex.Message}");
+        }
     }
 
     private void OnInstallCompleted(string version)
@@ -132,12 +167,13 @@ public sealed class TrayIcon : IDisposable
         _notifyIcon.ShowBalloonTip(6_000);
     }
 
-    private void OnInstallFailed(string message)
+    private void ShowUpdateError(string message)
     {
-        _notifyIcon.BalloonTipTitle = "Update failed";
-        _notifyIcon.BalloonTipText = message;
-        _notifyIcon.BalloonTipIcon = ToolTipIcon.Warning;
-        _notifyIcon.ShowBalloonTip(6_000);
+        System.Windows.MessageBox.Show(
+            message,
+            "E-Tab update failed",
+            System.Windows.MessageBoxButton.OK,
+            System.Windows.MessageBoxImage.Error);
     }
 
     private static void ExitApplication()
@@ -155,7 +191,6 @@ public sealed class TrayIcon : IDisposable
     {
         UpdateManager.CheckCompleted -= OnCheckCompleted;
         UpdateManager.InstallCompleted -= OnInstallCompleted;
-        UpdateManager.InstallFailed -= OnInstallFailed;
 
         _menuWindow.Close();
         _notifyIcon.Visible = false;

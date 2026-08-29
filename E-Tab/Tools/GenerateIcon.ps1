@@ -6,6 +6,8 @@ Add-Type -AssemblyName System.Drawing
 
 function New-RoundedRectPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
 {
+    $maxR = [Math]::Min([int]($w / 2), [int]($h / 2))
+    $r = [Math]::Max(1, [Math]::Min($r, $maxR))
     $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
     $d = $r * 2
     $path.AddArc($x, $y, $d, $d, 180, 90)
@@ -33,7 +35,12 @@ function New-IconBitmap([int]$size)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    function S([double]$value) { return [int][Math]::Round($value * $scale) }
+    # Small sizes fill more of the canvas so the tray icon does not look tiny.
+    $fillScale = if ($size -lt 48) { 1.14 } else { 1.0 }
+    function S([double]$value)
+    {
+        return [int][Math]::Round((($value - 128) * $fillScale + 128) * $scale)
+    }
 
     # MergeFolders: two overlapping folders (merge into tabs) + green status dot.
     $back = New-FolderPath (S 62) (S 88) (S 164) (S 92) (S 62) (S 22) (S 20)
@@ -48,8 +55,11 @@ function New-IconBitmap([int]$size)
 
     if ($size -ge 24)
     {
+        $dotSize = if ($size -lt 64) { 22 } else { 18 }
+        $dotX = 170 - (($dotSize - 18) / 2)
+        $dotY = 166 - (($dotSize - 18) / 2)
         $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
-        $g.FillEllipse($dotBrush, (S 170), (S 166), (S 18), (S 18))
+        $g.FillEllipse($dotBrush, (S $dotX), (S $dotY), (S $dotSize), (S $dotSize))
     }
 
     $g.Dispose()

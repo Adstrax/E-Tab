@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -13,6 +14,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using Microsoft.Win32;
 
 namespace ETab.Helpers;
 
@@ -52,7 +54,6 @@ public static class UpdateManager
     private const string UpdaterExeName = "E-Tab-updater.exe";
     private const string MarkerFileName = "last-update.txt";
 
-    private static readonly HttpClient Http = CreateHttpClient();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static int _checking;
     private static int _installing;
@@ -60,16 +61,57 @@ public static class UpdateManager
 
     public static event Action<UpdateCheckResult>? CheckCompleted;
     public static event Action<string>? InstallCompleted;
-    public static event Action<string>? InstallFailed;
 
     public static Version CurrentVersion => typeof(UpdateManager).Assembly.GetName().Version ?? new Version(0, 0);
 
     private static HttpClient CreateHttpClient()
     {
-        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        var handler = new SocketsHttpHandler
+        {
+            UseProxy = true,
+            Proxy = GetSystemProxy(),
+            ConnectTimeout = TimeSpan.FromSeconds(15),
+        };
+        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("E-Tab-Updater");
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         return client;
+    }
+
+    /// <summary>
+    /// Reads the Windows system proxy fresh for every operation so updates
+    /// work even when the app was started before the proxy was enabled.
+    /// </summary>
+    private static IWebProxy? GetSystemProxy()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Internet Settings");
+            if (key?.GetValue("ProxyEnable") is int enabled && enabled == 1)
+            {
+                if (key.GetValue("AutoConfigURL") is string pac && !string.IsNullOrWhiteSpace(pac))
+                    return WebRequest.GetSystemWebProxy();
+
+                if (key.GetValue("ProxyServer") is string server && !string.IsNullOrWhiteSpace(server))
+                {
+                    // Accepts both "host:port" and "http=host:port;https=host:port".
+                    var httpsPart = server
+                        .Split(';')
+                        .Select(p => p.Trim())
+                        .FirstOrDefault(p => p.StartsWith("https=", StringComparison.OrdinalIgnoreCase));
+                    var address = httpsPart != null ? httpsPart["https=".Length..] : server;
+                    if (!string.IsNullOrWhiteSpace(address))
+                        return new WebProxy(address) { BypassProxyOnLocal = true };
+                }
+            }
+        }
+        catch
+        {
+            // Fall through to a direct connection.
+        }
+
+        return null;
     }
 
     private static string UpdatesDir =>
@@ -93,7 +135,8 @@ public static class UpdateManager
             string? error = null;
             try
             {
-                using var response = await Http.GetAsync(RepoApiUrl, HttpCompletionOption.ResponseHeadersRead)
+                using var client = CreateHttpClient();
+                using var response = await client.GetAsync(RepoApiUrl, HttpCompletionOption.ResponseHeadersRead)
                     .ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
                 {
@@ -138,7 +181,11 @@ public static class UpdateManager
     /// hands over to a self-updater copy of the current exe. On success the
     /// app shuts down so the updater can replace the binary.
     /// </summary>
-    public static async Task<bool> InstallUpdateAsync(ReleaseInfo info)
+    public static async Task<bool> InstallUpdateAsync(
+        ReleaseInfo info,
+        IProgress<(long Received, long Total)>? progress = null,
+        Action<string>? status = null,
+        CancellationToken cancellationToken = default)
     {
         if (Interlocked.Exchange(ref _installing, 1) != 0) return false;
         try
@@ -155,14 +202,30 @@ public static class UpdateManager
             var stageDir = Path.Combine(updatesDir, $"stage-{info.TagName.TrimStart('v')}");
 
             Log.Info($"Downloading update {info.TagName} from {info.ZipUrl}.");
-            using (var response = await Http.GetAsync(info.ZipUrl, HttpCompletionOption.ResponseHeadersRead)
+            status?.Invoke("download");
+            using (var client = CreateHttpClient())
+            using (var response = await client
+                       .GetAsync(info.ZipUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                        .ConfigureAwait(false))
             {
                 response.EnsureSuccessStatusCode();
-                using var file = File.Create(zipPath);
-                await response.Content.CopyToAsync(file).ConfigureAwait(false);
+                var total = response.Content.Headers.ContentLength ?? 0;
+                await using var file = File.Create(zipPath);
+                await using var content = await response.Content
+                    .ReadAsStreamAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                var buffer = new byte[81_920];
+                long received = 0;
+                int read;
+                while ((read = await content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                {
+                    await file.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    received += read;
+                    progress?.Report((received, total));
+                }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             using (var archive = ZipFile.OpenRead(zipPath))
             {
                 var exeEntry = archive.GetEntry("E-Tab.exe")
@@ -177,6 +240,8 @@ public static class UpdateManager
                 archive.GetEntry("README.txt")?.ExtractToFile(Path.Combine(stageDir, "README.txt"), overwrite: true);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+            status?.Invoke("install");
             var updaterExe = Path.Combine(updatesDir, UpdaterExeName);
             File.Copy(appExe, updaterExe, overwrite: true);
 
@@ -209,8 +274,13 @@ public static class UpdateManager
         }
         catch (Exception ex)
         {
+            if (ex is OperationCanceledException)
+            {
+                Log.Info("Update installation cancelled by the user.");
+                return false;
+            }
+
             Log.Error("Update installation failed.", ex);
-            InstallFailed?.Invoke($"Download/install failed: {ex.Message}");
             return false;
         }
         finally
