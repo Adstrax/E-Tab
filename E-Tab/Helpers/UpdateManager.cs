@@ -473,7 +473,7 @@ public static class UpdateManager
             // old binary is still in place, so the app does not disappear.
             if (!string.IsNullOrEmpty(appExe) && File.Exists(appExe))
             {
-                Process.Start(new ProcessStartInfo { FileName = appExe, WorkingDirectory = appDir, UseShellExecute = true });
+                LaunchApp(appExe, appDir);
                 Log.Info("Self-update complete; relaunched the app.");
             }
         }
@@ -484,7 +484,7 @@ public static class UpdateManager
             {
                 try
                 {
-                    Process.Start(new ProcessStartInfo { FileName = appExe, WorkingDirectory = appDir, UseShellExecute = true });
+                    LaunchApp(appExe, appDir);
                 }
                 catch
                 {
@@ -493,6 +493,36 @@ public static class UpdateManager
             }
         }
     }
+
+    /// <summary>
+    /// Starts the app without inheriting the ETAB_UPDATE_* environment
+    /// variables. Without this the fresh instance would think it is still in
+    /// self-update mode and relaunch itself forever.
+    /// </summary>
+    private static void LaunchApp(string appExe, string appDir)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = appExe,
+            WorkingDirectory = appDir,
+            UseShellExecute = false,
+        };
+        foreach (var name in SelfUpdateEnvVars)
+            psi.Environment.Remove(name);
+        Process.Start(psi);
+    }
+
+    private static readonly string[] SelfUpdateEnvVars =
+    {
+        "ETAB_UPDATE_PID",
+        "ETAB_UPDATE_APP_EXE",
+        "ETAB_UPDATE_APP_DIR",
+        "ETAB_UPDATE_NEW_EXE",
+        "ETAB_UPDATE_README",
+        "ETAB_UPDATE_ZIP",
+        "ETAB_UPDATE_STAGE",
+        "ETAB_UPDATE_VERSION",
+    };
 
     private static void CopyWithRetry(string source, string destination)
     {
