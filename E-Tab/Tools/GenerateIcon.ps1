@@ -16,6 +16,15 @@ function New-RoundedRectPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
     return $path
 }
 
+function New-FolderPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$tabW, [int]$tabH, [int]$r)
+{
+    $path = New-RoundedRectPath $x $y $w $h $r
+    $tab = New-RoundedRectPath $x ($y - $tabH) $tabW $tabH 8
+    $path.AddPath($tab, $false)
+    $tab.Dispose()
+    return $path
+}
+
 function New-IconBitmap([int]$size)
 {
     $scale = $size / 256.0
@@ -26,44 +35,32 @@ function New-IconBitmap([int]$size)
 
     function S([double]$value) { return [int][Math]::Round($value * $scale) }
 
-    $tile = New-RoundedRectPath (S 14) (S 14) (S 228) (S 228) (S 58)
-    $gradient = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
-        [System.Drawing.Rectangle]::new(0, 0, $size, $size),
-        [System.Drawing.Color]::FromArgb(255, 76, 194, 255),
-        [System.Drawing.Color]::FromArgb(255, 0, 103, 192),
-        45)
-    $g.FillPath($gradient, $tile)
-
-    $highlight = New-RoundedRectPath (S 14) (S 14) (S 228) (S 118) (S 58)
+    # MergeFolders: two overlapping folders (merge into tabs) + green status dot.
+    $back = New-FolderPath (S 62) (S 88) (S 164) (S 92) (S 62) (S 22) (S 20)
     $g.FillPath(
-        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(18, 255, 255, 255)),
-        $highlight)
+        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 0, 120, 212)),
+        $back)
+    $back.Dispose()
 
-    $folderWhite = [System.Drawing.Color]::FromArgb(242, 255, 255, 255)
-    $folderBack = New-RoundedRectPath (S 46) (S 82) (S 164) (S 106) (S 22)
-    $g.FillPath([System.Drawing.SolidBrush]::new($folderWhite), $folderBack)
+    $front = New-FolderPath (S 46) (S 108) (S 164) (S 92) (S 62) (S 22) (S 20)
+    $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), $front)
+    $front.Dispose()
 
-    $folderFront = New-RoundedRectPath (S 48) (S 98) (S 158) (S 88) (S 20)
-    $g.FillPath([System.Drawing.SolidBrush]::new($folderWhite), $folderFront)
-
-    $tabInactive = New-RoundedRectPath (S 76) (S 62) (S 54) (S 38) (S 9)
-    $g.FillPath(
-        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 255, 255, 255)),
-        $tabInactive)
-
-    $tabActive = New-RoundedRectPath (S 138) (S 62) (S 54) (S 38) (S 9)
-    $g.FillPath(
-        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 0, 103, 192)),
-        $tabActive)
-
-    if ($size -ge 32)
+    if ($size -ge 24)
     {
-        $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(230, 255, 255, 255))
-        $g.FillEllipse($dotBrush, (S 160), (S 76), (S 10), (S 10))
+        $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
+        $g.FillEllipse($dotBrush, (S 170), (S 166), (S 18), (S 18))
     }
 
     $g.Dispose()
     return $bmp
+}
+
+function Write-Png([string]$path, [int]$size)
+{
+    $bmp = New-IconBitmap $size
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
 }
 
 function Write-Ico([string]$path)
@@ -114,4 +111,5 @@ function Write-Ico([string]$path)
 }
 
 Write-Ico $OutputPath
+Write-Png (Join-Path $PSScriptRoot '..\Icon-32.png') 32
 Write-Output "ICON_WRITTEN $OutputPath"

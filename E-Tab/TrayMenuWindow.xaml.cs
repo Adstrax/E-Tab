@@ -42,18 +42,23 @@ public partial class TrayMenuWindow : Window
         var cursor = System.Windows.Forms.Cursor.Position;
         var dpiScale = GetDpiScaleAt(cursor);
 
-        Left = cursor.X / dpiScale - Width + 14;
-        Top = cursor.Y / dpiScale - Height - 4;
+        _suppressToggle = true;
+        AutoStartToggle.IsChecked = AutoStartManager.IsEnabled();
+        _suppressToggle = false;
+
+        // Show first so layout runs and SizeToContent can resolve the real
+        // height (the update-install row is hidden until an update is found,
+        // so a fixed height would leave blank space below Exit).
+        Show();
+        UpdateLayout();
+
+        Left = cursor.X / dpiScale - ActualWidth + 14;
+        Top = cursor.Y / dpiScale - ActualHeight - 4;
 
         var workArea = SystemParameters.WorkArea;
         if (Left < workArea.Left) Left = workArea.Left + 8;
         if (Top < workArea.Top) Top = workArea.Top + 8;
 
-        _suppressToggle = true;
-        AutoStartToggle.IsChecked = AutoStartManager.IsEnabled();
-        _suppressToggle = false;
-
-        Show();
         Activate();
     }
 
