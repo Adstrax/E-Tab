@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="E-Tab"
         Width="264"
-        Height="178"
+        Height="262"
         WindowStyle="None"
         Background="Transparent"
         ResizeMode="NoResize"
@@ -100,7 +100,7 @@
                                    FontSize="13"
                                    FontWeight="SemiBold"/>
                         <TextBlock x:Name="VersionText"
-                                   Text="v3.6.0"
+                                   Text="v3.7.0"
                                    Foreground="{DynamicResource EtabTextSecondary}"
                                    FontSize="11"/>
                     </StackPanel>
@@ -144,6 +144,48 @@
                               Checked="AutoStartToggle_Changed"
                               Unchecked="AutoStartToggle_Changed"/>
             </Grid>
+
+            <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
+
+            <Button x:Name="UpdateCheckButton"
+                    Style="{StaticResource MenuButtonStyle}"
+                    AutomationProperties.Name="Check for updates"
+                    AutomationProperties.AutomationId="UpdateCheckButton"
+                    Click="UpdateCheckButton_Click">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="&#xE72A;"
+                               FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                               FontSize="14"
+                               Foreground="{DynamicResource EtabTextSecondary}"
+                               VerticalAlignment="Center"/>
+                    <TextBlock Text="Check for updates"
+                               Foreground="{DynamicResource EtabTextPrimary}"
+                               FontSize="13"
+                               Margin="10,0,0,0"/>
+                </StackPanel>
+            </Button>
+
+            <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
+
+            <Button x:Name="UpdateInstallButton"
+                    Style="{StaticResource MenuButtonStyle}"
+                    Visibility="Collapsed"
+                    AutomationProperties.Name="Download and install update"
+                    AutomationProperties.AutomationId="UpdateInstallButton"
+                    Click="UpdateInstallButton_Click">
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="&#xE896;"
+                               FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets"
+                               FontSize="14"
+                               Foreground="{DynamicResource EtabTextSecondary}"
+                               VerticalAlignment="Center"/>
+                    <TextBlock x:Name="UpdateInstallText"
+                               Text="Download &amp; install update"
+                               Foreground="{DynamicResource EtabTextPrimary}"
+                               FontSize="13"
+                               Margin="10,0,0,0"/>
+                </StackPanel>
+            </Button>
 
             <Border Height="1" Background="{DynamicResource EtabSeparator}" Margin="8,0"/>
 

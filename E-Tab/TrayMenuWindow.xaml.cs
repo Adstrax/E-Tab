@@ -10,6 +10,8 @@ namespace ETab;
 public partial class TrayMenuWindow : Window
 {
     public event Action? ExitRequested;
+    public event Action? UpdateCheckRequested;
+    public event Action? UpdateInstallRequested;
 
     private bool _suppressToggle;
 
@@ -87,5 +89,29 @@ public partial class TrayMenuWindow : Window
     {
         ExitRequested?.Invoke();
         Close();
+    }
+
+    private void UpdateCheckButton_Click(object sender, RoutedEventArgs e)
+    {
+        UpdateCheckRequested?.Invoke();
+        Hide();
+    }
+
+    private void UpdateInstallButton_Click(object sender, RoutedEventArgs e)
+    {
+        UpdateInstallRequested?.Invoke();
+        Hide();
+    }
+
+    public void SetUpdateAvailable(ReleaseInfo? info)
+    {
+        if (info == null)
+        {
+            UpdateInstallButton.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        UpdateInstallButton.Visibility = Visibility.Visible;
+        UpdateInstallText.Text = $"Download & install v{info.Version.ToString(3)}";
     }
 }

@@ -14,6 +14,15 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // Self-update mode: this process is a copy started by the updater to
+        // replace the running binary. Perform the replacement and exit without
+        // creating the mutex or starting the tray app.
+        if (UpdateManager.TryRunSelfUpdateMode())
+        {
+            Shutdown();
+            return;
+        }
+
         _mutex = new Mutex(true, "ETabHook__Mutex", out var createdNew);
 
         if (!createdNew)
@@ -34,6 +43,7 @@ public partial class App : Application
         Log.Info($"E-Tab started ({GetType().Assembly.GetName().Version}).");
         _explorerWatcher = new ExplorerWatcher();
         _trayIcon = new TrayIcon();
+        UpdateManager.FinishPostUpdateCleanup();
     }
 
     protected override void OnExit(ExitEventArgs e)
