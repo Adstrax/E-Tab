@@ -52,6 +52,8 @@ public sealed class ExplorerWatcher : IDisposable
     private long _lastFullShellPollTicks;
     private long _lastActivityTicks;
     private Timer? _maintenanceTimer;
+    private readonly object _tabWaitLock = new();
+    private readonly Dictionary<nint, List<TabWaitRequest>> _tabWaiters = new();
     private bool _disposed;
 
     public ExplorerWatcher()
@@ -454,6 +456,11 @@ public sealed class ExplorerWatcher : IDisposable
         uint dwmsEventTime)
     {
         if (idObject != 0 || idChild != 0) return;
+        if (WinApi.IsWindowHasClassName(hWnd, "ShellTabWindowClass"))
+        {
+            NotifyTabCreated(hWnd);
+            return;
+        }
         if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
 
         lock (_itemsLock)
@@ -670,7 +677,7 @@ public sealed class ExplorerWatcher : IDisposable
             // tab does not keep showing the address bar in an "input" state.
             // If the navigation has not committed yet, the location check in
             // ConvertToTabAsync falls back to the normal Navigate2 path.
-            await Task.Delay(350);
+            await Task.Delay(250);
             KeyboardSimulator.SendKeyPress(VirtualKey.Escape);
         }
         catch
@@ -697,11 +704,7 @@ public sealed class ExplorerWatcher : IDisposable
 
             var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
             await RequestToOpenNewTab(mainWindowHWnd);
-            var newTabHandle = await Helper.ListenForNewExplorerTabAsync(
-                mainWindowHWnd,
-                currentTabs,
-                2_000,
-                sleepMs: 5);
+            var newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_000);
             return (mainWindowHWnd, newTabHandle);
         }
         finally
@@ -710,6 +713,83 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// Waits for a new Explorer tab in the given window. The WinEvent hook
+    /// reports the tab the moment its window appears (event-driven, low CPU);
+    /// a slow polling fallback keeps it robust if the hook does not fire for a
+    /// particular tab window.
+    /// </summary>
+    private async Task<nint> WaitForNewTabAsync(nint window, IReadOnlyCollection<nint> currentTabs, int timeoutMs)
+    {
+        var eventTcs = new TaskCompletionSource<nint>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_tabWaitLock)
+        {
+            if (!_tabWaiters.TryGetValue(window, out var list))
+            {
+                list = new List<TabWaitRequest>();
+                _tabWaiters[window] = list;
+            }
+            list.Add(new TabWaitRequest(currentTabs, eventTcs));
+        }
+
+        try
+        {
+            var eventTask = eventTcs.Task;
+            var pollTask = Helper.ListenForNewExplorerTabAsync(window, currentTabs, timeoutMs, sleepMs: 50);
+            var winner = await Task.WhenAny(eventTask, pollTask);
+            var result = await winner;
+            if (result != 0) return result;
+
+            // Both timed out; take whichever is still non-zero.
+            return await (winner == eventTask ? pollTask : eventTask);
+        }
+        finally
+        {
+            lock (_tabWaitLock)
+            {
+                if (_tabWaiters.TryGetValue(window, out var list))
+                {
+                    list.RemoveAll(r => r.Tcs == eventTcs);
+                    if (list.Count == 0) _tabWaiters.Remove(window);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Called on the UI thread when a new ShellTabWindowClass window appears;
+    /// completes any waiter bound to its parent window.
+    /// </summary>
+    private void NotifyTabCreated(nint tabHandle)
+    {
+        var parent = WinApi.GetParent(tabHandle);
+        if (parent == 0) return;
+
+        lock (_tabWaitLock)
+        {
+            if (!_tabWaiters.TryGetValue(parent, out var list)) return;
+            for (var i = list.Count - 1; i >= 0; i--)
+            {
+                var request = list[i];
+                if (request.CurrentTabs.Contains(tabHandle)) continue;
+                if (request.Tcs.TrySetResult(tabHandle))
+                    list.RemoveAt(i);
+            }
+            if (list.Count == 0) _tabWaiters.Remove(parent);
+        }
+    }
+
+    private sealed class TabWaitRequest
+    {
+        public TabWaitRequest(IReadOnlyCollection<nint> currentTabs, TaskCompletionSource<nint> tcs)
+        {
+            CurrentTabs = currentTabs;
+            Tcs = tcs;
+        }
+
+        public IReadOnlyCollection<nint> CurrentTabs { get; }
+        public TaskCompletionSource<nint> Tcs { get; }
+    }
     private static void TryQuitTabItem(object tabItem)
     {
         try
@@ -941,7 +1021,7 @@ public sealed class ExplorerWatcher : IDisposable
     private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
     {
         var startTicks = Stopwatch.GetTimestamp();
-        var sleepMs = 5;
+        var sleepMs = 20;
         while (!Helper.IsTimeUp(startTicks, timeMs))
         {
             try
@@ -956,8 +1036,8 @@ public sealed class ExplorerWatcher : IDisposable
 
             // Poll aggressively while the tab is young, then back off to keep
             // the ShellWindows enumeration cheap if Explorer is slow.
-            if (Helper.IsTimeUp(startTicks, 500))
-                sleepMs = 20;
+            if (Helper.IsTimeUp(startTicks, 400))
+                sleepMs = 40;
             await Task.Delay(sleepMs);
         }
 
