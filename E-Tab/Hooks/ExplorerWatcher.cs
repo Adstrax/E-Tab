@@ -20,6 +20,8 @@ public sealed class ExplorerWatcher : IDisposable
     private const int IdlePollMs = 1000;
     private const int FastPollDurationMs = 3000;
     private const int FullShellPollIntervalMs = 5000;
+    private const double IdleTrimAfterSeconds = 90;
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(30);
 
     private readonly SynchronizationContext _syncContext;
     private readonly object _itemsLock = new();
@@ -48,6 +50,8 @@ public sealed class ExplorerWatcher : IDisposable
     private int _polling;
     private long _fastPollUntilTicks;
     private long _lastFullShellPollTicks;
+    private long _lastActivityTicks;
+    private Timer? _maintenanceTimer;
     private bool _disposed;
 
     public ExplorerWatcher()
@@ -60,6 +64,8 @@ public sealed class ExplorerWatcher : IDisposable
         // of milliseconds per full enumeration.
         _conversionStaTaskScheduler = new StaTaskScheduler("Conversion STA");
         StartExplorerProcessCheck();
+        _lastActivityTicks = Stopwatch.GetTimestamp();
+        StartMemoryMaintenance();
     }
 
     private void CheckForMainExplorer(object? state)
@@ -457,6 +463,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         Helper.HideWindow(hWnd);
+        MarkActivity();
         ScheduleShowFallback(hWnd);
         RequestFastPoll();
         Log.Info($"New Explorer window detected (0x{hWnd:X}).");
@@ -499,6 +506,7 @@ public sealed class ExplorerWatcher : IDisposable
     private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
     {
         var sw = Stopwatch.StartNew();
+        MarkActivity();
         long searchMs = 0, createMs = 0, fastMs = 0, itemMs = 0, navMs = 0;
         var converted = false;
         try
@@ -1109,6 +1117,39 @@ public sealed class ExplorerWatcher : IDisposable
         return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
     }
 
+    private void MarkActivity()
+    {
+        Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
+    }
+
+    /// <summary>
+    /// Periodically (every 30s) checks whether the app has been idle for a few
+    /// minutes, then reclaims transient COM/WPF garbage and hands idle
+    /// working-set pages back to the OS. Gated on idleness so it never pauses
+    /// the UI during conversions or rapid tab switching.
+    /// </summary>
+    private void StartMemoryMaintenance()
+    {
+        _maintenanceTimer = new Timer(MemoryMaintenanceTick, null, MaintenanceInterval, MaintenanceInterval);
+    }
+
+    private void MemoryMaintenanceTick(object? state)
+    {
+        if (_disposed) return;
+
+        var idleSeconds = (Stopwatch.GetTimestamp() - Volatile.Read(ref _lastActivityTicks)) / (double)Stopwatch.Frequency;
+        if (idleSeconds < IdleTrimAfterSeconds) return;
+
+        try
+        {
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Optimized, blocking: false, compacting: false);
+            WinApi.TrimWorkingSet();
+        }
+        catch
+        {
+            // Reclaiming memory must never affect the app.
+        }
+    }
     private void StartExplorerProcessCheck()
     {
         _explorerCheckTimer?.Dispose();
@@ -1201,6 +1242,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         _explorerCheckTimer?.Dispose();
         _explorerCheckTimer = null;
+        _maintenanceTimer?.Dispose();
 
         lock (_processLock)
         {

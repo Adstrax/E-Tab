@@ -3,14 +3,24 @@
     <PropertyGroup>
         <OutputType>WinExe</OutputType>
         <TargetFramework>net10.0-windows</TargetFramework>
-        <UseWPF>true</UseWPF>
+        <UseWPF>false</UseWPF>
         <UseWindowsForms>true</UseWindowsForms>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
+
+        <!-- A long-running tray app has no culture-sensitive UI beyond the
+             static English strings it owns. Disabling ICU/globalization data
+             trims startup time and the resident process footprint. -->
+        <InvariantGlobalization>true</InvariantGlobalization>
+        <!-- Desktop GUI app: workstation, non-server GC, concurrent collection.
+             Tiny heaps here, so a server GC would only waste memory. -->
+        <ServerGarbageCollection>false</ServerGarbageCollection>
+        <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>3.7.7</Version>
-        <AssemblyVersion>3.7.7.0</AssemblyVersion>
-        <FileVersion>3.7.7.0</FileVersion>
+        <Version>4.0.0</Version>
+        <AssemblyVersion>4.0.0.0</AssemblyVersion>
+        <FileVersion>4.0.0.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>

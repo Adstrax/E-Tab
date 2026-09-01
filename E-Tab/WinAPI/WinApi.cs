@@ -2,9 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Windows;
-using System.Windows.Interop;
-using System.Windows.Media;
 using ETab.Helpers;
 
 namespace ETab.WinAPI;
@@ -227,21 +224,6 @@ public static class WinApi
     }
 
     /// <summary>
-    /// Makes the WPF composition surface transparent so the DWM system backdrop
-    /// (Mica / Mica Alt / Acrylic) is actually visible. Must be called after the
-    /// window handle exists, e.g. on SourceInitialized.
-    /// </summary>
-    public static void MakeWindowBackdropVisible(Window window)
-    {
-        var hwnd = new WindowInteropHelper(window).Handle;
-        if (hwnd == 0) return;
-
-        var source = HwndSource.FromHwnd(hwnd);
-        if (source?.CompositionTarget is { } target)
-            target.BackgroundColor = Colors.Transparent;
-    }
-
-    /// <summary>
     /// Extends the DWM glass frame over the whole client area so a non-layered
     /// WPF window can be transparent and let the WCA acrylic backdrop show
     /// through, while DWM still rounds the window corners.
@@ -359,6 +341,29 @@ public static class WinApi
             Log.Warn($"DwmSetWindowAttribute(WINDOW_CORNER_PREFERENCE) failed: 0x{hr:X8}");
     }
 
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("psapi.dll")]
+    private static extern bool EmptyWorkingSet(nint hProcess);
+
+    /// <summary>
+    /// Hands idle, private working-set pages back to the OS. Called only while
+    /// the app is idle; it lowers the Working Set shown in Task Manager without
+    /// affecting the app's behavior (pages are re-faulted on next access).
+    /// </summary>
+    public static void TrimWorkingSet()
+    {
+        try
+        {
+            EmptyWorkingSet(GetCurrentProcess());
+        }
+        catch
+        {
+            // Best effort: trimming memory must never throw.
+        }
+    }
     public static string? GetProcessPath(int pid)
     {
         const uint processQueryLimitedInformation = 0x1000;
