@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     构建 E-Tab 发布包：单文件 exe + 使用说明，扁平结构。
