@@ -515,39 +515,79 @@ public sealed class ExplorerWatcher : IDisposable
         {
             try
             {
-                List<(object Item, nint Hwnd)> items = new();
                 RunInStaThread(() =>
                 {
-                    items = EnumerateShellWindows();
+                    var items = EnumerateShellWindows();
+                    var host = PickMergeTarget();
+                    if (host == 0)
+                    {
+                        Log.Warn("Manual merge ignored: no visible Explorer window to be the target.");
+                        return;
+                    }
+
+                    Log.Info($"Manual merge: target 0x{host:X}; {items.Count} window(s) enumerated.");
+                    foreach (var (item, hwnd) in items)
+                    {
+                        if (hwnd == host) continue;
+                        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd))
+                        {
+                            Log.Info($"Manual merge: skip 0x{hwnd:X} (not a visible window).");
+                            continue;
+                        }
+
+                        var location = TryGetLocation(item);
+                        if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log.Info($"Manual merge: skip 0x{hwnd:X} (control panel).");
+                            continue;
+                        }
+                        if (string.IsNullOrWhiteSpace(location))
+                        {
+                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no location).");
+                            continue;
+                        }
+                        if (GetTabHandle(item) == 0)
+                        {
+                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no tab handle).");
+                            continue;
+                        }
+                        if (!WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Any())
+                        {
+                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no shell tab).");
+                            continue;
+                        }
+
+                        Log.Info($"Manual merge: merging 0x{hwnd:X} into {location}.");
+                        Helper.HideWindow(hwnd);
+                        lock (_itemsLock)
+                            _pendingConversions.Add(hwnd);
+                        _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location, forceNew: true, preferredWindow: host));
+                    }
                 }).GetAwaiter().GetResult();
-
-                var host = GetMainWindowHWnd(0);
-                foreach (var (item, hwnd) in items)
-                {
-                    if (host != 0 && hwnd == host) continue;
-                    if (WinApi.IsWindow(hwnd) && !HasVisibleExplorerWindow(hwnd))
-                        continue;
-
-                    var location = TryGetLocation(item);
-                    if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    if (GetTabHandle(item) == 0) continue;
-                    if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1)
-                        continue;
-
-                    Helper.HideWindow(hwnd);
-                    lock (_itemsLock)
-                        _pendingConversions.Add(hwnd);
-                    _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location));
-                }
-
-                Log.Info("Manual merge of all windows requested.");
             }
             catch (Exception ex)
             {
                 Log.Warn("Merge all windows failed: " + ex.Message);
             }
         });
+    }
+
+    /// <summary>
+    /// Chooses the window that should become the target of a manual merge:
+    /// the focused Explorer window if there is one, otherwise the recorded main
+    /// window, otherwise the first visible Explorer window.
+    /// </summary>
+    private nint PickMergeTarget()
+    {
+        var foreground = WinApi.GetForegroundWindow();
+        if (Helper.IsFileExplorerWindow(foreground) && WinApi.IsWindowVisible(foreground))
+            return foreground;
+
+        var main = GetMainWindowHWnd(0);
+        if (main != 0) return main;
+
+        return WinApi.FindAllWindowsEx("CabinetWClass")
+            .FirstOrDefault(h => WinApi.IsWindowVisible(h));
     }
 
     private void OnWindowShown(
@@ -615,7 +655,7 @@ public sealed class ExplorerWatcher : IDisposable
         }, TaskScheduler.Default);
     }
 
-    private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location)
+    private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location, bool forceNew = false, nint preferredWindow = 0)
     {
         var sw = Stopwatch.StartNew();
         MarkActivity();
@@ -633,7 +673,7 @@ public sealed class ExplorerWatcher : IDisposable
             // that tab instead of creating a new one.
             var existingTab = SearchForTab(target);
             searchMs = sw.ElapsedMilliseconds;
-            if (existingTab != 0)
+            if (!forceNew && existingTab != 0)
             {
                 var windowHandle = WinApi.GetParent(existingTab);
                 if (windowHandle != 0 && WinApi.IsWindow(windowHandle) && WinApi.IsWindow(existingTab))
@@ -666,7 +706,7 @@ public sealed class ExplorerWatcher : IDisposable
             // Serialize only the tab-creation step; the item wait and the
             // navigation can overlap between conversions so opening several
             // folders in a row does not queue behind the first one.
-            var (targetWindow, newTabHandle) = await CreateNewTabAsync();
+            var (targetWindow, newTabHandle) = await CreateNewTabAsync(preferredWindow);
             createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
                 return;
@@ -748,12 +788,12 @@ public sealed class ExplorerWatcher : IDisposable
             $"navigate {navMs}ms, converted={converted}).");
     }
 
-    private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync()
+    private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync(nint preferredWindow = 0)
     {
         await _toOpenWindowsLock.WaitAsync();
         try
         {
-            var mainWindowHWnd = GetMainWindowHWnd(0);
+            var mainWindowHWnd = preferredWindow != 0 && WinApi.IsWindowVisible(preferredWindow) ? preferredWindow : GetMainWindowHWnd(0);
             if (mainWindowHWnd == 0)
             {
                 // No visible Explorer window is available to merge into.
