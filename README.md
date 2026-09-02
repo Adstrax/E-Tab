@@ -1,3 +1,6 @@
+<p align="center"><img src="docs/E-Tab.png" width="96" height="96" alt="E-Tab" /></p>
+
+
 # E-Tab
 
 Windows 11 File Explorer 增强工具。新打开的文件夹窗口会自动合并到已有窗口的标签页中，让桌面更整洁。
