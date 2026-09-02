@@ -1,15 +1,19 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using ETab.Helpers;
 
 namespace ETab;
 
 /// <summary>
-/// Minimal WinForms tray icon. The UI is a plain system-themed context menu:
-/// the tray menu is rarely inspected, so looks do not matter and this keeps the
-/// resident footprint far smaller than a WPF window.
+/// Minimal WinForms tray icon. The tray menu is rarely inspected, so the menu
+/// is a plain system-themed context menu. The tray icon itself is drawn at the
+/// exact physical size the notification area uses at the current DPI so it
+/// stays crisp (no downscaling) and fills the cell (not small).
 /// </summary>
 public sealed class TrayIcon : IDisposable
 {
@@ -52,25 +56,102 @@ public sealed class TrayIcon : IDisposable
         };
     }
 
+    /// <summary>
+    /// Builds the tray icon at the exact physical pixel size for the current DPI.
+    /// Pixel-snapped, hard-edged two-folder mark (back folder + front folder)
+    /// matching the app icon, with a green status dot at 24px and up.
+    /// </summary>
     private static Icon LoadTrayIcon()
     {
         try
         {
-            var path = Environment.ProcessPath;
-            if (!string.IsNullOrWhiteSpace(path))
+            using var bmp = DrawTrayIcon(GetTrayIconSize());
+            var hicon = bmp.GetHicon();
+            try
             {
-                var icon = Icon.ExtractAssociatedIcon(path);
-                if (icon != null)
-                    return icon;
+                using var temp = Icon.FromHandle(hicon);
+                return (Icon)temp.Clone();
+            }
+            finally
+            {
+                DestroyIcon(hicon);
             }
         }
         catch
         {
-            // Fall through to the default application icon.
+            // Fall back to the default application icon if drawing fails.
+            return (Icon)SystemIcons.Application.Clone();
+        }
+    }
+
+    /// <summary>
+    /// Physical pixel size of the tray icon for the current system DPI
+    /// (16 logical px at 100%, scaled up on high-DPI displays).
+    /// </summary>
+    private static int GetTrayIconSize()
+    {
+        var dpi = GetDpiForSystem();
+        if (dpi == 0)
+            return Math.Max(16, SystemInformation.SmallIconSize.Width);
+        return Math.Max(16, (int)Math.Round(16.0 * dpi / 96.0));
+    }
+
+    private static Bitmap DrawTrayIcon(int size)
+    {
+        var scale = size / 32.0;
+        var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(bmp);
+        // Hard-edged (pixel-snapped) so the small tray mark stays crisp at 1:1.
+        g.SmoothingMode = SmoothingMode.None;
+        g.Clear(Color.Transparent);
+
+        int P(double v) => Math.Max(0, (int)Math.Round(v * scale));
+
+        using var blue = new SolidBrush(Color.FromArgb(255, 0, 120, 212));
+        using var white = new SolidBrush(Color.FromArgb(255, 255, 255, 255));
+
+        // Back folder (blue), peeking top-right behind the front folder.
+        FillRoundedRect(g, P(8), P(6), P(20), P(14), P(2), blue);
+        FillRoundedRect(g, P(8), P(3), P(9), P(5), P(2), blue);
+
+        // Front folder (white), bottom-left, overlapping the back folder.
+        FillRoundedRect(g, P(3), P(11), P(18), P(14), P(2), white);
+        FillRoundedRect(g, P(3), P(8), P(9), P(5), P(2), white);
+
+        if (size >= 24)
+        {
+            using var green = new SolidBrush(Color.FromArgb(255, 52, 199, 89));
+            g.FillRectangle(green, P(16), P(19), P(5), P(5));
         }
 
-        return (Icon)SystemIcons.Application.Clone();
+        return bmp;
     }
+
+    private static void FillRoundedRect(Graphics g, int x, int y, int w, int h, int r, Brush brush)
+    {
+        using var path = RoundedRectPath(x, y, w, h, r);
+        g.FillPath(brush, path);
+    }
+
+    private static GraphicsPath RoundedRectPath(int x, int y, int w, int h, int r)
+    {
+        var maxR = Math.Min(w / 2, h / 2);
+        r = Math.Max(1, Math.Min(r, maxR));
+        var path = new GraphicsPath();
+        var d = r * 2;
+        path.AddArc(x, y, d, d, 180, 90);
+        path.AddArc(x + w - d, y, d, d, 270, 90);
+        path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+        path.AddArc(x, y + h - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForSystem();
+
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(nint handle);
 
     private void ExitApplication()
     {
