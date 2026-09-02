@@ -67,7 +67,7 @@ internal sealed class ETabApplicationContext : ApplicationContext
         Application.Idle -= OnFirstIdle;
 
         _explorerWatcher = new ExplorerWatcher();
-        _trayIcon = new TrayIcon();
+        _trayIcon = new TrayIcon(_explorerWatcher!);
     }
 
     protected override void ExitThreadCore()

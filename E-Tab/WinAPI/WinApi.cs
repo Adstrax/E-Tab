@@ -11,6 +11,12 @@ public static class WinApi
     public const int EVENT_OBJECT_CREATE = 0x8000;
     public const int EVENT_OBJECT_SHOW = 0x8002;
     public const int WM_COMMAND = 0x111;
+    public const int WM_HOTKEY = 0x312;
+    public const uint MOD_ALT = 0x0001;
+    public const uint MOD_CONTROL = 0x0002;
+    public const uint MOD_SHIFT = 0x0004;
+    public const uint MOD_WIN = 0x0008;
+    public const uint VK_E = 0x45;
     public const int SW_HIDE = 0;
     public const int SW_SHOWNOACTIVATE = 4;
 
@@ -32,6 +38,12 @@ public static class WinApi
         uint idProcess,
         uint idThread,
         uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool RegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnregisterHotKey(nint hWnd, int id);
 
     [DllImport("user32.dll")]
     public static extern bool UnhookWinEvent(nint hWinEventHook);

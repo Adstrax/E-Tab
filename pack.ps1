@@ -7,7 +7,7 @@
     .\pack.ps1 -Version 2.0.0
 #>
 param(
-    [string]$Version = '5.5.0',
+    [string]$Version = '5.6.0',
     [string]$Runtime = 'win-x64'
 )
 

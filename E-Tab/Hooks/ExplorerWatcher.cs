@@ -54,6 +54,20 @@ public sealed class ExplorerWatcher : IDisposable
     private Timer? _maintenanceTimer;
     private readonly object _tabWaitLock = new();
     private readonly Dictionary<nint, List<TabWaitRequest>> _tabWaiters = new();
+
+    private volatile bool _autoMerge = Settings.AutoMerge;
+
+    public bool AutoMerge
+    {
+        get => _autoMerge;
+        set
+        {
+            _autoMerge = value;
+            try { Settings.AutoMerge = value; }
+            catch (Exception ex) { Log.Warn("Failed to persist AutoMerge: " + ex.Message); }
+        }
+    }
+
     private bool _disposed;
 
     public ExplorerWatcher()
@@ -362,6 +376,13 @@ public sealed class ExplorerWatcher : IDisposable
 
     private bool HandleNewTopLevelWindow(nint hwnd, List<(object Item, nint Hwnd)> items)
     {
+        if (!AutoMerge)
+        {
+            lock (_itemsLock)
+                _knownTopLevelWindows.Add(hwnd);
+            return true;
+        }
+
         object? item = null;
         foreach (var (candidate, candidateHwnd) in items)
         {
@@ -446,6 +467,89 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
+    private List<(object Item, nint Hwnd)> EnumerateShellWindows()
+    {
+        var result = new List<(object Item, nint Hwnd)>();
+        if (_shellApp == null) return result;
+        try
+        {
+            dynamic windows = ((dynamic)_shellApp).Windows();
+            var count = (int)windows.Count;
+            for (var i = 0; i < count; i++)
+            {
+                object item;
+                try
+                {
+                    item = (object)windows.Item(i);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                var hwnd = GetWindowHandle(item);
+                if (hwnd != 0)
+                    result.Add((item, hwnd));
+            }
+        }
+        catch
+        {
+            // ShellWindows can be temporarily unavailable.
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Collapses every currently-open Explorer window (except the main window)
+    /// into tabs of the main window. Used by the manual merge command, which is
+    /// useful when auto-merge is switched off so the user can still collapse
+    /// several windows in one go.
+    /// </summary>
+    public void MergeAllWindowsNow()
+    {
+        if (_disposed || _shellApp == null) return;
+
+        MarkActivity();
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                List<(object Item, nint Hwnd)> items = new();
+                RunInStaThread(() =>
+                {
+                    items = EnumerateShellWindows();
+                }).GetAwaiter().GetResult();
+
+                var host = GetMainWindowHWnd(0);
+                foreach (var (item, hwnd) in items)
+                {
+                    if (host != 0 && hwnd == host) continue;
+                    if (WinApi.IsWindow(hwnd) && !HasVisibleExplorerWindow(hwnd))
+                        continue;
+
+                    var location = TryGetLocation(item);
+                    if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (GetTabHandle(item) == 0) continue;
+                    if (WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Take(2).Count() != 1)
+                        continue;
+
+                    Helper.HideWindow(hwnd);
+                    lock (_itemsLock)
+                        _pendingConversions.Add(hwnd);
+                    _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location));
+                }
+
+                Log.Info("Manual merge of all windows requested.");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Merge all windows failed: " + ex.Message);
+            }
+        });
+    }
+
     private void OnWindowShown(
         nint hWinEventHook,
         uint eventType,
@@ -462,6 +566,7 @@ public sealed class ExplorerWatcher : IDisposable
             return;
         }
         if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
+        if (!AutoMerge) return;
 
         lock (_itemsLock)
         {
@@ -542,6 +647,15 @@ public sealed class ExplorerWatcher : IDisposable
                     // restored instead of silently disappearing.
                     if (WinApi.IsWindow(existingTab) && WinApi.GetParent(existingTab) == windowHandle)
                     {
+                        object? existingItem = null;
+                        if (_tabToItem.TryGetValue(existingTab, out var cached))
+                            existingItem = cached;
+                        else
+                            existingItem = await RunConversionInStaThread(() => FindShellItemForTab(existingTab));
+
+                        if (existingItem != null)
+                            SelectItems(existingItem, TryGetSelectedItems(item));
+
                         WinApi.RestoreWindowToForeground(windowHandle);
                         converted = true;
                         return;
