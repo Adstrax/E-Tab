@@ -96,49 +96,48 @@ public sealed class TrayIcon : IDisposable
         return Math.Max(16, (int)Math.Round(16.0 * dpi / 96.0));
     }
 
+
     private static Bitmap DrawTrayIcon(int size)
     {
-        var scale = size / 32.0;
+        var scale = size / 256.0d;
         var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(bmp);
-        // Hard-edged (pixel-snapped) so the small tray mark stays crisp at 1:1.
-        g.SmoothingMode = SmoothingMode.None;
+        // C2: a deck of two stacked tabs; mid-blue back peeks up-right, white
+        // front sits on top. Anti-aliased and auto-centred so it fills the
+        // square cell at any DPI and never looks small.
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         g.Clear(Color.Transparent);
 
-        int P(double v) => Math.Max(0, (int)Math.Round(v * scale));
+        const double tab = 150, dx = 30, dy = -30, radius = 16;
+        var minX = Math.Min(0, dx);
+        var minY = Math.Min(0, dy);
+        var maxX = Math.Max(tab, dx + tab);
+        var maxY = Math.Max(tab, dy + tab);
+        var tx = size / 2.0 - (minX + maxX) / 2.0 * scale;
+        var ty = size / 2.0 - (minY + maxY) / 2.0 * scale;
 
-        using var blue = new SolidBrush(Color.FromArgb(255, 0, 120, 212));
-        using var white = new SolidBrush(Color.FromArgb(255, 255, 255, 255));
+        using (var back = new SolidBrush(Color.FromArgb(255, 0, 120, 212)))
+            FillRoundedRect(g, tx + dx * scale, ty + dy * scale, tab * scale, tab * scale, radius * scale, back);
 
-        // Back folder (blue), peeking top-right behind the front folder.
-        FillRoundedRect(g, P(8), P(6), P(20), P(14), P(2), blue);
-        FillRoundedRect(g, P(8), P(3), P(9), P(5), P(2), blue);
-
-        // Front folder (white), bottom-left, overlapping the back folder.
-        FillRoundedRect(g, P(3), P(11), P(18), P(14), P(2), white);
-        FillRoundedRect(g, P(3), P(8), P(9), P(5), P(2), white);
-
-        if (size >= 24)
-        {
-            using var green = new SolidBrush(Color.FromArgb(255, 52, 199, 89));
-            g.FillRectangle(green, P(16), P(19), P(5), P(5));
-        }
+        using (var front = new SolidBrush(Color.White))
+            FillRoundedRect(g, tx, ty, tab * scale, tab * scale, radius * scale, front);
 
         return bmp;
     }
 
-    private static void FillRoundedRect(Graphics g, int x, int y, int w, int h, int r, Brush brush)
+    private static void FillRoundedRect(Graphics g, double x, double y, double w, double h, double r, Brush brush)
     {
-        using var path = RoundedRectPath(x, y, w, h, r);
+        using var path = RoundedRectPath((float)x, (float)y, (float)w, (float)h, (float)r);
         g.FillPath(brush, path);
     }
 
-    private static GraphicsPath RoundedRectPath(int x, int y, int w, int h, int r)
+    private static GraphicsPath RoundedRectPath(float x, float y, float w, float h, float r)
     {
-        var maxR = Math.Min(w / 2, h / 2);
-        r = Math.Max(1, Math.Min(r, maxR));
+        var maxR = Math.Min(w / 2f, h / 2f);
+        r = Math.Clamp(r, 1f, maxR);
         var path = new GraphicsPath();
-        var d = r * 2;
+        var d = r * 2f;
         path.AddArc(x, y, d, d, 180, 90);
         path.AddArc(x + w - d, y, d, d, 270, 90);
         path.AddArc(x + w - d, y + h - d, d, d, 0, 90);

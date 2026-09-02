@@ -4,122 +4,53 @@ param(
 
 Add-Type -AssemblyName System.Drawing
 
-function New-RoundedRectPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
+function New-RoundedRectPath([double]$x, [double]$y, [double]$w, [double]$h, [double]$r)
 {
-    $maxR = [Math]::Min([int]($w / 2), [int]($h / 2))
-    $r = [Math]::Max(1, [Math]::Min($r, $maxR))
+    $maxR = [Math]::Min([double]($w / 2), [double]($h / 2))
+    $r = [Math]::Max(1.0, [Math]::Min($r, $maxR))
     $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
     $d = $r * 2
-    $path.AddArc($x, $y, $d, $d, 180, 90)
-    $path.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
-    $path.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
-    $path.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
+    $path.AddArc([float]$x, [float]$y, [float]$d, [float]$d, 180, 90)
+    $path.AddArc([float]($x + $w - $d), [float]$y, [float]$d, [float]$d, 270, 90)
+    $path.AddArc([float]($x + $w - $d), [float]($y + $h - $d), [float]$d, [float]$d, 0, 90)
+    $path.AddArc([float]$x, [float]($y + $h - $d), [float]$d, [float]$d, 90, 90)
     $path.CloseFigure()
     return $path
 }
 
-function New-FolderPath([int]$x, [int]$y, [int]$w, [int]$h, [int]$tabW, [int]$tabH, [int]$r)
+# C2: a deck of two stacked tabs. Mid-blue back peeks up-right, white front on
+# top. Anti-aliased and auto-centred so it fills the square at any size.
+function New-TabsBitmap([int]$size)
 {
-    $path = New-RoundedRectPath $x $y $w $h $r
-    $tab = New-RoundedRectPath $x ($y - $tabH) $tabW $tabH 8
-    $path.AddPath($tab, $false)
-    $tab.Dispose()
-    return $path
-}
-
-function Fill-RoundedRect($g, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r, $brush)
-{
-    $path = New-RoundedRectPath $x $y $w $h $r
-    $g.FillPath($brush, $path)
-    $path.Dispose()
-}
-
-function New-TrayIconBitmap([int]$size)
-{
-    # Pixel-snapped, bold two-folder mark for tray sizes (16/24/32px). Hard
-    # edges keep it crisp at 1:1, and the folders fill the canvas so it does
-    # not look small next to filled tray icons.
-    $scale = $size / 32.0
-    $bmp = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
-    $g.Clear([System.Drawing.Color]::Transparent)
-
-    function P([double]$value) { return [Math]::Max(0, [int][Math]::Round($value * $scale)) }
-
-    $blue = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 0, 120, 212))
-    $white = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
-
-    # Back folder (blue), peeking top-right behind the front folder.
-    Fill-RoundedRect $g (P 8) (P 6) (P 20) (P 14) (P 2) $blue
-    Fill-RoundedRect $g (P 8) (P 3) (P 9) (P 5) (P 2) $blue
-
-    # Front folder (white), bottom-left, overlapping the back folder.
-    Fill-RoundedRect $g (P 3) (P 11) (P 18) (P 14) (P 2) $white
-    Fill-RoundedRect $g (P 3) (P 8) (P 9) (P 5) (P 2) $white
-
-    if ($size -ge 24)
-    {
-        $green = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
-        $g.FillRectangle($green, (P 16), (P 19), (P 5), (P 5))
-        $green.Dispose()
-    }
-
-    $blue.Dispose()
-    $white.Dispose()
-    $g.Dispose()
-    return $bmp
-}
-
-function New-IconBitmap([int]$size)
-{
-    if ($size -le 32)
-    {
-        return New-TrayIconBitmap $size
-    }
-
     $scale = $size / 256.0
     $bmp = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    # Small sizes fill more of the canvas so the tray icon does not look tiny.
-    $fillScale = if ($size -lt 48) { 1.14 } else { 1.0 }
-    function S([double]$value)
-    {
-        return [int][Math]::Round((($value - 128) * $fillScale + 128) * $scale)
-    }
+    $tab = 150.0; $dx = 30.0; $dy = -30.0; $r = 16.0
+    $minX = [Math]::Min(0.0, $dx); $minY = [Math]::Min(0.0, $dy)
+    $maxX = [Math]::Max($tab, $dx + $tab); $maxY = [Math]::Max($tab, $dy + $tab)
+    $tx = ($size / 2.0) - (($minX + $maxX) / 2.0) * $scale
+    $ty = ($size / 2.0) - (($minY + $maxY) / 2.0) * $scale
 
-    # MergeFolders (approved design): two overlapping folders (merge into
-    # tabs) + green status dot. Small sizes are scaled up around the centre
-    # (via S) so the artwork fills the canvas at tray sizes.
-    $back = New-FolderPath (S 62) (S 88) (S 164) (S 92) (S 62) (S 22) (S 20)
-    $g.FillPath(
-        [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(235, 0, 120, 212)),
-        $back)
-    $back.Dispose()
+    $back = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 0, 120, 212))
+    $front = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
 
-    $front = New-FolderPath (S 46) (S 108) (S 164) (S 92) (S 62) (S 22) (S 20)
-    $g.FillPath([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255)), $front)
-    $front.Dispose()
+    $pathBack = New-RoundedRectPath ($tx + $dx * $scale) ($ty + $dy * $scale) ($tab * $scale) ($tab * $scale) ($r * $scale)
+    $g.FillPath($back, $pathBack); $pathBack.Dispose()
 
-    if ($size -ge 24)
-    {
-        $dotSize = if ($size -lt 64) { 22 } else { 18 }
-        $dotX = 170 - (($dotSize - 18) / 2)
-        $dotY = 166 - (($dotSize - 18) / 2)
-        $dotBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(255, 52, 199, 89))
-        $g.FillEllipse($dotBrush, (S $dotX), (S $dotY), (S $dotSize), (S $dotSize))
-    }
+    $pathFront = New-RoundedRectPath $tx $ty ($tab * $scale) ($tab * $scale) ($r * $scale)
+    $g.FillPath($front, $pathFront); $pathFront.Dispose()
 
-    $g.Dispose()
+    $back.Dispose(); $front.Dispose(); $g.Dispose()
     return $bmp
 }
 
 function Write-Png([string]$path, [int]$size)
 {
-    $bmp = New-IconBitmap $size
+    $bmp = New-TabsBitmap $size
     $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
 }
@@ -131,7 +62,7 @@ function Write-Ico([string]$path)
 
     foreach ($size in $sizes)
     {
-        $bmp = New-IconBitmap $size
+        $bmp = New-TabsBitmap $size
         $stream = [System.IO.MemoryStream]::new()
         $bmp.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
         $images += , ($stream.ToArray())
