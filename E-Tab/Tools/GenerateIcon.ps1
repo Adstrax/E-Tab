@@ -29,7 +29,7 @@ function New-TabsBitmap([int]$size)
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    $tab = 196.0; $dx = 40.0; $dy = -40.0; $r = 21.0  # ~92% fill
+    $tab = 216.0; $dx = 35.0; $dy = -35.0; $r = 24.0  # ~98% fill
     $minX = [Math]::Min(0.0, $dx); $minY = [Math]::Min(0.0, $dy)
     $maxX = [Math]::Max($tab, $dx + $tab); $maxY = [Math]::Max($tab, $dy + $tab)
     $tx = ($size / 2.0) - (($minX + $maxX) / 2.0) * $scale

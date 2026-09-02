@@ -134,7 +134,7 @@ public sealed class TrayIcon : IDisposable
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         g.Clear(Color.Transparent);
 
-        const double tab = 196, dx = 40, dy = -40, radius = 21; // ~92% fill
+        const double tab = 216, dx = 35, dy = -35, radius = 24; // ~92% fill
         var minX = Math.Min(0, dx);
         var minY = Math.Min(0, dy);
         var maxX = Math.Max(tab, dx + tab);
