@@ -40,7 +40,7 @@ public sealed class TrayIcon : IDisposable
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitApplication();
 
-        _menu = new ContextMenuStrip { ShowImageMargin = false };
+        _menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true };
         _menu.Items.Add(new ToolStripMenuItem($"E-Tab  v{version?.ToString(3) ?? "?"}") { Enabled = false });
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_autoStartItem);
