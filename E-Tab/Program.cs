@@ -11,6 +11,9 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        // Declare system DPI awareness so the tray icon is drawn at the
+        // real physical size (not a DPI-virtualized 16px that gets upscaled).
+        Application.SetHighDpiMode(HighDpiMode.SystemAware);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 

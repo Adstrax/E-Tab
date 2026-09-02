@@ -92,8 +92,10 @@ public sealed class TrayIcon : IDisposable
     {
         var dpi = GetDpiForSystem();
         if (dpi == 0)
-            return Math.Max(16, SystemInformation.SmallIconSize.Width);
-        return Math.Max(16, (int)Math.Round(16.0 * dpi / 96.0));
+            return Math.Max(32, SystemInformation.SmallIconSize.Width);
+        // Draw at least 32px so the shell downscales (crisp) instead of
+        // upscaling a tiny bitmap (blurry) for the tray/flyout cell.
+        return Math.Max(32, (int)Math.Round(16.0 * dpi / 96.0));
     }
 
 
