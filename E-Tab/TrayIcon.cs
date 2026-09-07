@@ -8,6 +8,7 @@ using System.Windows.Forms;
 using ETab.Helpers;
 using ETab.Hooks;
 using ETab.WinAPI;
+using Microsoft.Win32;
 
 namespace ETab;
 
@@ -57,8 +58,26 @@ public sealed class TrayIcon : IDisposable
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitApplication();
 
-        _menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true };
-        _menu.Items.Add(new ToolStripMenuItem($"E-Tab  v{version?.ToString(3) ?? "?"}") { Enabled = false });
+        var titleItem = new ToolStripMenuItem($"E-Tab  v{version?.ToString(3) ?? "?"}") { Enabled = false };
+        ApplyItemStyle(titleItem, isTitle: true);
+
+        _menu = new ContextMenuStrip
+        {
+            ShowImageMargin = false,
+            ShowCheckMargin = true,
+            BackColor = FluentMenuRenderer.Background,
+            ForeColor = FluentMenuRenderer.Text,
+            Padding = new Padding(4),
+        };
+        _menu.Renderer = new FluentMenuRenderer();
+        _menu.HandleCreated += (_, _) => ApplyRoundedCorners(_menu);
+
+        ApplyItemStyle(_autoStartItem, isTitle: false);
+        ApplyItemStyle(_autoMergeItem, isTitle: false);
+        ApplyItemStyle(mergeAllItem, isTitle: false);
+        ApplyItemStyle(exitItem, isTitle: false);
+
+        _menu.Items.Add(titleItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(_autoStartItem);
         _menu.Items.Add(_autoMergeItem);
@@ -200,6 +219,130 @@ public sealed class TrayIcon : IDisposable
         _menu.Dispose();
         _icon.Dispose();
         _hotkey?.Dispose();
+    }
+
+    private static bool IsDarkMode()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            return key?.GetValue("AppsUseLightTheme") is int v && v == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ApplyRoundedCorners(ContextMenuStrip menu)
+    {
+        if (menu.Handle == 0) return;
+        var corner = WinApi.DWMWCP_ROUND;
+        WinApi.DwmSetWindowAttribute(menu.Handle, WinApi.DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
+    }
+
+    private static void ApplyItemStyle(ToolStripMenuItem item, bool isTitle)
+    {
+        item.ForeColor = isTitle ? FluentMenuRenderer.TextDisabled : FluentMenuRenderer.Text;
+        item.Padding = new Padding(10, 7, 10, 7);
+    }
+
+    internal sealed class FluentMenuRenderer : ToolStripProfessionalRenderer
+    {
+        private static bool Dark => IsDarkMode();
+
+        public static Color Background => Dark ? Color.FromArgb(44, 44, 44) : Color.FromArgb(251, 251, 251);
+        public static Color Text => Dark ? Color.FromArgb(240, 240, 240) : Color.FromArgb(26, 26, 26);
+        public static Color TextDisabled => Dark ? Color.FromArgb(130, 130, 130) : Color.FromArgb(150, 150, 150);
+        private static Color Hover => Dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(232, 232, 232);
+        private static Color Separator => Dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(226, 226, 226);
+
+        public FluentMenuRenderer() : base(new FluentColorTable())
+        {
+            RoundedEdges = false;
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (!e.Item.Selected || !e.Item.Enabled) return;
+            var bounds = new Rectangle(0, 0, e.Item.Width, e.Item.Height);
+            using var brush = new SolidBrush(Hover);
+            FilledRoundRect(e.Graphics, bounds, 6f, brush);
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = e.Item.Enabled ? e.Item.ForeColor : TextDisabled;
+            base.OnRenderItemText(e);
+        }
+
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            var item = e.Item as ToolStripMenuItem;
+            if (item == null || !item.Checked) return;
+
+            var r = e.ImageRectangle;
+            if (r.Width <= 0 || r.Height <= 0) return;
+
+            var cx = r.X + r.Width / 2f;
+            var cy = r.Y + r.Height / 2f;
+            var w = Math.Min(r.Width, r.Height) * 0.62f;
+
+            using var pen = new Pen(Text, Math.Max(2f, w * 0.16f))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round,
+            };
+
+            var p1 = new PointF(cx - w * 0.42f, cy - w * 0.02f);
+            var p2 = new PointF(cx - w * 0.12f, cy + w * 0.28f);
+            var p3 = new PointF(cx + w * 0.46f, cy - w * 0.34f);
+            e.Graphics.DrawLines(pen, new[] { p1, p2, p3 });
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            using var pen = new Pen(Separator);
+            var y = e.Item.Height / 2;
+            e.Graphics.DrawLine(pen, 10, y, e.Item.Width - 10, y);
+        }
+
+        private static void FilledRoundRect(Graphics g, Rectangle r, float radius, Brush brush)
+        {
+            using var path = new GraphicsPath();
+            var d = radius * 2f;
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            g.FillPath(brush, path);
+        }
+    }
+
+    private sealed class FluentColorTable : ProfessionalColorTable
+    {
+        private static bool Dark => IsDarkMode();
+        private static Color Bg => Dark ? Color.FromArgb(44, 44, 44) : Color.FromArgb(251, 251, 251);
+        private static Color Hover => Dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(232, 232, 232);
+        private static Color Sep => Dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(226, 226, 226);
+
+        public override Color ToolStripDropDownBackground => Bg;
+        public override Color MenuBorder => Bg;
+        public override Color MenuItemSelected => Hover;
+        public override Color MenuItemBorder => Hover;
+        public override Color SeparatorDark => Sep;
+        public override Color SeparatorLight => Sep;
+        public override Color ImageMarginGradientBegin => Bg;
+        public override Color ImageMarginGradientMiddle => Bg;
+        public override Color ImageMarginGradientEnd => Bg;
+        public override Color CheckBackground => Bg;
+        public override Color CheckSelectedBackground => Hover;
+        public override Color CheckPressedBackground => Hover;
+        public override Color ButtonSelectedHighlight => Hover;
+        public override Color ButtonSelectedHighlightBorder => Hover;
+
     }
 
     private sealed class HotkeyWindow : NativeWindow, IDisposable

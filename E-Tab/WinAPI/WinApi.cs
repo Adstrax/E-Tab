@@ -17,6 +17,8 @@ public static class WinApi
     public const uint MOD_SHIFT = 0x0004;
     public const uint MOD_WIN = 0x0008;
     public const uint VK_E = 0x45;
+    public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    public const int DWMWCP_ROUND = 2;
     public const int SW_HIDE = 0;
     public const int SW_SHOWNOACTIVATE = 4;
 
@@ -44,6 +46,9 @@ public static class WinApi
 
     [DllImport("user32.dll")]
     public static extern bool UnregisterHotKey(nint hWnd, int id);
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 
     [DllImport("user32.dll")]
     public static extern bool UnhookWinEvent(nint hWinEventHook);
