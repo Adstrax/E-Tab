@@ -48,6 +48,8 @@ public sealed class ExplorerWatcher : IDisposable
     private WinEventDelegate? _eventObjectCreateHookCallback;
     private WinEventDelegate? _eventObjectShowHookCallback;
     private int _polling;
+    // Guards the periodic Explorer check against overlapping ticks.
+    private int _explorerCheckBusy;
     private long _fastPollUntilTicks;
     private long _lastFullShellPollTicks;
     private long _lastActivityTicks;
@@ -88,6 +90,24 @@ public sealed class ExplorerWatcher : IDisposable
     {
         if (_disposed) return;
 
+        // Ticks are one second apart and the first shell snapshot can take
+        // longer than that, so two ticks used to be able to overlap: the
+        // second one saw "process id known, Process object not attached yet"
+        // and read that as "Explorer died", which reset the watcher and put
+        // every hidden window back on screen. Only one check runs at a time.
+        if (Interlocked.CompareExchange(ref _explorerCheckBusy, 1, 0) != 0) return;
+        try
+        {
+            CheckForMainExplorerCore();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _explorerCheckBusy, 0);
+        }
+    }
+
+    private void CheckForMainExplorerCore()
+    {
         // Once the main explorer process is known, the periodic check is just
         // a cheap liveness probe: Process.Exited normally notifies instantly,
         // but this catches the rare case where the event is missed (or its
@@ -96,10 +116,15 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (_mainExplorerProcessId != 0)
             {
+                // The Process object is attached only after the first shell
+                // snapshot has been taken. "No object yet" means this check is
+                // still initializing, not that Explorer exited.
+                if (_mainExplorerProcess is not { } current) return;
+
                 bool exited;
                 try
                 {
-                    exited = _mainExplorerProcess is not { } p || p.HasExited;
+                    exited = current.HasExited;
                 }
                 catch
                 {
@@ -426,14 +451,15 @@ public sealed class ExplorerWatcher : IDisposable
             return true;
         }
 
-        Helper.HideWindow(hwnd);
+        Helper.HideWindowInBackground(hwnd);
         lock (_itemsLock)
             _pendingConversions.Add(hwnd);
         ScheduleShowFallback(hwnd);
+        ScheduleHideRecheck(hwnd);
         RequestFastPoll();
         // Run the conversion off the UI thread: its awaits would otherwise
         // resume on the WPF dispatcher and hold the UI thread for the whole
-        // conversion (COM lookups, navigation, keyboard simulation), delaying
+        // conversion (COM lookups, navigation), delaying
         // WinEvent hook delivery for any new window that appears meanwhile.
         _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location));
         return true;
@@ -443,7 +469,7 @@ public sealed class ExplorerWatcher : IDisposable
     /// A window that ShellWindows cannot map to a convertible item (for
     /// example an elevated Explorer window, which a non-elevated process
     /// cannot enumerate via COM) would otherwise be hidden on every SHOW
-    /// event and restored by the 3-second fallback, flickering forever.
+    /// event and restored by the fallback timer, flickering forever.
     /// After a short grace period, give up on such windows: show them and
     /// mark them as known so OnWindowShown stops hiding them.
     /// </summary>
@@ -587,7 +613,7 @@ public sealed class ExplorerWatcher : IDisposable
         if (main != 0) return main;
 
         return WinApi.FindAllWindowsEx("CabinetWClass")
-            .FirstOrDefault(h => WinApi.IsWindowVisible(h));
+            .FirstOrDefault(h => WinApi.IsWindowVisible(h) && !Helper.IsParkedOffScreen(h));
     }
 
     private void OnWindowShown(
@@ -608,17 +634,59 @@ public sealed class ExplorerWatcher : IDisposable
         if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
         if (!AutoMerge) return;
 
+        // Explorer creates the frame window and only reveals it a moment later
+        // (~150 ms), and once revealed the window stays on screen for as long as
+        // Explorer keeps its own thread busy: a hide request sent at that point
+        // waits behind that work, which measured 30-110 ms of a window the user
+        // can see, i.e. a flash. Moving the window while it is still invisible
+        // costs nothing and is already applied by the time Explorer shows it, so
+        // the window is never painted on screen at all. See Helper.ParkWindow.
+        if (eventType == WinApi.EVENT_OBJECT_CREATE)
+        {
+            TryParkNewWindow(hWnd);
+            return;
+        }
+
+        // A window this app is already hiding must be hidden again the moment
+        // Explorer shows it (see HideWindow): otherwise it stays visible until
+        // the merge finishes and reads as a flash of the new window.
+        if (Helper.IsHidden(hWnd))
+        {
+            if (WinApi.IsWindowVisible(hWnd))
+            {
+                Helper.HideWindow(hWnd);
+                Log.Info($"Window 0x{hWnd:X} was shown again by Explorer; hidden again.");
+            }
+            return;
+        }
+
         lock (_itemsLock)
         {
             if (_knownTopLevelWindows.Contains(hWnd)) return;
+            // Nothing to merge into: leave the window alone instead of hiding
+            // it and having to put it back a moment later.
             if (!HasVisibleExplorerWindow(hWnd)) return;
         }
 
-        Helper.HideWindow(hWnd);
+        // A window that was moved out of the way is only registered as hidden
+        // here, the first moment it could have been seen; from then on
+        // HideWindow keeps it hidden and reports nothing new, so this detection
+        // branch runs once per window. Windows that are not visible yet are left
+        // for their SHOW event.
+        var wasParked = Helper.IsTracked(hWnd);
+        if (!Helper.HideWindowInBackground(hWnd)) return;
+
         MarkActivity();
         ScheduleShowFallback(hWnd);
+        ScheduleHideRecheck(hWnd);
         RequestFastPoll();
-        Log.Info($"New Explorer window detected (0x{hWnd:X}).");
+        // dwmsEventTime is the moment Explorer made the window visible; the gap
+        // to now is how long the user could actually see it before this app was
+        // able to hide it, i.e. the length of the flash.
+        var detectedMs = MsSinceEvent(dwmsEventTime);
+        Log.Info(wasParked
+            ? $"New Explorer window detected (0x{hWnd:X}); was already out of the way, hidden {detectedMs} ms after Explorer revealed it."
+            : $"New Explorer window detected (0x{hWnd:X}); visible for {detectedMs} ms before hiding.");
 
         // Poll the shell off the UI thread: PollShell blocks on the STA
         // scheduler, and this callback now runs on the UI thread.
@@ -628,30 +696,85 @@ public sealed class ExplorerWatcher : IDisposable
             TaskScheduler.Default);
     }
 
+    /// <summary>
+    /// Moves a freshly created Explorer window out of the way before Explorer
+    /// shows it, which is the only moment at which this costs the user nothing.
+    /// </summary>
+    private void TryParkNewWindow(nint hWnd)
+    {
+        lock (_itemsLock)
+        {
+            if (_knownTopLevelWindows.Contains(hWnd)) return;
+            // Nothing to merge into: leave the window alone instead of moving
+            // it and having to put it back a moment later.
+            if (!HasVisibleExplorerWindow(hWnd)) return;
+        }
+
+        if (!Helper.ParkWindow(hWnd)) return;
+
+        // Explorer almost always reveals the window a moment later, which is
+        // what starts the merge. If it never does, nothing else would put the
+        // window back, so it is put back here.
+        _ = Task.Delay(2_000).ContinueWith(_ => Helper.UnparkIfUntouched(hWnd), TaskScheduler.Default);
+    }
+
     private static bool HasVisibleExplorerWindow(nint except)
     {
         foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
         {
             if (hWnd == except) continue;
+            // A window this app has already moved out of the way is not a place
+            // the user can see, so it does not count as somewhere to merge into.
+            if (Helper.IsParkedOffScreen(hWnd)) continue;
             if (WinApi.IsWindowVisible(hWnd)) return true;
         }
 
         return false;
     }
 
+    /// <summary>
+    /// Puts a window back on screen when no merge has taken it over.
+    ///
+    /// A window is hidden the moment it appears, but the Shell item needed to
+    /// merge it only comes from a full ShellWindows pass, which takes a few
+    /// hundred milliseconds. When that lookup never succeeds the window has to
+    /// be given back to the user, so it stays hidden for at most this long. A
+    /// conversion that is already running owns the window instead, and
+    /// ConvertToTabAsync restores it when the merge fails.
+    /// </summary>
     private void ScheduleShowFallback(nint hWnd)
     {
-        _ = Task.Delay(3_000).ContinueWith(_ =>
+        _ = Task.Delay(1_500).ContinueWith(_ =>
         {
-            // If the conversion is still in progress, leave the window hidden;
-            // ConvertToTabAsync restores it when it completes or fails.
             lock (_itemsLock)
             {
                 if (_pendingConversions.Contains(hWnd)) return;
+                if (!Helper.HiddenWindows.ContainsKey(hWnd)) return;
             }
 
-            if (Helper.HiddenWindows.ContainsKey(hWnd))
-                Helper.ShowWindow(hWnd, removeCache: true);
+            if (Helper.ShowWindow(hWnd, removeCache: true))
+                Log.Warn($"Window 0x{hWnd:X} could not be merged; restored after 1.5 s.");
+        }, TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// One extra visibility check while a merge is running.
+    ///
+    /// Explorer reveals a new window more than once as its shell view comes up,
+    /// and the SHOW event normally hides it again straight away. This covers
+    /// the case where a window is revealed without an event this app can see:
+    /// without it the window would sit on screen for the whole merge.
+    /// </summary>
+    private void ScheduleHideRecheck(nint hWnd)
+    {
+        _ = Task.Delay(250).ContinueWith(_ =>
+        {
+            lock (_itemsLock)
+            {
+                if (!_pendingConversions.Contains(hWnd)) return;
+            }
+
+            Helper.HideWindow(hWnd);
         }, TaskScheduler.Default);
     }
 
@@ -696,7 +819,7 @@ public sealed class ExplorerWatcher : IDisposable
                         if (existingItem != null)
                             SelectItems(existingItem, TryGetSelectedItems(item));
 
-                        WinApi.RestoreWindowToForeground(windowHandle);
+                        WinApi.TryActivate(windowHandle);
                         converted = true;
                         return;
                     }
@@ -747,7 +870,7 @@ public sealed class ExplorerWatcher : IDisposable
             // source window instead of pretending the tab exists.
             if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == targetWindow)
             {
-                WinApi.RestoreWindowToForeground(targetWindow);
+                WinApi.TryActivate(targetWindow);
                 converted = true;
             }
         }
@@ -775,7 +898,11 @@ public sealed class ExplorerWatcher : IDisposable
             }
             else
             {
-                Helper.ShowWindow(sourceHwnd, removeCache: true);
+                // Hand the window back exactly as the user left it. A failed
+                // merge must never lose the window the user opened: it would
+                // otherwise stay hidden with no taskbar button.
+                if (Helper.ShowWindow(sourceHwnd, removeCache: true))
+                    Log.Warn($"Merge of 0x{sourceHwnd:X} failed; source window restored.");
             }
 
             lock (_itemsLock)
@@ -1007,13 +1134,11 @@ public sealed class ExplorerWatcher : IDisposable
         WinApi.PostMessage(tabHandle, WinApi.WM_COMMAND, 0xA21B, 0);
 
         if (bringToFront)
-            WinApi.RestoreWindowToForeground(windowHandle);
+            WinApi.TryActivate(windowHandle);
     }
 
     private async Task OpenNewWindow(string location)
     {
-        Helper.BypassWinForegroundRestrictions();
-
         var target = string.IsNullOrWhiteSpace(location) ? _defaultLocation : location;
         await RunConversionInStaThread(() =>
         {
@@ -1031,13 +1156,15 @@ public sealed class ExplorerWatcher : IDisposable
 
     private nint GetMainWindowHWnd(nint otherThan)
     {
-        if (Helper.IsFileExplorerWindow(_mainWindowHandle) && WinApi.IsWindowVisible(_mainWindowHandle))
+        if (Helper.IsFileExplorerWindow(_mainWindowHandle)
+            && WinApi.IsWindowVisible(_mainWindowHandle)
+            && !Helper.IsParkedOffScreen(_mainWindowHandle))
             return _mainWindowHandle;
 
         var allWindows = WinApi.FindAllWindowsEx("CabinetWClass");
         _mainWindowHandle = allWindows
             .Where(h => h != otherThan)
-            .Where(h => WinApi.IsWindowVisible(h))
+            .Where(h => WinApi.IsWindowVisible(h) && !Helper.IsParkedOffScreen(h))
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
             .FirstOrDefault();
 
@@ -1068,7 +1195,7 @@ public sealed class ExplorerWatcher : IDisposable
     /// snapshot. This is used while waiting for a newly created tab so the wait
     /// is both faster and cheaper than a complete PollShellCore pass.
     /// </summary>
-    private object? FindShellItemForTab(nint tabHandle)
+    private object? FindShellItemForTab(nint tabHandle, int startIndex = 0)
     {
         if (_shellApp == null) return null;
 
@@ -1085,7 +1212,9 @@ public sealed class ExplorerWatcher : IDisposable
         {
             dynamic windows = ((dynamic)_shellApp).Windows();
             var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
+            // Items are added in creation order, so a tab that has just been
+            // created can only be one of the entries added since the last look.
+            for (var i = Math.Max(startIndex, 0); i < count; i++)
             {
                 object item;
                 try
@@ -1119,30 +1248,66 @@ public sealed class ExplorerWatcher : IDisposable
         return found;
     }
 
+    /// <summary>
+    /// Waits for the Shell item of a tab that has just been created.
+    ///
+    /// The tab window exists long before its browser registers with
+    /// ShellWindows, and the lookup walks every open tab, which is several COM
+    /// calls into the very Explorer that is still busy starting this tab. A tab
+    /// that registers adds exactly one entry to ShellWindows, so the entry count
+    /// is read first - one cheap call - and the expensive scan only runs when
+    /// that count actually moved, plus once every 250 ms in case an entry
+    /// appears without changing it.
+    /// </summary>
     private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
     {
         var startTicks = Stopwatch.GetTimestamp();
-        var sleepMs = 20;
+        var lastCount = -1;
+        var lastScanTicks = 0L;
+
         while (!Helper.IsTimeUp(startTicks, timeMs))
         {
-            try
+            var count = await RunConversionInStaThread(GetShellWindowCount);
+            if (count <= 0 || count != lastCount || Helper.IsTimeUp(lastScanTicks, 250))
             {
-                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle));
-                if (item != null) return item;
-            }
-            catch
-            {
-                // Explorer can be in a transient state during tab creation.
+                // A grown list only has to be checked from where the last look
+                // ended; anything else needs a full pass.
+                var fromIndex = lastCount >= 0 && count > lastCount ? lastCount : 0;
+                lastCount = count;
+                lastScanTicks = Stopwatch.GetTimestamp();
+                try
+                {
+                    var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, fromIndex));
+                    if (item != null) return item;
+                }
+                catch
+                {
+                    // Explorer can be in a transient state during tab creation.
+                }
             }
 
-            // Poll aggressively while the tab is young, then back off to keep
-            // the ShellWindows enumeration cheap if Explorer is slow.
-            if (Helper.IsTimeUp(startTicks, 400))
-                sleepMs = 40;
-            await Task.Delay(sleepMs);
+            await Task.Delay(10);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// How many entries ShellWindows exposes right now: a single COM call, used
+    /// as a cheap "did anything register since the last look" signal.
+    /// </summary>
+    private int GetShellWindowCount()
+    {
+        if (_shellApp == null) return -1;
+
+        try
+        {
+            return (int)((dynamic)_shellApp).Windows().Count;
+        }
+        catch
+        {
+            return -1;
+        }
     }
 
     private void RemoveItem(object item)
@@ -1298,6 +1463,17 @@ public sealed class ExplorerWatcher : IDisposable
         return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
     }
 
+    /// <summary>
+    /// Milliseconds since a WinEvent timestamp. WinEvent times are 32-bit
+    /// tick counts, so the difference is taken in 32-bit arithmetic and a
+    /// nonsensical result (clock change, suspended machine) is reported as 0.
+    /// </summary>
+    private static long MsSinceEvent(uint eventTime)
+    {
+        var delta = unchecked((uint)Environment.TickCount64 - eventTime);
+        return delta > 60_000 ? 0 : delta;
+    }
+
     private void MarkActivity()
     {
         Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
@@ -1366,7 +1542,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
-    private void DisposeShellObjects()
+    private void DisposeShellObjects(bool restoreHiddenWindows = false)
     {
         if (_pollTimer != null)
         {
@@ -1390,9 +1566,26 @@ public sealed class ExplorerWatcher : IDisposable
             _eventObjectShowHookCallback = null;
         }
 
-        // Never leave windows hidden when the watcher stops.
-        foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
-            Helper.ShowWindow(hWnd, removeCache: true);
+        // Windows hidden by this app are handed back only when the app itself
+        // is going away. Re-initializing the watcher (after a real Explorer
+        // restart, say) must never flash a half-merged window back on screen:
+        // those windows are restored by ScheduleShowFallback, or by the
+        // conversion that owns them, within a second or so.
+        if (restoreHiddenWindows)
+        {
+            Helper.RestoreAllHiddenWindows();
+        }
+        else
+        {
+            // Handles that died with the old Explorer process must not linger:
+            // a recycled handle could otherwise be mistaken for a window that
+            // this app is still hiding.
+            foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
+            {
+                if (!WinApi.IsWindow(hWnd))
+                    Helper.HiddenWindows.TryRemove(hWnd, out _);
+            }
+        }
 
         lock (_itemsLock)
         {
@@ -1438,7 +1631,7 @@ public sealed class ExplorerWatcher : IDisposable
             _mainExplorerProcess = null;
         }
 
-        DisposeShellObjects();
+        DisposeShellObjects(restoreHiddenWindows: true);
         _staTaskScheduler.Dispose();
         _conversionStaTaskScheduler.Dispose();
 

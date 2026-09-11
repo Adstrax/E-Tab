@@ -35,7 +35,12 @@ dotnet build -c Release
 ## 使用
 
 - 运行后驻留系统托盘并自动开始工作。
-- 右键托盘图标：**Start with Windows** 开机自启动开关、**Exit** 退出（菜单项勾选即表示开机自启已开启）。
+- 右键托盘图标可以看到版本号和几个开关（勾选即表示已开启）：
+  - **Start with Windows**：开机自动启动。
+  - **Auto-merge new windows**：新窗口自动变成标签页；关掉后新窗口保持独立，需要时用下面的命令合并。
+  - **Merge all windows (Ctrl+Shift+E)**：把当前打开的资源管理器窗口合并到最前面的那个窗口。
+  - **Exit**：退出。
+- 合并过程不会改动窗口的大小、位置和最大化状态；万一合并失败，窗口会原样还原。
 - 日志位于 `%LOCALAPPDATA%\E-Tab\logs\E-Tab.log`。
 
 ## 许可证

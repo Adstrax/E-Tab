@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
-using ETab.Helpers;
 
 namespace ETab.WinAPI;
 
@@ -20,14 +19,11 @@ public static class WinApi
     public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     public const int DWMWCP_ROUND = 2;
     public const int SW_HIDE = 0;
-    public const int SW_SHOWNOACTIVATE = 4;
-
     public const uint SWP_NOSIZE = 0x0001;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
-    public const uint SWP_FRAMECHANGED = 0x0020;
-    public const uint SWP_SHOWWINDOW = 0x0040;
-    public const uint SWP_HIDEWINDOW = 0x0080;
+    public const int SW_SHOWNOACTIVATE = 4;
+    public const int SW_SHOWMINNOACTIVE = 7;
 
     public const uint SIGDN_URL = 0x80068000;
 
@@ -59,17 +55,23 @@ public static class WinApi
     [DllImport("user32.dll", SetLastError = true)]
     public static extern nint FindWindowEx(nint parentHandle, nint childAfter, string className, string? windowTitle);
 
-    [DllImport("user32.dll", ExactSpelling = true, EntryPoint = "MapVirtualKeyW")]
-    public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(nint handle, int nCmdShow);
 
-    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
-    public static extern uint SendInput(uint nInputs, [MarshalAs(UnmanagedType.LPArray), In] INPUT[] pInputs, int cbSize);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(nint hWnd, nint hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
 
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(nint handle, int nCmdShow);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
 
     [DllImport("user32.dll")]
     public static extern bool IsIconic(nint handle);
@@ -85,9 +87,6 @@ public static class WinApi
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetForegroundWindow(nint hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
 
     [DllImport("user32.dll")]
     public static extern uint RealGetWindowClass(nint hwnd, StringBuilder pszType, uint cchType);
@@ -128,15 +127,19 @@ public static class WinApi
         } while (handle != 0);
     }
 
-    public static void RestoreWindowToForeground(nint window)
+    /// <summary>
+    /// Best-effort "bring this window to the front", without synthetic input.
+    ///
+    /// The previous implementation sent a fake F23 key press system-wide to
+    /// defeat the foreground lock, which could disturb whatever the user was
+    /// typing into. When Windows denies the request the Z-order is left alone.
+    /// </summary>
+    public static bool TryActivate(nint window)
     {
+        if (window == 0 || !IsWindow(window)) return false;
         if (IsIconic(window))
             ShowWindow(window, SW_SHOWNOACTIVATE);
-
-        if (SetForegroundWindow(window)) return;
-
-        Helper.BypassWinForegroundRestrictions();
-        SetForegroundWindow(window);
+        return SetForegroundWindow(window);
     }
 
     public static string GetWindowClassName(nint hWnd, int maxClassNameLength = 254)

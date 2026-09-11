@@ -33,6 +33,10 @@ internal static class Program
 
         ThemeManager.Initialize();
         Log.Info($"E-Tab started ({typeof(Program).Assembly.GetName().Version}).");
+        // Last-resort safety net: an Explorer window this app hid must never
+        // outlive the app.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Helper.RestoreAllHiddenWindows();
+        AppDomain.CurrentDomain.UnhandledException += (_, _) => Helper.RestoreAllHiddenWindows();
 
         using var context = new ETabApplicationContext();
         Application.Run(context);

@@ -199,8 +199,7 @@ public sealed class TrayIcon : IDisposable
     private void ExitApplication()
     {
         // Never leave Explorer windows hidden when the app goes away.
-        foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
-            Helper.ShowWindow(hWnd, removeCache: true);
+        Helper.RestoreAllHiddenWindows();
 
         Log.Info("Exit requested from tray menu.");
         // Graceful exit so the watcher, hooks, COM objects and the single-instance
