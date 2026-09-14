@@ -488,8 +488,19 @@ public sealed class ExplorerWatcher : IDisposable
 
             _firstSeenTicks.Remove(hwnd);
             _knownTopLevelWindows.Add(hwnd);
+
+            // A window the user has already seen is handed back untouched. A
+            // window that was only moved out of the way was never on screen:
+            // revealing it here popped up a File Explorer window nobody had
+            // asked for, so such a window is left to Explorer instead (see
+            // Helper.ShowWindow). Explorer still shows it if it meant to.
+            var wasHidden = Helper.IsHidden(hwnd);
+            var title = WinApi.GetWindowTitle(hwnd);
             Helper.ShowWindow(hwnd, removeCache: true);
-            Log.Warn($"Window 0x{hwnd:X} cannot be merged into a tab; leaving it visible.");
+            if (wasHidden)
+                Log.Warn($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab; handed back to the user.");
+            else
+                Log.Info($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab and was never on screen; left to Explorer.");
         }
     }
 
@@ -842,6 +853,10 @@ public sealed class ExplorerWatcher : IDisposable
             if (tabItem == null)
                 return;
 
+            // Title of the tab while it still shows Explorer's default page;
+            // the tab keeps it until the folder it was sent to is on screen.
+            var defaultTitle = WinApi.GetWindowTitle(newTabHandle);
+
             // Navigate the new tab to the target via its Shell item (no simulated
             // address-bar keystrokes). Navigate2 runs when the fresh tab is not
             // already at the target, which is the normal case for a new tab.
@@ -870,6 +885,15 @@ public sealed class ExplorerWatcher : IDisposable
             // source window instead of pretending the tab exists.
             if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == targetWindow)
             {
+                // Let the tab draw the folder before it is brought forward:
+                // Explorer lays the new view out asynchronously and keeps the
+                // default page up for a few hundred milliseconds after the
+                // navigation was handed over (measured 300-650 ms). Switching
+                // during that window is what looks like the tab jumping from
+                // Home to the folder.
+                await WaitForTabLoadedAsync(newTabHandle, defaultTitle, TabLoadWaitMs);
+
+                await BringNewTabToFrontAsync(targetWindow, newTabHandle);
                 WinApi.TryActivate(targetWindow);
                 converted = true;
             }
@@ -915,6 +939,14 @@ public sealed class ExplorerWatcher : IDisposable
             $"navigate {navMs}ms, converted={converted}).");
     }
 
+    /// <summary>
+    /// Delays, in milliseconds, at which the window is put back on the tab the
+    /// user was on after a new tab was requested, counted from the new-tab
+    /// command. One request is posted straight away (see CreateNewTabAsync);
+    /// these cover Explorer adding the tab a little later than that.
+    /// </summary>
+    private static readonly int[] SwitchBackDelaysMs = { 20, 60 };
+
     private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync(nint preferredWindow = 0)
     {
         await _toOpenWindowsLock.WaitAsync();
@@ -931,7 +963,35 @@ public sealed class ExplorerWatcher : IDisposable
             }
 
             var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
+
+            // Explorer opens a new tab on its default "Home" page and switches to
+            // it, so the folder the user was looking at would be replaced by Home
+            // and then by the target folder. Remember which tab the user is on and
+            // send the window straight back to it, so the new tab can load in the
+            // background unseen.
+            var activeTab = currentTabs.Length > 0 ? currentTabs[0] : 0;
+            var backIndex = activeTab != 0
+                ? await RunConversionInStaThread(() => FindTabStripIndex(mainWindowHWnd, activeTab))
+                : -1;
+
             await RequestToOpenNewTab(mainWindowHWnd);
+
+            if (backIndex >= 0)
+            {
+                // Back to the tab the user was on as early as possible. The
+                // first request is posted while Explorer is still busy with the
+                // new tab, so it is already queued when that tab appears and the
+                // default page never gets a frame on screen; the later attempts
+                // cover a tab that Explorer adds a little later.
+                PostSelectTabByIndex(mainWindowHWnd, backIndex);
+                foreach (var delayMs in SwitchBackDelaysMs)
+                {
+                    await Task.Delay(delayMs);
+                    if (!WinApi.IsWindow(mainWindowHWnd)) return (0, 0);
+                    PostSelectTabByIndex(mainWindowHWnd, backIndex);
+                }
+            }
+
             var newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_000);
             return (mainWindowHWnd, newTabHandle);
         }
@@ -1119,6 +1179,19 @@ public sealed class ExplorerWatcher : IDisposable
         WinApi.SendMessage(windowHandle, WinApi.WM_COMMAND, 0xA221, index + 1);
     }
 
+    /// <summary>
+    /// The same "go to tab n" command as <see cref="SelectTabByIndex"/>, but
+    /// posted instead of sent. A sent message waits for a cross-process round
+    /// trip into Explorer, which is busy creating the tab at that very moment;
+    /// posting puts the request into Explorer's own queue right behind the
+    /// new-tab command, so it is handled before the fresh tab can draw the
+    /// default page.
+    /// </summary>
+    private static void PostSelectTabByIndex(nint windowHandle, int index)
+    {
+        WinApi.PostMessage(windowHandle, WinApi.WM_COMMAND, 0xA221, index + 1);
+    }
+
     private async Task RequestToOpenNewTab(nint windowHandle, bool bringToFront = false)
     {
         if (windowHandle == 0)
@@ -1251,42 +1324,33 @@ public sealed class ExplorerWatcher : IDisposable
     /// <summary>
     /// Waits for the Shell item of a tab that has just been created.
     ///
-    /// The tab window exists long before its browser registers with
-    /// ShellWindows, and the lookup walks every open tab, which is several COM
-    /// calls into the very Explorer that is still busy starting this tab. A tab
-    /// that registers adds exactly one entry to ShellWindows, so the entry count
-    /// is read first - one cheap call - and the expensive scan only runs when
-    /// that count actually moved, plus once every 250 ms in case an entry
-    /// appears without changing it.
+    /// Explorer registers a tab with ShellWindows roughly 100 ms after the tab
+    /// window appears. Reading the entry count is one cheap call, so it is done
+    /// first and the list is only walked when that count actually moved - a walk
+    /// over every open tab is several COM calls into the very Explorer that is
+    /// still busy starting this tab. The wait is kept as short as it can be
+    /// because the tab spends it sitting on Explorer's default "Home" page.
     /// </summary>
     private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
     {
         var startTicks = Stopwatch.GetTimestamp();
         var lastCount = -1;
-        var lastScanTicks = 0L;
+        var lastScanTicks = startTicks;
 
         while (!Helper.IsTimeUp(startTicks, timeMs))
         {
             var count = await RunConversionInStaThread(GetShellWindowCount);
-            if (count <= 0 || count != lastCount || Helper.IsTimeUp(lastScanTicks, 250))
+            if (count > 0 && (count != lastCount || Helper.IsTimeUp(lastScanTicks, 250)))
             {
-                // A grown list only has to be checked from where the last look
-                // ended; anything else needs a full pass.
-                var fromIndex = lastCount >= 0 && count > lastCount ? lastCount : 0;
+                // A new entry is not necessarily appended to the list, so every
+                // look is a full pass that stops at the first match.
                 lastCount = count;
                 lastScanTicks = Stopwatch.GetTimestamp();
-                try
-                {
-                    var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, fromIndex));
-                    if (item != null) return item;
-                }
-                catch
-                {
-                    // Explorer can be in a transient state during tab creation.
-                }
+                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, 0));
+                if (item != null) return item;
             }
 
-            await Task.Delay(10);
+            await Task.Delay(5);
         }
 
         return null;
@@ -1310,6 +1374,120 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// Shows the tab that was just created. It was left in the background while
+    /// it loaded so Explorer's default "Home" page never appeared, and by now it
+    /// shows the target folder.
+    /// </summary>
+    private async Task BringNewTabToFrontAsync(nint windowHandle, nint tabHandle)
+    {
+        // The tab was created in the background so it could load the target
+        // folder without Explorer's default page appearing. Show it now that it
+        // holds the folder the user asked for.
+        //
+        // The position is read from the tab strip itself: ShellWindows lists the
+        // tabs of one window in strip order, while enumerating the tab windows
+        // follows activation and therefore keeps changing.
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var tabs = Helper.GetAllExplorerTabs(windowHandle).ToArray();
+            if (tabs.Length == 0) return;
+            if (tabs[0] == tabHandle) return;
+
+            var index = await RunConversionInStaThread(() => FindTabStripIndex(windowHandle, tabHandle));
+            if (index < 0) break;
+
+            SelectTabByIndex(windowHandle, index);
+            await Task.Delay(20);
+        }
+
+        // No strip position was available (the tab is not registered with
+        // ShellWindows yet), so walk the strip instead.
+        await SelectTabByHandle(windowHandle, tabHandle);
+    }
+    /// <summary>
+    /// Position of a tab inside its window's tab strip. ShellWindows lists the
+    /// tabs of one window in strip order, so counting the entries that belong to
+    /// the same window before this one gives the position the tab commands use.
+    /// </summary>
+    /// <summary>
+    /// How long a new tab is given to draw the folder it was navigated to
+    /// before the window switches to it. Measured: 300-650 ms from the moment
+    /// the navigation was issued.
+    /// </summary>
+    private const int TabLoadWaitMs = 900;
+
+    /// <summary>
+    /// Earliest moment the title check is trusted. Explorer's tab window starts
+    /// out titled after the application itself and only picks up the default
+    /// page a moment later, so a title change inside this window would be that
+    /// first step rather than the folder being ready.
+    /// </summary>
+    private const int TabTitleTrustMs = 300;
+
+    /// <summary>
+    /// Waits until a tab shows the folder it was sent to instead of the default
+    /// page, so the window can switch to it without the default page ever being
+    /// visible.
+    ///
+    /// A tab that is not in front keeps reporting the default page's title while
+    /// it loads, so the title cannot be the only signal; the measured load time
+    /// is the part that always holds, and the title is an early exit for the
+    /// runs where Explorer does update it before the tab is shown.
+    /// </summary>
+    private async Task WaitForTabLoadedAsync(nint tabHandle, string defaultTitle, int timeMs)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+        while (!Helper.IsTimeUp(startTicks, timeMs))
+        {
+            if (!WinApi.IsWindow(tabHandle)) return;
+
+            if (Helper.IsTimeUp(startTicks, TabTitleTrustMs))
+            {
+                var title = WinApi.GetWindowTitle(tabHandle);
+                if (!string.IsNullOrWhiteSpace(title)
+                    && !string.Equals(title, defaultTitle, StringComparison.Ordinal))
+                    return;
+            }
+
+            await Task.Delay(15);
+        }
+    }
+    private int FindTabStripIndex(nint windowHandle, nint tabHandle)
+    {
+        if (_shellApp == null) return -1;
+
+        var index = 0;
+        try
+        {
+            dynamic windows = ((dynamic)_shellApp).Windows();
+            var count = (int)windows.Count;
+            for (var i = 0; i < count; i++)
+            {
+                object item;
+                try
+                {
+                    item = (object)windows.Item(i);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                var handle = GetTabHandle(item);
+                if (handle == 0) continue;
+                if (WinApi.GetParent(handle) != windowHandle) continue;
+                if (handle == tabHandle) return index;
+                index++;
+            }
+        }
+        catch
+        {
+            // ShellWindows can be temporarily unavailable while tabs change.
+        }
+
+        return -1;
+    }
     private void RemoveItem(object item)
     {
         var tabHandle = GetTabHandle(item);

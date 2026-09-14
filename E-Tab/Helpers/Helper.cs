@@ -289,6 +289,16 @@ public static class Helper
                 WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
         }
 
+        // Only a window the user has already seen may be put back on screen. A
+        // window that was merely parked was never shown by Explorer, and
+        // revealing it here decides, on Explorer's behalf, that the user wants
+        // a window they never asked for - which is how stray File Explorer
+        // windows used to pop up. Explorer keeps that decision: if it reveals
+        // the window, the SHOW event hands it to the normal merge path. The
+        // position has already been put back above, so the window appears
+        // where Explorer meant it to if it is shown later.
+        if (!state.Hidden) return false;
+
         return WinApi.ShowWindow(
             hWnd,
             state.WasMinimized ? WinApi.SW_SHOWMINNOACTIVE : WinApi.SW_SHOWNOACTIVATE);

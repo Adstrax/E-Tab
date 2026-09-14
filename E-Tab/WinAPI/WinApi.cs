@@ -98,6 +98,9 @@ public static class WinApi
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     public static extern bool PostMessage(nint hWnd, uint msg, nint wParam, nint lParam);
 
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(nint hWnd, StringBuilder lpString, int nMaxCount);
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(nint hWnd, out uint lpdwProcessId);
 
@@ -149,6 +152,20 @@ public static class WinApi
         var className = new StringBuilder(maxClassNameLength + 1);
         RealGetWindowClass(hWnd, className, (uint)className.Capacity);
         return className.ToString();
+    }
+
+    /// <summary>
+    /// Title of a window - for an Explorer tab window that is the name of the
+    /// page the tab is showing, which makes this a cheap way to see whether a
+    /// tab has finished loading the folder it was sent to.
+    /// </summary>
+    public static string GetWindowTitle(nint hWnd, int maxLength = 512)
+    {
+        if (hWnd == 0) return string.Empty;
+
+        var title = new StringBuilder(maxLength + 1);
+        var length = GetWindowText(hWnd, title, title.Capacity);
+        return length > 0 ? title.ToString() : string.Empty;
     }
 
     public static bool IsWindowHasClassName(nint hWnd, string className, StringComparison comparison = StringComparison.OrdinalIgnoreCase)
