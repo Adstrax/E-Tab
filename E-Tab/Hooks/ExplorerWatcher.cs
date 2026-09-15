@@ -29,6 +29,18 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly Dictionary<nint, WindowInfo> _tabInfos = new();
     private readonly Dictionary<nint, object> _tabToItem = new();
     private readonly HashSet<nint> _knownTopLevelWindows = new();
+
+    /// <summary>
+    /// Windows that were given up on while they were invisible, together with
+    /// the title they carried at that moment. Explorer keeps such windows
+    /// hidden and hands one of them to the next folder that is opened, so they
+    /// are not finished with: the folder that lands in one of them becomes its
+    /// title, which is what says the window has to be merged like any other.
+    /// Treating such a window as old for good was what made a merge fail at
+    /// random.
+    /// </summary>
+    private readonly Dictionary<nint, string> _spareWindows = new();
+
     private readonly HashSet<nint> _pendingConversions = new();
     private readonly Dictionary<nint, long> _firstSeenTicks = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
@@ -283,6 +295,23 @@ public sealed class ExplorerWatcher : IDisposable
 
         var currentTopLevel = WinApi.FindAllWindowsEx("CabinetWClass").ToHashSet();
 
+        // A window Explorer held back can be handed the next folder that is
+        // opened, which turns it into a window that has to be merged like any
+        // other. Explorer gives it that folder's name as its title, so a title
+        // that differs from the one it was given up with is the signal to take
+        // it on again. This also covers a SHOW event this app never saw.
+        lock (_itemsLock)
+        {
+            foreach (var spare in _spareWindows.Where(p => currentTopLevel.Contains(p.Key)).ToList())
+            {
+                var titleNow = WinApi.GetWindowTitle(spare.Key);
+                if (string.Equals(titleNow, spare.Value, StringComparison.Ordinal)) continue;
+                _spareWindows.Remove(spare.Key);
+                _knownTopLevelWindows.Remove(spare.Key);
+                Log.Info($"Window 0x{spare.Key:X} now shows '{titleNow}'; merging it as a new window.");
+            }
+        }
+
         // The ShellWindows COM snapshot is the most expensive step: it costs
         // several COM round-trips per open tab. At idle it is only needed to
         // keep the tab cache fresh, so run a full pass when a new window
@@ -346,12 +375,27 @@ public sealed class ExplorerWatcher : IDisposable
             // into tabs (which caused a flash on first launch and a garbled
             // window on first close).
             recognizedWindows.UnionWith(currentTopLevel);
+
+            // Windows that exist but are not on screen are not the user's:
+            // Explorer keeps spare windows of its own around, and one of those
+            // is what the next folder is opened in. They stay mergeable, which
+            // the title they carry at this moment records.
+            lock (_itemsLock)
+            {
+                foreach (var hwnd in currentTopLevel)
+                {
+                    if (!WinApi.IsWindowVisible(hwnd))
+                        _spareWindows[hwnd] = WinApi.GetWindowTitle(hwnd);
+                }
+            }
         }
 
         lock (_itemsLock)
         {
             _knownTopLevelWindows.RemoveWhere(h => !currentTopLevel.Contains(h));
             _knownTopLevelWindows.UnionWith(recognizedWindows);
+            foreach (var goneSpare in _spareWindows.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
+                _spareWindows.Remove(goneSpare);
 
             foreach (var staleSeen in _firstSeenTicks.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
                 _firstSeenTicks.Remove(staleSeen);
@@ -428,7 +472,10 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (!HasVisibleExplorerWindow(hwnd))
             {
+                // Nothing to merge into: hand the window back instead of
+                // hiding it and having to put it back a moment later.
                 Helper.ShowWindow(hwnd, removeCache: true);
+                Log.Warn($"Window 0x{hwnd:X} left as its own window: no other File Explorer window is on screen to merge it into.");
                 return true;
             }
         }
@@ -438,6 +485,19 @@ public sealed class ExplorerWatcher : IDisposable
         {
             Helper.ShowWindow(hwnd, removeCache: true);
             return true;
+        }
+
+        // A window that does not say which folder it shows - Explorer's Home
+        // page, or a window that is still coming up - is nothing this app can
+        // merge. It is left alone rather than hidden and put back a moment
+        // later: that round trip is what used to flash, and it is also what
+        // put a window Explorer had never shown on screen in front of the
+        // user. The window keeps its place in the queue, so the merge happens
+        // as soon as it does say which folder it shows.
+        if (string.IsNullOrWhiteSpace(location))
+        {
+            MarkUnconvertibleIfStale(hwnd);
+            return false;
         }
 
         if (GetTabHandle(item) == 0)
@@ -498,9 +558,20 @@ public sealed class ExplorerWatcher : IDisposable
             var title = WinApi.GetWindowTitle(hwnd);
             Helper.ShowWindow(hwnd, removeCache: true);
             if (wasHidden)
+            {
                 Log.Warn($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab; handed back to the user.");
+            }
+            else if (!WinApi.IsWindowVisible(hwnd))
+            {
+                // Never on screen, so Explorer is still holding it: the next
+                // folder the user opens may land in this very window.
+                _spareWindows[hwnd] = title;
+                Log.Info($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab yet; kept for the next open.");
+            }
             else
-                Log.Info($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab and was never on screen; left to Explorer.");
+            {
+                Log.Info($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab; left open for the user.");
+            }
         }
     }
 
@@ -673,7 +744,21 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            if (_knownTopLevelWindows.Contains(hWnd)) return;
+            // A window that was given up on while it was invisible is allowed
+            // back in as soon as Explorer has put a folder in it: that is what
+            // the title it shows now says. It has to leave the known list here,
+            // otherwise the poll would take it for an old window and skip the
+            // merge.
+            if (_knownTopLevelWindows.Contains(hWnd))
+            {
+                if (!_spareWindows.TryGetValue(hWnd, out var spareTitle)) return;
+                var titleNow = WinApi.GetWindowTitle(hWnd);
+                if (string.Equals(titleNow, spareTitle, StringComparison.Ordinal)) return;
+                _spareWindows.Remove(hWnd);
+                _knownTopLevelWindows.Remove(hWnd);
+                Log.Info($"Window 0x{hWnd:X} now shows '{titleNow}'; merging it as a new window.");
+            }
+
             // Nothing to merge into: leave the window alone instead of hiding
             // it and having to put it back a moment later.
             if (!HasVisibleExplorerWindow(hWnd)) return;
@@ -799,7 +884,10 @@ public sealed class ExplorerWatcher : IDisposable
         {
             var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
             if (string.IsNullOrWhiteSpace(target))
+            {
+                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: the window does not say which folder it shows.");
                 return;
+            }
 
             Log.Info($"Merging 0x{sourceHwnd:X} into '{target}'.");
 
@@ -843,7 +931,10 @@ public sealed class ExplorerWatcher : IDisposable
             var (targetWindow, newTabHandle) = await CreateNewTabAsync(preferredWindow);
             createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
+            {
+                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: Explorer did not open a new tab (window 0x{targetWindow:X}, tab 0x{newTabHandle:X}).");
                 return;
+            }
 
             // Give slow Explorer extra time to register the new tab's Shell
             // item before giving up, so a half-created tab is not left at the
@@ -851,7 +942,10 @@ public sealed class ExplorerWatcher : IDisposable
             var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
             itemMs = sw.ElapsedMilliseconds;
             if (tabItem == null)
+            {
+                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: the new tab 0x{newTabHandle:X} did not register with the shell in {itemMs} ms.");
                 return;
+            }
 
             // Title of the tab while it still shows Explorer's default page;
             // the tab keeps it until the folder it was sent to is on screen.
@@ -959,6 +1053,7 @@ public sealed class ExplorerWatcher : IDisposable
                 // Restore the source window instead of opening a brand-new
                 // one, so a window does not "reappear" right after the user
                 // closes File Explorer.
+                Log.Warn("No File Explorer window is on screen to merge into; the new folder is left as its own window.");
                 return (0, 0);
             }
 
@@ -993,6 +1088,16 @@ public sealed class ExplorerWatcher : IDisposable
             }
 
             var newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_000);
+            if (newTabHandle == 0)
+            {
+                // Explorer can take longer than that when it is busy. Giving up
+                // here would hand the folder the user opened back as a window
+                // of its own, so the tab is given one more chance before that
+                // happens; this costs nothing in the normal case.
+                Log.Warn($"Explorer has not opened the new tab in 0x{mainWindowHWnd:X} yet; waiting a little longer.");
+                newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_500);
+            }
+
             return (mainWindowHWnd, newTabHandle);
         }
         finally
@@ -1770,6 +1875,7 @@ public sealed class ExplorerWatcher : IDisposable
             _tabInfos.Clear();
             _tabToItem.Clear();
             _knownTopLevelWindows.Clear();
+            _spareWindows.Clear();
             _pendingConversions.Clear();
             _firstSeenTicks.Clear();
         }
