@@ -337,37 +337,26 @@ public static class Helper
         => HiddenWindows.TryGetValue(hWnd, out var state) && state.Hidden;
 
     /// <summary>
-    /// Safety net for a window that was parked but that Explorer never went on
-    /// to reveal: if nothing else has claimed it, put it back where Explorer
-    /// meant to open it, so the user is never left without their window.
+    /// A window that was parked and that nothing has claimed yet is left where
+    /// it is.
     ///
-    /// The window is not forced on screen - whatever Explorer was going to do
-    /// with it still happens, only at the position it was meant to appear at.
+    /// It used to be moved back to where Explorer meant to open it a couple of
+    /// seconds after being parked, and that is what turned the folder Explorer
+    /// hands such a window into something the user saw: Explorer reveals a
+    /// window it is about to give a folder to, so a window put back on screen
+    /// first appears in front of the user and is taken away again a moment
+    /// later, once the merge has turned it into a tab. While the window is still
+    /// off screen, that reveal happens out of sight. Whenever a merge is given
+    /// up on, Helper.ShowWindow puts the position Explorer meant back first, so
+    /// the folder can never be left off screen.
     /// </summary>
-    public static void UnparkIfUntouched(nint hWnd)
+    public static void KeepOutOfTheWayIfUntouched(nint hWnd)
     {
         if (!HiddenWindows.TryGetValue(hWnd, out var state)) return;
         if (!state.Parked || state.Hidden) return;
 
         if (!WinApi.IsWindow(hWnd))
-        {
             HiddenWindows.TryRemove(hWnd, out _);
-            return;
-        }
-
-        // Explorer revealed it after all, so the normal hide path owns it now.
-        if (WinApi.IsWindowVisible(hWnd)) return;
-
-        WinApi.SetWindowPos(
-            hWnd,
-            0,
-            state.OriginalRect.Left,
-            state.OriginalRect.Top,
-            0,
-            0,
-            WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
-        HiddenWindows[hWnd] = state with { Parked = false };
-        Log.Info($"Window 0x{hWnd:X} was never revealed; put back at {state.OriginalRect.Left},{state.OriginalRect.Top}.");
     }
 
     public static string NormalizeLocation(string location)
