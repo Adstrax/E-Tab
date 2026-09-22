@@ -58,6 +58,40 @@ public static class WinApi
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(nint handle, int nCmdShow);
 
+    public const uint PM_REMOVE = 0x0001;
+    public const uint QS_ALLINPUT = 0x04FF;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG
+    {
+        public nint hwnd;
+        public uint message;
+        public nuint wParam;
+        public nint lParam;
+        public uint time;
+        public int ptX;
+        public int ptY;
+        public uint lPrivate;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool PeekMessage(out MSG msg, nint hWnd, uint filterMin, uint filterMax, uint removeMsg);
+
+    [DllImport("user32.dll")]
+    public static extern bool TranslateMessage(ref MSG msg);
+
+    [DllImport("user32.dll")]
+    public static extern nint DispatchMessage(ref MSG msg);
+
+    /// <summary>
+    /// Waits for any of the handles, for a message to arrive in this thread's
+    /// queue, or for the timeout - whichever comes first. A thread that owns COM
+    /// objects has to keep its message queue serviced, because calls from other
+    /// threads are delivered through that queue.
+    /// </summary>
+    [DllImport("user32.dll")]
+    public static extern uint MsgWaitForMultipleObjectsEx(uint count, nint[] handles, uint milliseconds, uint wakeMask, uint flags);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
     {

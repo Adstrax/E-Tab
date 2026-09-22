@@ -20,6 +20,26 @@ public sealed class ExplorerWatcher : IDisposable
     private const int IdlePollMs = 1000;
     private const int FastPollDurationMs = 3000;
     private const int FullShellPollIntervalMs = 5000;
+    /// <summary>
+    /// How often the shell is checked while Explorer is holding a window of its
+    /// own that the next folder can land in. Such a window comes on screen the
+    /// moment it is given a folder, so it is looked at more often than
+    /// everything else. The check is a window enumeration and knows nothing
+    /// about the shell, so it costs almost nothing.
+    /// </summary>
+    private const int SparePollMs = 300;
+    /// <summary>
+    /// A merge that has not moved on for this long is stuck: one of the calls
+    /// into Explorer never came back. The window is then handed back to the
+    /// user, so a folder can never end up with neither a window nor a tab to
+    /// show for it.
+    /// </summary>
+    private const int MergeStuckMs = 6000;
+    /// <summary>
+    /// The longest a merge waits for its turn at the tab creation step, no
+    /// matter how much the queue in front of it keeps moving.
+    /// </summary>
+    private const int TabCreationGiveUpMs = 30_000;
     private const double IdleTrimAfterSeconds = 90;
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(30);
 
@@ -42,6 +62,47 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly Dictionary<nint, string> _spareWindows = new();
 
     private readonly HashSet<nint> _pendingConversions = new();
+
+    /// <summary>
+    /// Where a merge is right now, so a merge that gets stuck can name the step
+    /// it is waiting in instead of ending up as silence in the log.
+    /// </summary>
+    private sealed class MergeStep
+    {
+        private long _changedTicks = Stopwatch.GetTimestamp();
+        private string _stage = "starting";
+        private int _reported;
+
+        public string Stage => _stage;
+
+        public bool IsStale
+            => Stopwatch.GetTimestamp() - Interlocked.Read(ref _changedTicks)
+               > Stopwatch.Frequency * MergeStuckMs / 1000;
+
+        public bool TryClaimReport() => Interlocked.Exchange(ref _reported, 1) == 0;
+
+        public void Set(string stage)
+        {
+            _stage = stage;
+            Interlocked.Exchange(ref _changedTicks, Stopwatch.GetTimestamp());
+            ExplorerWatcher.NoteMergeProgress();
+        }
+    }
+
+    /// <summary>
+    /// The last moment any merge moved on. Waiting its turn behind other
+    /// merges is normal and can take seconds when several folders are opened
+    /// one after another, so a merge is only ever treated as stuck when
+    /// nothing at all has moved - which is what a call into Explorer that
+    /// never comes back looks like.
+    /// </summary>
+    private static long _lastMergeProgressTicks = Stopwatch.GetTimestamp();
+
+    private static void NoteMergeProgress() => Interlocked.Exchange(ref _lastMergeProgressTicks, Stopwatch.GetTimestamp());
+
+    private static bool NothingMovedFor(int ms)
+        => Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastMergeProgressTicks)
+           > Stopwatch.Frequency * ms / 1000;
     private readonly Dictionary<nint, long> _firstSeenTicks = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
     private readonly StaTaskScheduler _staTaskScheduler;
@@ -278,7 +339,11 @@ public sealed class ExplorerWatcher : IDisposable
         if (_disposed || _pollTimer == null) return;
 
         var fast = Stopwatch.GetTimestamp() < _fastPollUntilTicks;
-        var interval = fast ? FastPollMs : IdlePollMs;
+        // A window Explorer is holding back can be given a folder at any
+        // moment, and it comes on screen as soon as that happens. Those windows
+        // are checked more often than the idle rate, so the folder is turned
+        // into a tab before the user has time to see the window at all.
+        var interval = fast ? FastPollMs : _spareWindows.Count > 0 ? SparePollMs : IdlePollMs;
         try
         {
             _pollTimer.Change(interval, interval);
@@ -306,6 +371,19 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 var titleNow = WinApi.GetWindowTitle(spare.Key);
                 if (string.Equals(titleNow, spare.Value, StringComparison.Ordinal)) continue;
+
+                // Explorer's own Home page is not a folder, so a window that
+                // moved from one Home title to another ("Home and 2 more
+                // tabs") has not been given anything to merge. Only the title
+                // remembered for it is updated: without this, a window the user
+                // is working in was taken for a folder window and left as its
+                // own window, which is noise in the log and a wasted move.
+                if (IsHomeTitle(titleNow))
+                {
+                    _spareWindows[spare.Key] = titleNow;
+                    continue;
+                }
+
                 _spareWindows.Remove(spare.Key);
                 _knownTopLevelWindows.Remove(spare.Key);
                 Log.Info($"Window 0x{spare.Key:X} now shows '{titleNow}'; merging it as a new window.");
@@ -473,8 +551,16 @@ public sealed class ExplorerWatcher : IDisposable
             if (!HasVisibleExplorerWindow(hwnd))
             {
                 // Nothing to merge into: hand the window back instead of
-                // hiding it and having to put it back a moment later.
+                // hiding it and having to put it back a moment later. It holds
+                // the folder that was just opened, so it has to end up on
+                // screen: a window Explorer had been keeping off screen used to
+                // be left off screen here, and the folder simply never appeared.
                 Helper.ShowWindow(hwnd, removeCache: true);
+                if (WinApi.IsWindow(hwnd) && !WinApi.IsWindowVisible(hwnd))
+                {
+                    WinApi.ShowWindow(hwnd, WinApi.SW_SHOWNOACTIVATE);
+                    Log.Info($"Window 0x{hwnd:X} was put on screen; there was nothing to merge it into.");
+                }
                 Log.Warn($"Window 0x{hwnd:X} left as its own window: no other File Explorer window is on screen to merge it into.");
                 return true;
             }
@@ -732,11 +818,20 @@ public sealed class ExplorerWatcher : IDisposable
         // A window this app is already hiding must be hidden again the moment
         // Explorer shows it (see HideWindow): otherwise it stays visible until
         // the merge finishes and reads as a flash of the new window.
+        //
+        // The hide itself is handed to a background thread. Hiding a window
+        // waits for Explorer's own thread to service the request, and when
+        // several folders are opened at once that thread is busy: the wait then
+        // holds this message loop, which is the loop that has to hand the next
+        // window its hide request. Waiting here is what let the following
+        // windows sit on screen for up to a second. The window is already on
+        // screen at this point, so hiding it a moment later changes nothing for
+        // this one.
         if (Helper.IsHidden(hWnd))
         {
             if (WinApi.IsWindowVisible(hWnd))
             {
-                Helper.HideWindow(hWnd);
+                Helper.HideWindowInBackground(hWnd);
                 Log.Info($"Window 0x{hWnd:X} was shown again by Explorer; hidden again.");
             }
             return;
@@ -753,7 +848,23 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 if (!_spareWindows.TryGetValue(hWnd, out var spareTitle)) return;
                 var titleNow = WinApi.GetWindowTitle(hWnd);
-                if (string.Equals(titleNow, spareTitle, StringComparison.Ordinal)) return;
+                if (string.Equals(titleNow, spareTitle, StringComparison.Ordinal))
+                {
+                    // Explorer did not put a folder in it yet: the title it gets
+                    // with the folder is what this window is waiting for, so
+                    // look again quickly instead of at the idle rate. Waiting
+                    // here is what let such a window sit on screen before it
+                    // was taken over.
+                    RequestFastPoll();
+                    return;
+                }
+
+                if (IsHomeTitle(titleNow))
+                {
+                    // Still Explorer's Home page: nothing here to merge.
+                    _spareWindows[hWnd] = titleNow;
+                    return;
+                }
                 _spareWindows.Remove(hWnd);
                 _knownTopLevelWindows.Remove(hWnd);
                 Log.Info($"Window 0x{hWnd:X} now shows '{titleNow}'; merging it as a new window.");
@@ -813,6 +924,14 @@ public sealed class ExplorerWatcher : IDisposable
         // window back, so it is put back here.
         _ = Task.Delay(2_000).ContinueWith(_ => Helper.UnparkIfUntouched(hWnd), TaskScheduler.Default);
     }
+
+    /// <summary>
+    /// True for the title Explorer gives a window that shows its Home page
+    /// ("Home - File Explorer", "Home and 2 more tabs - File Explorer"). Such a
+    /// window is not showing a folder, so it is never merged.
+    /// </summary>
+    private static bool IsHomeTitle(string title)
+        => title.StartsWith("Home", StringComparison.OrdinalIgnoreCase);
 
     private static bool HasVisibleExplorerWindow(nint except)
     {
@@ -880,6 +999,8 @@ public sealed class ExplorerWatcher : IDisposable
         MarkActivity();
         long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0;
         var converted = false;
+        var step = new MergeStep();
+        var stopWatchdog = WatchForStuckMerge(sourceHwnd, step);
         try
         {
             var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
@@ -893,6 +1014,7 @@ public sealed class ExplorerWatcher : IDisposable
 
             // Fast path: the folder is already open as a tab, so just select
             // that tab instead of creating a new one.
+            step.Set("looking for a tab that already shows this folder");
             var existingTab = SearchForTab(target);
             searchMs = sw.ElapsedMilliseconds;
             if (!forceNew && existingTab != 0)
@@ -928,6 +1050,7 @@ public sealed class ExplorerWatcher : IDisposable
             // Serialize only the tab-creation step; the item wait and the
             // navigation can overlap between conversions so opening several
             // folders in a row does not queue behind the first one.
+            step.Set("asking Explorer for a new tab");
             var (targetWindow, newTabHandle) = await CreateNewTabAsync(preferredWindow);
             createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
@@ -939,6 +1062,7 @@ public sealed class ExplorerWatcher : IDisposable
             // Give slow Explorer extra time to register the new tab's Shell
             // item before giving up, so a half-created tab is not left at the
             // default location.
+            step.Set("waiting for the new tab to register");
             var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
             itemMs = sw.ElapsedMilliseconds;
             if (tabItem == null)
@@ -959,6 +1083,7 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 try
                 {
+                    step.Set("sending the new tab to the folder");
                     await Navigate(tabItem, target);
                 }
                 catch (Exception ex)
@@ -985,8 +1110,10 @@ public sealed class ExplorerWatcher : IDisposable
                 // navigation was handed over (measured 300-650 ms). Switching
                 // during that window is what looks like the tab jumping from
                 // Home to the folder.
+                step.Set("waiting for the folder to draw");
                 await WaitForTabLoadedAsync(newTabHandle, defaultTitle, TabLoadWaitMs);
 
+                step.Set("showing the new tab");
                 await BringNewTabToFrontAsync(targetWindow, newTabHandle);
                 WinApi.TryActivate(targetWindow);
                 converted = true;
@@ -1002,6 +1129,7 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (converted)
             {
+                step.Set("closing the window that was replaced");
                 try
                 {
                     ((dynamic)item).Quit();
@@ -1025,12 +1153,64 @@ public sealed class ExplorerWatcher : IDisposable
 
             lock (_itemsLock)
                 _pendingConversions.Remove(sourceHwnd);
+
+            // Stopped last: a call that hangs while the replaced window is
+            // closed is one of the ways a merge used to go quiet for good.
+            stopWatchdog();
         }
 
         Log.Info(
             $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
             $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, " +
             $"navigate {navMs}ms, converted={converted}).");
+    }
+
+    /// <summary>
+    /// Watches one merge and hands the window back to the user if the merge
+    /// stops moving. Every step of a merge is a call into Explorer, and a call
+    /// that never comes back would otherwise leave the folder opened with
+    /// neither a window nor a tab to show for it.
+    /// </summary>
+    private Action WatchForStuckMerge(nint hwnd, MergeStep step)
+    {
+        var cts = new CancellationTokenSource();
+        _ = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(500, cts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                // The order matters: the report is claimed once, so nothing may
+                // claim it before every reason to stay quiet has been ruled out.
+                if (!step.IsStale) continue;
+                if (!NothingMovedFor(MergeStuckMs)) continue;
+                if (!step.TryClaimReport()) continue;
+
+                // Everything is standing still: this is not a merge waiting for
+                // its turn any more, it is a call into Explorer that never came
+                // back. Waiting its turn keeps the window hidden (the folder
+                // shows up in the end), so that wait is never cut short.
+
+                Log.Warn($"Merge of 0x{hwnd:X} has been waiting in '{step.Stage}' for over {MergeStuckMs} ms; handing the window back.");
+                if (Helper.ShowWindow(hwnd, removeCache: true))
+                    Log.Info($"Window 0x{hwnd:X} is on screen again so the folder is not lost.");
+                else if (WinApi.IsWindow(hwnd) && !WinApi.IsWindowVisible(hwnd))
+                    WinApi.ShowWindow(hwnd, WinApi.SW_SHOWNOACTIVATE);
+
+                lock (_itemsLock)
+                    _pendingConversions.Remove(hwnd);
+                return;
+            }
+        });
+
+        return () => cts.Cancel();
     }
 
     /// <summary>
@@ -1043,7 +1223,9 @@ public sealed class ExplorerWatcher : IDisposable
 
     private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync(nint preferredWindow = 0)
     {
-        await _toOpenWindowsLock.WaitAsync();
+        if (!await WaitForTabStepAsync().ConfigureAwait(false))
+            return (0, 0);
+
         try
         {
             var mainWindowHWnd = preferredWindow != 0 && WinApi.IsWindowVisible(preferredWindow) ? preferredWindow : GetMainWindowHWnd(0);
@@ -1107,6 +1289,40 @@ public sealed class ExplorerWatcher : IDisposable
     }
 
     /// <summary>
+    /// Takes the turn at the tab creation step, which only ever runs one merge
+    /// at a time because Explorer creates the tab in one window and the folder
+    /// has to be handed to the tab that this merge asked for.
+    ///
+    /// A merge used to give up after a fixed five seconds, which left the
+    /// folder as a window of its own whenever several folders were opened in
+    /// quick succession - the wait was long because the queue was long, not
+    /// because anything was wrong. The wait now only ends when nothing at all
+    /// has moved for the stuck threshold, i.e. when a call into Explorer has
+    /// stopped coming back, with a generous cap as a last resort.
+    /// </summary>
+    private async Task<bool> WaitForTabStepAsync()
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (true)
+        {
+            if (await _toOpenWindowsLock.WaitAsync(2_000).ConfigureAwait(false)) return true;
+
+            if (NothingMovedFor(MergeStuckMs))
+            {
+                Log.Warn($"Nothing has moved for over {MergeStuckMs} ms while waiting for the tab step; this folder is left as its own window.");
+                return false;
+            }
+
+            if (Helper.IsTimeUp(startTicks, TabCreationGiveUpMs))
+            {
+                Log.Warn($"Waited over {TabCreationGiveUpMs} ms for the tab step; this folder is left as its own window.");
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
     /// Waits for a new Explorer tab in the given window. The WinEvent hook
     /// reports the tab the moment its window appears (event-driven, low CPU);
     /// a slow polling fallback keeps it robust if the hook does not fire for a
@@ -1133,8 +1349,13 @@ public sealed class ExplorerWatcher : IDisposable
             var result = await winner;
             if (result != 0) return result;
 
-            // Both timed out; take whichever is still non-zero.
-            return await (winner == eventTask ? pollTask : eventTask);
+            // One side may still be waiting, and the event side has no timeout
+            // of its own: awaiting it here used to leave a merge (and the
+            // window it had taken over) waiting forever when Explorer never
+            // created the tab at all. Only a result that is already there is
+            // taken.
+            var other = winner == eventTask ? pollTask : eventTask;
+            return other.IsCompleted ? await other : 0;
         }
         finally
         {
@@ -1455,7 +1676,11 @@ public sealed class ExplorerWatcher : IDisposable
                 if (item != null) return item;
             }
 
-            await Task.Delay(5);
+            // Each of these looks is a call into the shell, and every merge
+            // takes its turn on one thread: asking every 5 ms is churn the tab
+            // does not need, since it takes a few hundred milliseconds to
+            // register either way.
+            await Task.Delay(20);
         }
 
         return null;
