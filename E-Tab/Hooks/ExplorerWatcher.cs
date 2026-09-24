@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -42,6 +43,24 @@ public sealed class ExplorerWatcher : IDisposable
     /// </summary>
     private const int TabCreationGiveUpMs = 30_000;
     /// <summary>
+    /// How often the shell is asked whether the new tab has registered yet. The
+    /// look is a handful of calls on one thread, so it can be much more often
+    /// than the old "when the count changes, or every quarter second" - which
+    /// is what made a folder wait for an entry that had been there for a while.
+    /// </summary>
+    private const int ItemLookMs = 40;
+    /// <summary>
+    /// The same, while several merges are running at once. They all take their
+    /// turn on one thread and on one shell, so looking this often for each of
+    /// them would crowd out the very work they are all waiting for.
+    /// </summary>
+    private const int ItemLookBusyMs = 150;
+    /// <summary>
+    /// A full pass over every open tab, in case the new entry did not land at
+    /// the end of the list. Rare on purpose: it is the expensive one.
+    /// </summary>
+    private const int ItemFullLookMs = 500;
+    /// <summary>
     /// A merge that has not moved from its current step for this long is handed
     /// back even if other merges are still getting through. Without this, one
     /// merge could wait quietly forever while the others worked, and the folder
@@ -50,6 +69,12 @@ public sealed class ExplorerWatcher : IDisposable
     /// this limit is short; the tab queue is what TabCreationGiveUpMs is for.
     /// </summary>
     private const int MergeHardStuckMs = 12_000;
+    /// <summary>
+    /// However long a merge takes, this is the end of it: the window is put
+    /// back on screen and the log says which step it was in. Nothing may stay
+    /// quiet for longer than this - that used to be a folder nobody could see.
+    /// </summary>
+    private const int MergeDeadlineMs = 30_000;
     /// <summary>
     /// The step a merge sits in while it waits its turn at the tab creation
     /// step, where a wait is normal and only the queue moving matters.
@@ -79,14 +104,33 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly HashSet<nint> _pendingConversions = new();
 
     /// <summary>
+    /// The merges that are running, with the step each of them is on. Kept for
+    /// the watchdog below.
+    /// </summary>
+    private readonly List<(nint Hwnd, MergeStep Step)> _runningMerges = new();
+    private Thread? _mergeWatchdogThread;
+
+    /// <summary>
     /// Where a merge is right now, so a merge that gets stuck can name the step
     /// it is waiting in instead of ending up as silence in the log.
     /// </summary>
     private sealed class MergeStep
     {
+        private readonly long _startedTicks = Stopwatch.GetTimestamp();
         private long _changedTicks = Stopwatch.GetTimestamp();
         private string _stage = "starting";
         private int _reported;
+        private int _abandoned;
+
+        /// <summary>True once this merge has been handed back to the user.</summary>
+        public bool Abandoned => Volatile.Read(ref _abandoned) == 1;
+
+        public void MarkAbandoned() => Interlocked.Exchange(ref _abandoned, 1);
+
+        /// <summary>True when this merge has been running for longer than that.</summary>
+        public bool OlderThan(int ms)
+            => Stopwatch.GetTimestamp() - _startedTicks > Stopwatch.Frequency * ms / 1000;
+
 
         public string Stage => _stage;
 
@@ -125,6 +169,18 @@ public sealed class ExplorerWatcher : IDisposable
     private readonly StaTaskScheduler _conversionStaTaskScheduler;
 
     private object? _shellApp;
+    /// <summary>
+    /// The shell object the merge thread owns itself.
+    ///
+    /// A shell object created on one thread can only be used from another
+    /// through that thread's message queue, so a merge that reached for the
+    /// object this app's poll owns had to wait for the poll to be free - which
+    /// it often was not, because a poll pass is a full walk of every open tab.
+    /// That wait is what the merge paid on every look for the new tab, tens of
+    /// times per folder. This object belongs to the merge thread, so its calls
+    /// are answered on the spot.
+    /// </summary>
+    private object? _conversionShellApp;
     private ShellPathComparer? _shellPathComparer;
     private string _defaultLocation = string.Empty;
     private nint _mainWindowHandle;
@@ -515,7 +571,6 @@ public sealed class ExplorerWatcher : IDisposable
                     var tabHandle = GetTabHandle(item);
                     if (tabHandle == 0) continue;
                     currentTabHandles.Add(tabHandle);
-                    _tabToItem[tabHandle] = item;
 
                     if (_tabInfos.TryGetValue(tabHandle, out var info))
                     {
@@ -524,16 +579,19 @@ public sealed class ExplorerWatcher : IDisposable
                         continue;
                     }
 
-                    var newInfo = new WindowInfo
+                    // The folder this tab shows is read here rather than left
+                    // for a merge to look up later. This pass owns the shell
+                    // items it just enumerated, so the read is a local call; a
+                    // merge runs on another thread, and reading these items from
+                    // there would have to go through this thread's queue - which
+                    // is busy exactly when many folders are opened at once, the
+                    // moment a merge needs the answer most.
+                    _tabInfos[tabHandle] = new WindowInfo
                     {
                         WindowHandle = hwnd,
                         TabHandle = tabHandle,
-                        Location = _tabInfos.Count == 0 && WinApi.IsWindowVisible(hwnd) &&
-                                   WinApi.IsWindowHasClassName(hwnd, "CabinetWClass")
-                            ? TryGetLocation(item)
-                            : null
+                        Location = TryGetLocation(item)
                     };
-                    _tabInfos[tabHandle] = newInfo;
                 }
 
                 foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
@@ -984,10 +1042,13 @@ public sealed class ExplorerWatcher : IDisposable
         foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
         {
             if (hWnd == except) continue;
-            // A window this app has already moved out of the way is not a place
-            // the user can see, so it does not count as somewhere to merge into.
-            if (Helper.IsParkedOffScreen(hWnd)) continue;
-            if (WinApi.IsWindowVisible(hWnd)) return true;
+            if (!WinApi.IsWindowVisible(hWnd)) continue;
+            // A window this app has moved out of the way is not a place the
+            // user can see - but only while it really is off screen. The record
+            // can be stale, and a window that is on screen is somewhere to
+            // merge into no matter what this app remembers about it.
+            if (Helper.IsParkedOffScreen(hWnd) && Helper.IsOffScreen(hWnd)) continue;
+            return true;
         }
 
         return false;
@@ -1091,7 +1152,7 @@ public sealed class ExplorerWatcher : IDisposable
     {
         var sw = Stopwatch.StartNew();
         MarkActivity();
-        long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0;
+        long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0, drawMs = 0, showMs = 0, closeMs = 0;
         var converted = false;
         var step = new MergeStep();
         var stopWatchdog = WatchForStuckMerge(sourceHwnd, step);
@@ -1145,7 +1206,7 @@ public sealed class ExplorerWatcher : IDisposable
             // navigation can overlap between conversions so opening several
             // folders in a row does not queue behind the first one.
             step.Set(TabStepStage);
-            var (targetWindow, newTabHandle) = await CreateNewTabAsync(preferredWindow);
+            var (targetWindow, newTabHandle, firstNewIndex) = await CreateNewTabAsync(preferredWindow);
             createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
             {
@@ -1157,7 +1218,7 @@ public sealed class ExplorerWatcher : IDisposable
             // item before giving up, so a half-created tab is not left at the
             // default location.
             step.Set("waiting for the new tab to register");
-            var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000);
+            var tabItem = await WaitForTabItemAsync(newTabHandle, 4_000, firstNewIndex);
             itemMs = sw.ElapsedMilliseconds;
             if (tabItem == null)
             {
@@ -1193,6 +1254,7 @@ public sealed class ExplorerWatcher : IDisposable
             }
             SelectItems(tabItem, TryGetSelectedItems(item));
             navMs = sw.ElapsedMilliseconds;
+            RememberTabLocation(newTabHandle, target);
 
             // If the target window disappeared mid-conversion, restore the
             // source window instead of pretending the tab exists.
@@ -1205,12 +1267,33 @@ public sealed class ExplorerWatcher : IDisposable
                 // during that window is what looks like the tab jumping from
                 // Home to the folder.
                 step.Set("waiting for the folder to draw");
+                var drawStart = sw.ElapsedMilliseconds;
                 await WaitForTabLoadedAsync(newTabHandle, defaultTitle, TabLoadWaitMs);
+                drawMs = sw.ElapsedMilliseconds - drawStart;
 
                 step.Set("showing the new tab");
+                var showStart = sw.ElapsedMilliseconds;
                 await BringNewTabToFrontAsync(targetWindow, newTabHandle);
                 WinApi.TryActivate(targetWindow);
-                converted = true;
+                showMs = sw.ElapsedMilliseconds - showStart;
+
+                // The window that was replaced is only closed once the folder
+                // is really in the new tab. Closing it on the strength of the
+                // tab existing is what could leave the user with neither: a tab
+                // still on Explorer's own page, and the folder gone with the
+                // window. When that cannot be confirmed the window stays, so the
+                // folder is always somewhere the user can see.
+                if (TabShowsFolder(newTabHandle, tabItem, target, defaultTitle))
+                {
+                    converted = true;
+                }
+                else
+                {
+                    Log.Warn(
+                        $"Tab 0x{newTabHandle:X} does not show '{target}' yet " +
+                        $"(its title is '{WinApi.GetWindowTitle(newTabHandle)}'); " +
+                        $"the window that was replaced is kept so the folder is not lost.");
+                }
             }
         }
         catch (Exception ex)
@@ -1224,6 +1307,7 @@ public sealed class ExplorerWatcher : IDisposable
             if (converted)
             {
                 step.Set("closing the window that was replaced");
+                var closeStart = sw.ElapsedMilliseconds;
                 try
                 {
                     ((dynamic)item).Quit();
@@ -1232,6 +1316,7 @@ public sealed class ExplorerWatcher : IDisposable
                 {
                     // The window may already be gone.
                 }
+                closeMs = sw.ElapsedMilliseconds - closeStart;
 
                 RemoveItem(item);
                 Helper.HiddenWindows.TryRemove(sourceHwnd, out _);
@@ -1256,7 +1341,8 @@ public sealed class ExplorerWatcher : IDisposable
         Log.Info(
             $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
             $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, " +
-            $"navigate {navMs}ms, converted={converted}).");
+            $"navigate {navMs}ms, draw {drawMs}ms, show {showMs}ms, close {closeMs}ms, " +
+            $"converted={converted}).");
     }
 
     /// <summary>
@@ -1267,39 +1353,77 @@ public sealed class ExplorerWatcher : IDisposable
     /// </summary>
     private Action WatchForStuckMerge(nint hwnd, MergeStep step)
     {
-        var cts = new CancellationTokenSource();
-        _ = Task.Run(async () =>
-        {
-            while (!cts.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(500, cts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
+        EnsureMergeWatchdog();
 
-                // The order matters: the report is claimed once, so nothing may
-                // claim it before every reason to stay quiet has been ruled out.
-                if (!step.StaleFor(MergeStuckMs)) continue;
+        lock (_runningMerges)
+            _runningMerges.Add((hwnd, step));
+
+        return () =>
+        {
+            lock (_runningMerges)
+                _runningMerges.RemoveAll(m => m.Hwnd == hwnd);
+        };
+    }
+
+    /// <summary>
+    /// One thread whose only job is to make sure no merge ends in silence.
+    ///
+    /// This used to be a task per merge, which turned out to be exactly what a
+    /// merge cannot rely on: opening several folders at once fills the thread
+    /// pool with waiting continuations, and the tasks that were supposed to
+    /// report a merge that never finished were waiting for their turn along
+    /// with everything else. A thread of its own is never in that queue.
+    /// </summary>
+
+    private void EnsureMergeWatchdog()
+    {
+        if (_mergeWatchdogThread != null) return;
+
+        _mergeWatchdogThread = new Thread(MergeWatchdogLoop)
+        {
+            IsBackground = true,
+            Name = "E-Tab merge watchdog"
+        };
+        _mergeWatchdogThread.Start();
+    }
+
+    private void MergeWatchdogLoop()
+    {
+        while (!_disposed)
+        {
+            Thread.Sleep(500);
+
+            List<(nint Hwnd, MergeStep Step)> snapshot;
+            lock (_runningMerges)
+                snapshot = _runningMerges.ToList();
+
+
+
+            foreach (var (hwnd, step) in snapshot)
+            {
+                if (step.Abandoned) continue;
 
                 // Waiting its turn behind other merges is normal and can take
                 // seconds, so that on its own is not being stuck. It is being
                 // stuck when nothing at all is moving any more - which is what a
                 // call into Explorer that never comes back looks like - or when
                 // this one merge has been sitting on the same step for far
-                // longer than any queue of merges could explain.
-                var nothingMoving = NothingMovedFor(MergeStuckMs);
-                var hardLimit = step.Stage == TabStepStage ? TabCreationGiveUpMs : MergeHardStuckMs;
-                var farTooLong = step.StaleFor(hardLimit);
-                if (!nothingMoving && !farTooLong) continue;
+                // longer than any queue of merges could explain, or when it has
+                // simply taken too long.
+                var overdue = step.OlderThan(MergeDeadlineMs);
+                if (!overdue)
+                {
+                    if (!step.StaleFor(MergeStuckMs)) continue;
+
+                    var hardLimit = step.Stage == TabStepStage ? TabCreationGiveUpMs : MergeHardStuckMs;
+                    if (!NothingMovedFor(MergeStuckMs) && !step.StaleFor(hardLimit)) continue;
+                }
                 if (!step.TryClaimReport()) continue;
 
+                step.MarkAbandoned();
                 Log.Warn(
-                    $"Merge of 0x{hwnd:X} has not moved from '{step.Stage}' for over " +
-                    $"{(farTooLong ? MergeHardStuckMs : MergeStuckMs)} ms; handing the window back. " +
+                    $"Merge of 0x{hwnd:X} is being handed back without finishing " +
+                    $"(last step: '{step.Stage}'); the folder is put on screen. " +
                     $"Windows found: {DescribeExplorerWindows(hwnd)}.");
                 if (Helper.ShowWindow(hwnd, removeCache: true))
                     Log.Info($"Window 0x{hwnd:X} is on screen again so the folder is not lost.");
@@ -1308,11 +1432,8 @@ public sealed class ExplorerWatcher : IDisposable
 
                 lock (_itemsLock)
                     _pendingConversions.Remove(hwnd);
-                return;
             }
-        });
-
-        return () => cts.Cancel();
+        }
     }
 
     /// <summary>
@@ -1323,10 +1444,10 @@ public sealed class ExplorerWatcher : IDisposable
     /// </summary>
     private static readonly int[] SwitchBackDelaysMs = { 20, 60 };
 
-    private async Task<(nint WindowHandle, nint TabHandle)> CreateNewTabAsync(nint preferredWindow = 0)
+    private async Task<(nint WindowHandle, nint TabHandle, int FirstNewIndex)> CreateNewTabAsync(nint preferredWindow = 0)
     {
         if (!await WaitForTabStepAsync().ConfigureAwait(false))
-            return (0, 0);
+            return (0, 0, 0);
 
         try
         {
@@ -1338,7 +1459,7 @@ public sealed class ExplorerWatcher : IDisposable
                 // one, so a window does not "reappear" right after the user
                 // closes File Explorer.
                 Log.Warn("No File Explorer window is on screen to merge into; the new folder is left as its own window.");
-                return (0, 0);
+                return (0, 0, 0);
             }
 
             var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
@@ -1353,6 +1474,10 @@ public sealed class ExplorerWatcher : IDisposable
                 ? await RunConversionInStaThread(() => FindTabStripIndex(mainWindowHWnd, activeTab))
                 : -1;
 
+            // The entries that appear after this point are the ones the new
+            // tab can be, which is what the item wait starts from.
+            var shellWindowsBefore = await RunConversionInStaThread(GetShellWindowCount);
+
             await RequestToOpenNewTab(mainWindowHWnd);
 
             if (backIndex >= 0)
@@ -1366,7 +1491,14 @@ public sealed class ExplorerWatcher : IDisposable
                 foreach (var delayMs in SwitchBackDelaysMs)
                 {
                     await Task.Delay(delayMs);
-                    if (!WinApi.IsWindow(mainWindowHWnd)) return (0, 0);
+                    if (!WinApi.IsWindow(mainWindowHWnd)) return (0, 0, 0);
+
+                    // Already back on the tab the user was looking at: there is
+                    // nothing left to post, and waiting out the rest of these
+                    // delays would only make the folder later.
+                    var tabsNow = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
+                    if (tabsNow.Length > 0 && tabsNow[0] == activeTab) break;
+
                     PostSelectTabByIndex(mainWindowHWnd, backIndex);
                 }
             }
@@ -1382,7 +1514,7 @@ public sealed class ExplorerWatcher : IDisposable
                 newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_500);
             }
 
-            return (mainWindowHWnd, newTabHandle);
+            return (mainWindowHWnd, newTabHandle, shellWindowsBefore);
         }
         finally
         {
@@ -1568,6 +1700,33 @@ public sealed class ExplorerWatcher : IDisposable
     }
 
     /// <summary>
+    /// True when a tab is showing the folder it was sent to: either its title
+    /// has moved off Explorer's own page, or the shell says it is at the folder.
+    /// </summary>
+    private static bool TabShowsFolder(nint tabHandle, object tabItem, string target, string defaultTitle)
+    {
+        var title = WinApi.GetWindowTitle(tabHandle);
+        if (!string.IsNullOrWhiteSpace(title)
+            && !string.Equals(title, defaultTitle, StringComparison.Ordinal))
+            return true;
+
+        return string.Equals(TryGetLocation(tabItem), target, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Records which folder a tab shows, so looking for a tab that already
+    /// shows a folder stays a lookup in this app's own bookkeeping.
+    /// </summary>
+    private void RememberTabLocation(nint tabHandle, string location)
+    {
+        lock (_itemsLock)
+        {
+            if (_tabInfos.TryGetValue(tabHandle, out var info))
+                info.Location = location;
+        }
+    }
+
+    /// <summary>
     /// The folder every open tab shows, taken in two steps: the handles and the
     /// folders this app already knows under the lock, and the ones that still
     /// have to be read from the shell without it.
@@ -1749,9 +1908,28 @@ public sealed class ExplorerWatcher : IDisposable
     /// snapshot. This is used while waiting for a newly created tab so the wait
     /// is both faster and cheaper than a complete PollShellCore pass.
     /// </summary>
+    /// <summary>
+    /// The shell object for the thread a merge runs on, created the first time
+    /// that thread asks for one. Only ever touched from that thread.
+    /// </summary>
+    private object? ConversionShell()
+    {
+        if (_conversionShellApp != null) return _conversionShellApp;
+        try
+        {
+            _conversionShellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"The merge thread could not open the shell: {ex.Message}");
+        }
+        return _conversionShellApp;
+    }
+
     private object? FindShellItemForTab(nint tabHandle, int startIndex = 0)
     {
-        if (_shellApp == null) return null;
+        var shell = ConversionShell();
+        if (shell == null) return null;
 
         // Cheap pre-filter: only ShellWindows items hosted in the same
         // Explorer window can be this tab's item. Comparing the item HWND
@@ -1764,7 +1942,7 @@ public sealed class ExplorerWatcher : IDisposable
         object? found = null;
         try
         {
-            dynamic windows = ((dynamic)_shellApp).Windows();
+            dynamic windows = ((dynamic)shell).Windows();
             var count = (int)windows.Count;
             // Items are added in creation order, so a tab that has just been
             // created can only be one of the entries added since the last look.
@@ -1812,7 +1990,7 @@ public sealed class ExplorerWatcher : IDisposable
     /// still busy starting this tab. The wait is kept as short as it can be
     /// because the tab spends it sitting on Explorer's default "Home" page.
     /// </summary>
-    private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs)
+    private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs, int firstNewIndex = 0)
     {
         var startTicks = Stopwatch.GetTimestamp();
         var lastCount = -1;
@@ -1821,20 +1999,25 @@ public sealed class ExplorerWatcher : IDisposable
         while (!Helper.IsTimeUp(startTicks, timeMs))
         {
             var count = await RunConversionInStaThread(GetShellWindowCount);
-            if (count > 0 && (count != lastCount || Helper.IsTimeUp(lastScanTicks, 250)))
+            var lookMs = PendingConversionCount() > 2 ? ItemLookBusyMs : ItemLookMs;
+            if (count > 0 && (count != lastCount || Helper.IsTimeUp(lastScanTicks, lookMs)))
             {
-                // A new entry is not necessarily appended to the list, so every
-                // look is a full pass that stops at the first match.
+                // The entries this tab could be are the ones that appeared with
+                // it, so a look normally starts there instead of walking every
+                // open tab; a full pass every so often still covers an entry
+                // that landed somewhere else in the list. The look is cheap
+                // enough to repeat often, and repeating it is what decides how
+                // long the folder waits: Explorer registers the tab somewhere
+                // in these few hundred milliseconds, and until this app looks at
+                // the moment it did, the folder sits there.
+                var full = Helper.IsTimeUp(lastScanTicks, ItemFullLookMs);
+                var from = full ? 0 : Math.Max(firstNewIndex, 0);
                 lastCount = count;
                 lastScanTicks = Stopwatch.GetTimestamp();
-                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, 0));
+                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, from));
                 if (item != null) return item;
             }
 
-            // Each of these looks is a call into the shell, and every merge
-            // takes its turn on one thread: asking every 5 ms is churn the tab
-            // does not need, since it takes a few hundred milliseconds to
-            // register either way.
             await Task.Delay(20);
         }
 
@@ -1845,13 +2028,20 @@ public sealed class ExplorerWatcher : IDisposable
     /// How many entries ShellWindows exposes right now: a single COM call, used
     /// as a cheap "did anything register since the last look" signal.
     /// </summary>
+    private int PendingConversionCount()
+    {
+        lock (_itemsLock)
+            return _pendingConversions.Count;
+    }
+
     private int GetShellWindowCount()
     {
-        if (_shellApp == null) return -1;
+        var shell = ConversionShell();
+        if (shell == null) return -1;
 
         try
         {
-            return (int)((dynamic)_shellApp).Windows().Count;
+            return (int)((dynamic)shell).Windows().Count;
         }
         catch
         {
@@ -1908,7 +2098,7 @@ public sealed class ExplorerWatcher : IDisposable
     /// page a moment later, so a title change inside this window would be that
     /// first step rather than the folder being ready.
     /// </summary>
-    private const int TabTitleTrustMs = 300;
+    private const int TabTitleTrustMs = 100;
 
     /// <summary>
     /// Waits until a tab shows the folder it was sent to instead of the default
@@ -1940,12 +2130,13 @@ public sealed class ExplorerWatcher : IDisposable
     }
     private int FindTabStripIndex(nint windowHandle, nint tabHandle)
     {
-        if (_shellApp == null) return -1;
+        var shell = ConversionShell();
+        if (shell == null) return -1;
 
         var index = 0;
         try
         {
-            dynamic windows = ((dynamic)_shellApp).Windows();
+            dynamic windows = ((dynamic)shell).Windows();
             var count = (int)windows.Count;
             for (var i = 0; i < count; i++)
             {
@@ -2262,6 +2453,19 @@ public sealed class ExplorerWatcher : IDisposable
 
         _shellPathComparer?.Dispose();
         _shellPathComparer = null;
+
+        if (_conversionShellApp != null)
+        {
+            try
+            {
+                Marshal.FinalReleaseComObject(_conversionShellApp);
+            }
+            catch
+            {
+                // Nothing to do while shutting down.
+            }
+            _conversionShellApp = null;
+        }
 
         if (_shellApp != null)
         {

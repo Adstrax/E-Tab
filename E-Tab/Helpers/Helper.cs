@@ -330,6 +330,27 @@ public static class Helper
     public static bool IsTracked(nint hWnd) => HiddenWindows.ContainsKey(hWnd);
 
     /// <summary>
+    /// True when the window is sitting outside every screen - where this app
+    /// moves the windows it holds out of the way - rather than merely being
+    /// recorded as such. The record can outlive the move: Explorer may put a
+    /// window back, or this app may restore one without clearing it. A window
+    /// the user can actually see has to be treated as one, whatever this app
+    /// remembers, or a folder is told there is nothing to merge into.
+    /// </summary>
+    public static bool IsOffScreen(nint hWnd)
+    {
+        if (!WinApi.GetWindowRect(hWnd, out var rect)) return false;
+
+        var x = WinApi.GetSystemMetrics(WinApi.SM_XVIRTUALSCREEN);
+        var y = WinApi.GetSystemMetrics(WinApi.SM_YVIRTUALSCREEN);
+        var width = WinApi.GetSystemMetrics(WinApi.SM_CXVIRTUALSCREEN);
+        var height = WinApi.GetSystemMetrics(WinApi.SM_CYVIRTUALSCREEN);
+
+        return rect.Right <= x || rect.Left >= x + width
+            || rect.Bottom <= y || rect.Top >= y + height;
+    }
+
+    /// <summary>
     /// True when the window has actually been hidden, as opposed to only moved
     /// out of the way before Explorer revealed it.
     /// </summary>
