@@ -1969,22 +1969,38 @@ public sealed class ExplorerWatcher : IDisposable
         return path.Length >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
     }
 
+    /// <summary>
+    /// Brings one tab of a window to the front, by its handle.
+    ///
+    /// The windows of a tab strip are enumerated in the order they were last
+    /// activated, which is not the order they sit in the strip: the first one is
+    /// whichever tab is in front and the rest follow by age. Their position in
+    /// that list was being used as the number for the switch command, so a
+    /// window with several tabs was told to switch to a tab that had nothing to
+    /// do with the one asked for - which is why opening a folder that was
+    /// already open left the user on whichever tab was in front instead of the
+    /// one they had clicked. The position in the strip is read from the shell.
+    /// </summary>
     private async Task SelectTabByHandle(nint windowHandle, nint tabHandle)
     {
-        var tabs = Helper.GetAllExplorerTabs(windowHandle).ToArray();
-        if (tabs.Length == 0) return;
-
-        var activeTab = tabs[0];
-        for (var i = 0; i < tabs.Length; i++)
+        for (var attempt = 0; attempt < 3; attempt++)
         {
-            if (activeTab == tabHandle) break;
+            var activeTab = WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
+            if (activeTab == tabHandle) return;
 
-            SelectTabByIndex(windowHandle, i);
+            var index = await RunConversionInStaThread(() => FindTabStripIndex(windowHandle, tabHandle));
+            if (index < 0) return;
 
-            activeTab = await Helper.DoUntilNotDefaultAsync(
+            SelectTabByIndex(windowHandle, index);
+
+            await Helper.DoUntilNotDefaultAsync(
                 () => WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null),
                 h => h != activeTab);
         }
+
+        Log.Warn(
+            $"Could not bring tab 0x{tabHandle:X} of window 0x{windowHandle:X} to the front; " +
+            "the tab strip did not follow the switch command.");
     }
 
     private static void SelectTabByIndex(nint windowHandle, int index)
