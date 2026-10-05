@@ -101,6 +101,24 @@ public sealed class ExplorerWatcher : IDisposable
     /// </summary>
     private readonly Dictionary<nint, string> _spareWindows = new();
 
+    /// <summary>
+    /// When to stop waiting for a window that is on screen and still shows
+    /// nothing but Explorer's own page. A window like that is one this app
+    /// could merge the moment a folder lands in it, and on Windows 11 the folder
+    /// regularly arrives a moment after the window does - but a window left
+    /// like that for a long time is the user's own window, and it is left alone.
+    /// Windows Explorer is holding back have no deadline: those wait for the
+    /// next folder however long it takes.
+    /// </summary>
+    private readonly Dictionary<nint, long> _spareWatchUntilTicks = new();
+    private const int ScreenSpareWatchMs = 60_000;
+    /// <summary>
+    /// How long a folder waits for a window to merge into before it is left as
+    /// its own. Explorer regularly has that window off screen for a moment right
+    /// as a folder is opened, so this is waited out rather than given up on.
+    /// </summary>
+    private const int NoHostWaitMs = 5_000;
+
     private readonly HashSet<nint> _pendingConversions = new();
 
     /// <summary>
@@ -448,7 +466,22 @@ public sealed class ExplorerWatcher : IDisposable
         foreach (var (spareHwnd, spareTitle) in spareTitles)
         {
             var titleNow = WinApi.GetWindowTitle(spareHwnd);
-            if (string.Equals(titleNow, spareTitle, StringComparison.Ordinal)) continue;
+            if (string.Equals(titleNow, spareTitle, StringComparison.Ordinal))
+            {
+                // Still nothing but Explorer's own page. A window that has been
+                // sitting there like that is the user's own window: it is
+                // dropped from the watch list so the poll can go back to idle.
+                long until;
+                lock (_itemsLock)
+                {
+                    if (!_spareWatchUntilTicks.TryGetValue(spareHwnd, out until)) continue;
+                    if (Stopwatch.GetTimestamp() < until) continue;
+                    _spareWatchUntilTicks.Remove(spareHwnd);
+                    _spareWindows.Remove(spareHwnd);
+                    Log.Info($"Window 0x{spareHwnd:X} still shows '{titleNow}'; it is left alone as the user's own window.");
+                }
+                continue;
+            }
 
             // Explorer's own Home page is not a folder, so a window that moved
             // from one Home title to another ("Home and 2 more tabs") has not
@@ -470,6 +503,7 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 if (!_spareWindows.Remove(spareHwnd)) continue;
                 _knownTopLevelWindows.Remove(spareHwnd);
+                _spareWatchUntilTicks.Remove(spareHwnd);
             }
             Log.Info($"Window 0x{spareHwnd:X} now shows '{titleNow}'; merging it as a new window.");
         }
@@ -558,7 +592,10 @@ public sealed class ExplorerWatcher : IDisposable
             _knownTopLevelWindows.RemoveWhere(h => !currentTopLevel.Contains(h));
             _knownTopLevelWindows.UnionWith(recognizedWindows);
             foreach (var goneSpare in _spareWindows.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
+            {
                 _spareWindows.Remove(goneSpare);
+                _spareWatchUntilTicks.Remove(goneSpare);
+            }
 
             foreach (var staleSeen in _firstSeenTicks.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
                 _firstSeenTicks.Remove(staleSeen);
@@ -637,11 +674,29 @@ public sealed class ExplorerWatcher : IDisposable
         {
             if (!HasVisibleExplorerWindow(hwnd))
             {
-                // Nothing to merge into: hand the window back instead of
-                // hiding it and having to put it back a moment later. It holds
-                // the folder that was just opened, so it has to end up on
-                // screen: a window Explorer had been keeping off screen used to
-                // be left off screen here, and the folder simply never appeared.
+                // Nothing to merge into - yet. Explorer very often has the
+                // window this folder belongs in off screen at exactly this
+                // moment and puts it back a moment later, so the folder is not
+                // written off straight away: the poll looks again for a few
+                // seconds, and only then is the window left as its own. Giving
+                // up here immediately is what left a folder as a window of its
+                // own while the window it belonged in stood in front of it.
+                if (!_firstSeenTicks.TryGetValue(hwnd, out var waitingSince))
+                {
+                    _firstSeenTicks[hwnd] = Stopwatch.GetTimestamp();
+                    return false;
+                }
+
+                if (!Helper.IsTimeUp(waitingSince, NoHostWaitMs))
+                    return false;
+
+                _firstSeenTicks.Remove(hwnd);
+
+                // Hand the window back instead of hiding it and having to put it
+                // back a moment later. It holds the folder that was just opened,
+                // so it has to end up on screen: a window Explorer had been
+                // keeping off screen used to be left off screen here, and the
+                // folder simply never appeared.
                 Helper.ShowWindow(hwnd, removeCache: true);
                 if (WinApi.IsWindow(hwnd) && !WinApi.IsWindowVisible(hwnd))
                 {
@@ -729,15 +784,31 @@ public sealed class ExplorerWatcher : IDisposable
         var wasHidden = Helper.IsHidden(hwnd);
         var title = WinApi.GetWindowTitle(hwnd);
 
-        // Explorer is still holding a window that this app would be able to
-        // merge the moment it shows a folder: it is kept exactly as it is, out
-        // of the way, and remembered for the next folder the user opens.
-        // Putting it back on screen here instead is what made that folder
-        // appear as a window and disappear into a tab a moment later.
-        if (convertible && !WinApi.IsWindowVisible(hwnd))
+        // A window that has no folder in it yet - it shows Explorer's own page,
+        // or has not finished coming up - is one this app can merge the moment a
+        // folder lands in it, so it is remembered and looked at again rather
+        // than given up on. This is the normal shape of opening a folder on
+        // Windows 11: the window appears first and the folder follows a moment
+        // later. Writing such a window off here used to mean that folder never
+        // became a tab at all, and it stayed a window of its own for good.
+        //
+        // A window Explorer is holding back is watched until it is used, however
+        // long that takes; a window that is already on screen is watched for a
+        // while and then left alone - by then it is the user's own window, not a
+        // folder on its way in.
+        if (convertible && !wasHidden)
         {
+            var onScreen = WinApi.IsWindowVisible(hwnd);
             lock (_itemsLock)
+            {
                 _spareWindows[hwnd] = title;
+                if (onScreen)
+                    _spareWatchUntilTicks[hwnd] = Stopwatch.GetTimestamp()
+                        + Stopwatch.Frequency * ScreenSpareWatchMs / 1000;
+                else
+                    _spareWatchUntilTicks.Remove(hwnd);
+            }
+
             Log.Info($"Window 0x{hwnd:X} ('{title}') cannot be merged into a tab yet; kept for the next open.");
             return;
         }

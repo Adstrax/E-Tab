@@ -32,7 +32,12 @@ internal static class Program
         }
 
         ThemeManager.Initialize();
-        Log.Info($"E-Tab started ({typeof(Program).Assembly.GetName().Version}).");
+        Log.Info($"E-Tab started ({typeof(Program).Assembly.GetName().Version}) from '{Environment.ProcessPath}'.");
+
+        // If "start with Windows" points at a copy that is no longer there, it is
+        // pointed at this one: otherwise Windows starts nothing at login and the
+        // app looks like it did not start.
+        AutoStartManager.RepairIfStale();
         // Last-resort safety net: an Explorer window this app hid must never
         // outlive the app.
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Helper.RestoreAllHiddenWindows();

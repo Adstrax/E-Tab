@@ -95,7 +95,7 @@ public sealed class TrayIcon : IDisposable
                 _menu.Show(Cursor.Position);
         };
 
-        _hotkey = new HotkeyWindow(_watcher);
+        _hotkey = new HotkeyWindow(_watcher, RestoreTrayIcon);
     }
 
     /// <summary>
@@ -344,14 +344,44 @@ public sealed class TrayIcon : IDisposable
 
     }
 
+    /// <summary>
+    /// Puts the tray icon back after Explorer has restarted.
+    ///
+    /// The notification area belongs to Explorer: when it restarts - and on this
+    /// machine it does, several times a day - every icon in it disappears, and
+    /// an application only learns about it from this message. Without this the
+    /// icon never came back at all: the app kept running, but from the user's
+    /// side it looked like it had not started.
+    /// </summary>
+    private void RestoreTrayIcon()
+    {
+        if (_disposed) return;
+
+        try
+        {
+            // Toggling it makes the icon be added to the new taskbar even when
+            // this object still believes it is showing one.
+            _notifyIcon.Visible = false;
+            _notifyIcon.Visible = true;
+            Log.Info("The taskbar was recreated; the tray icon was put back.");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"The tray icon could not be put back: {ex.Message}");
+        }
+    }
+
     private sealed class HotkeyWindow : NativeWindow, IDisposable
     {
         private const int HotkeyId = 0xE01;
         private readonly ExplorerWatcher _watcher;
+        private readonly Action _onTaskbarCreated;
+        private readonly int _taskbarCreatedMessage = WinApi.RegisterWindowMessage("TaskbarCreated");
 
-        public HotkeyWindow(ExplorerWatcher watcher)
+        public HotkeyWindow(ExplorerWatcher watcher, Action onTaskbarCreated)
         {
             _watcher = watcher;
+            _onTaskbarCreated = onTaskbarCreated;
             CreateHandle(new CreateParams());
             if (!WinApi.RegisterHotKey(Handle, HotkeyId, WinApi.MOD_CONTROL | WinApi.MOD_SHIFT, WinApi.VK_E))
                 Log.Warn("Failed to register Ctrl+Shift+E hotkey.");
@@ -362,6 +392,12 @@ public sealed class TrayIcon : IDisposable
             if (m.Msg == WinApi.WM_HOTKEY && m.WParam.ToInt32() == HotkeyId)
             {
                 _watcher.MergeAllWindowsNow();
+                return;
+            }
+
+            if (_taskbarCreatedMessage != 0 && m.Msg == _taskbarCreatedMessage)
+            {
+                _onTaskbarCreated();
                 return;
             }
 

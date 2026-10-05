@@ -43,6 +43,15 @@ public static class WinApi
     [DllImport("user32.dll")]
     public static extern bool UnregisterHotKey(nint hWnd, int id);
 
+    /// <summary>
+    /// The id of a window message that every application can agree on by name.
+    /// Windows broadcasts "TaskbarCreated" this way when Explorer starts, which
+    /// is the only signal an application gets that its notification icon is
+    /// gone: the icon belongs to the old taskbar and is not put back for it.
+    /// </summary>
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int RegisterWindowMessage(string message);
+
     [DllImport("dwmapi.dll", PreserveSig = true)]
     public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 
