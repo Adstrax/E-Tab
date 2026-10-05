@@ -134,11 +134,14 @@ public sealed class ExplorerWatcher : IDisposable
     /// </summary>
     private sealed class MergeStep
     {
+        private readonly nint _hwnd;
         private readonly long _startedTicks = Stopwatch.GetTimestamp();
         private long _changedTicks = Stopwatch.GetTimestamp();
         private string _stage = "starting";
         private int _reported;
         private int _abandoned;
+
+        public MergeStep(nint hwnd) => _hwnd = hwnd;
 
         /// <summary>True once this merge has been handed back to the user.</summary>
         public bool Abandoned => Volatile.Read(ref _abandoned) == 1;
@@ -159,11 +162,14 @@ public sealed class ExplorerWatcher : IDisposable
 
         public bool TryClaimReport() => Interlocked.Exchange(ref _reported, 1) == 0;
 
+        public long AgeMs => (long)Stopwatch.GetElapsedTime(_startedTicks).TotalMilliseconds;
+
         public void Set(string stage)
         {
             _stage = stage;
             Interlocked.Exchange(ref _changedTicks, Stopwatch.GetTimestamp());
             ExplorerWatcher.NoteMergeProgress();
+            Log.Info($"Merge of 0x{_hwnd:X}: {stage} (+{AgeMs} ms)");
         }
     }
 
@@ -613,6 +619,17 @@ public sealed class ExplorerWatcher : IDisposable
                     {
                         info.WindowHandle = hwnd;
                         info.TabHandle = tabHandle;
+
+                        // A tab that was still coming up when it first appeared
+                        // may have shown no folder at all. It is looked at again
+                        // here, because a tab whose folder stays unknown is a
+                        // folder that cannot be found again: opening it a second
+                        // time opened another tab for it instead of going back.
+                        if (info.Location == null)
+                        {
+                            var locationNow = TryGetLocation(item);
+                            if (locationNow != null) info.Location = locationNow;
+                        }
                         continue;
                     }
 
@@ -1225,7 +1242,7 @@ public sealed class ExplorerWatcher : IDisposable
         MarkActivity();
         long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0, drawMs = 0, showMs = 0, closeMs = 0;
         var converted = false;
-        var step = new MergeStep();
+        var step = new MergeStep(sourceHwnd);
         var stopWatchdog = WatchForStuckMerge(sourceHwnd, step);
         try
         {
@@ -1379,18 +1396,31 @@ public sealed class ExplorerWatcher : IDisposable
             {
                 step.Set("closing the window that was replaced");
                 var closeStart = sw.ElapsedMilliseconds;
-                try
-                {
-                    ((dynamic)item).Quit();
-                }
-                catch
-                {
-                    // The window may already be gone.
-                }
-                closeMs = sw.ElapsedMilliseconds - closeStart;
 
-                RemoveItem(item);
+                // Everything remembered about that window is dropped first, by
+                // window handle alone - no call into the shell for a window that
+                // is about to go.
+                RemoveTabsOfWindow(sourceHwnd);
                 Helper.HiddenWindows.TryRemove(sourceHwnd, out _);
+
+                // Closing it is a posted message and not a call into the shell.
+                // The shell call that used to do this closes the window and then,
+                // every so often, never comes back: the merge ended with no
+                // summary line, no watchdog report, and a thread stuck inside it
+                // for the rest of the session. A posted close cannot wait for
+                // anything.
+                WinApi.PostMessage(sourceHwnd, WinApi.WM_SYSCOMMAND, WinApi.SC_CLOSE, 0);
+
+                var windowToClose = sourceHwnd;
+                _ = Task.Delay(3_000).ContinueWith(_ =>
+                {
+                    if (WinApi.IsWindow(windowToClose) && WinApi.IsWindowHasClassName(windowToClose, "CabinetWClass"))
+                        Log.Warn($"Window 0x{windowToClose:X} should have closed after its folder went into a tab, but it is still there.");
+                    else
+                        Log.Info($"Merge of 0x{windowToClose:X}: the window that was replaced is closed.");
+                }, TaskScheduler.Default);
+
+                closeMs = sw.ElapsedMilliseconds - closeStart;
             }
             else
             {
@@ -1407,13 +1437,16 @@ public sealed class ExplorerWatcher : IDisposable
             // Stopped last: a call that hangs while the replaced window is
             // closed is one of the ways a merge used to go quiet for good.
             stopWatchdog();
-        }
 
-        Log.Info(
-            $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
-            $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, " +
-            $"navigate {navMs}ms, draw {drawMs}ms, show {showMs}ms, close {closeMs}ms, " +
-            $"converted={converted}).");
+            // Written here rather than after the method: a merge that finds the
+            // folder already open leaves through a return of its own, and it
+            // used to leave without saying anything at all.
+            Log.Info(
+                $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
+                $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, " +
+                $"navigate {navMs}ms, draw {drawMs}ms, show {showMs}ms, close {closeMs}ms, " +
+                $"converted={converted}).");
+        }
     }
 
     /// <summary>
@@ -1730,7 +1763,9 @@ public sealed class ExplorerWatcher : IDisposable
         // there waited for a call that could never be delivered, silently and
         // without end. This app's window bookkeeping lock must never be held
         // across a call into the shell.
-        foreach (var (tabHandle, comparePath) in SnapshotTabLocations())
+        var known = SnapshotTabLocations();
+
+        foreach (var (tabHandle, comparePath) in known)
         {
             if (comparePath == null) continue;
             if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase))
@@ -1738,7 +1773,11 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         if (IsFileSystemPath(targetPath))
+        {
+            Log.Info($"SearchForTab('{targetPath}'): no tab shows this folder; tabs known: " +
+                     string.Join("; ", known.Select(k => $"0x{k.TabHandle:X}='{k.Location ?? "<unknown>"}'")));
             return 0;
+        }
 
         var comparer = _shellPathComparer;
         if (comparer == null) return 0;
@@ -1793,7 +1832,20 @@ public sealed class ExplorerWatcher : IDisposable
         lock (_itemsLock)
         {
             if (_tabInfos.TryGetValue(tabHandle, out var info))
+            {
                 info.Location = location;
+                return;
+            }
+
+            // The poll may not have come across this tab yet. Recording it here
+            // means the folder it shows is known from the moment the merge ends -
+            // which is what lets a folder that is opened again go back to this
+            // tab instead of opening a second one for the same folder.
+            _tabInfos[tabHandle] = new WindowInfo
+            {
+                TabHandle = tabHandle,
+                Location = location,
+            };
         }
     }
 
@@ -2235,6 +2287,26 @@ public sealed class ExplorerWatcher : IDisposable
 
         return -1;
     }
+    /// <summary>
+    /// Forgets every tab of a window, by the window's own handle. Used for the
+    /// window a merge replaced, at the moment it is closed: there is nothing
+    /// worth asking the shell for any more, and asking can cost the whole merge.
+    /// </summary>
+    private void RemoveTabsOfWindow(nint windowHandle)
+    {
+        lock (_itemsLock)
+        {
+            foreach (var tabHandle in _tabInfos
+                         .Where(pair => pair.Value.WindowHandle == windowHandle)
+                         .Select(pair => pair.Key)
+                         .ToList())
+            {
+                _tabInfos.Remove(tabHandle);
+                _tabToItem.TryRemove(tabHandle, out _);
+            }
+        }
+    }
+
     private void RemoveItem(object item)
     {
         var tabHandle = GetTabHandle(item);

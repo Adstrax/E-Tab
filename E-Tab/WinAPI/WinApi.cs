@@ -11,6 +11,14 @@ public static class WinApi
     public const int EVENT_OBJECT_SHOW = 0x8002;
     public const int WM_COMMAND = 0x111;
     public const int WM_HOTKEY = 0x312;
+    public const int WM_SYSCOMMAND = 0x0112;
+
+    /// <summary>
+    /// The command behind a window's own close button. Posted, it closes an
+    /// Explorer window without asking the shell to do anything, and so without
+    /// ever waiting for it.
+    /// </summary>
+    public const int SC_CLOSE = 0xF060;
     public const uint MOD_ALT = 0x0001;
     public const uint MOD_CONTROL = 0x0002;
     public const uint MOD_SHIFT = 0x0004;
