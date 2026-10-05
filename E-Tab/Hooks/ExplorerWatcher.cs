@@ -529,6 +529,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         var currentItems = new List<(object Item, nint Hwnd)>();
+        var shellAnswered = false;
         if (fullPassNeeded)
         {
             _lastFullShellPollTicks = Stopwatch.GetTimestamp();
@@ -552,6 +553,8 @@ public sealed class ExplorerWatcher : IDisposable
                     if (hwnd != 0)
                         currentItems.Add((item, hwnd));
                 }
+
+                shellAnswered = true;
             }
             catch
             {
@@ -648,10 +651,23 @@ public sealed class ExplorerWatcher : IDisposable
                     };
                 }
 
-                foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
+                // What this app knows about the open tabs is only pruned when the
+                // shell actually answered. An answer of "no tabs at all" while
+                // there are still File Explorer windows on screen is a shell that
+                // did not answer properly - Explorer restarting, or too busy - and
+                // pruning on it threw away every tab this app knew: a folder that
+                // was already open then looked like one it had never seen, and
+                // opening it again opened a second tab for it.
+                var nothingToPrune = currentItems.Count == 0
+                    && WinApi.FindAllWindowsEx("CabinetWClass").Any();
+
+                if (shellAnswered && !nothingToPrune)
                 {
-                    _tabToItem.TryRemove(staleTab, out _);
-                    _tabInfos.Remove(staleTab);
+                    foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
+                    {
+                        _tabToItem.TryRemove(staleTab, out _);
+                        _tabInfos.Remove(staleTab);
+                    }
                 }
             }
 
@@ -1258,7 +1274,7 @@ public sealed class ExplorerWatcher : IDisposable
             // Fast path: the folder is already open as a tab, so just select
             // that tab instead of creating a new one.
             step.Set("looking for a tab that already shows this folder");
-            var existingTab = SearchForTab(target);
+            var existingTab = await SearchForTabAsync(target, sourceHwnd).ConfigureAwait(false);
             searchMs = sw.ElapsedMilliseconds;
             if (!forceNew && existingTab != 0)
             {
@@ -1754,7 +1770,7 @@ public sealed class ExplorerWatcher : IDisposable
         }
     }
 
-    private nint SearchForTab(string targetPath)
+    private async Task<nint> SearchForTabAsync(string targetPath, nint sourceWindow)
     {
         // Nothing here reads a Shell item while holding the lock. A Shell item
         // can only be read from another thread through the message queue of the
@@ -1770,6 +1786,20 @@ public sealed class ExplorerWatcher : IDisposable
             if (comparePath == null) continue;
             if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase))
                 return tabHandle;
+        }
+
+        // Nothing in the bookkeeping - so ask the shell itself before deciding
+        // that this folder is not open anywhere. What this app remembers can be
+        // thin for a moment (a tab that appeared before its folder could be
+        // read, a pass that did not come back), and acting on that opened a
+        // second tab for a folder that was already open, leaving the user on the
+        // newest one. The shell knows its own tabs.
+        var live = await RunConversionInStaThread(() => FindExistingTabByLocation(targetPath, sourceWindow))
+            .ConfigureAwait(false);
+        if (live != 0)
+        {
+            Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{live:X}) by asking the shell.");
+            return live;
         }
 
         if (IsFileSystemPath(targetPath))
@@ -1847,6 +1877,52 @@ public sealed class ExplorerWatcher : IDisposable
                 Location = location,
             };
         }
+    }
+
+    /// <summary>
+    /// Walks the shell's own tabs for one that shows this folder, ignoring what
+    /// this app remembers. The window that is being merged is left out: it shows
+    /// the same folder, and taking it for an open tab would close the only place
+    /// the folder is.
+    /// </summary>
+    private nint FindExistingTabByLocation(string targetPath, nint sourceWindow)
+    {
+        var shell = ConversionShell();
+        if (shell == null) return 0;
+
+        try
+        {
+            dynamic windows = ((dynamic)shell).Windows();
+            var count = (int)windows.Count;
+            for (var i = 0; i < count; i++)
+            {
+                object item;
+                try
+                {
+                    item = (object)windows.Item(i);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (sourceWindow != 0 && GetWindowHandle(item) == sourceWindow) continue;
+
+                var tabHandle = GetTabHandle(item);
+                if (tabHandle == 0) continue;
+
+                var location = TryGetLocation(item);
+                if (location == null) continue;
+                if (string.Equals(location, targetPath, StringComparison.OrdinalIgnoreCase))
+                    return tabHandle;
+            }
+        }
+        catch
+        {
+            // The shell can be busy; the caller simply carries on without this.
+        }
+
+        return 0;
     }
 
     /// <summary>
