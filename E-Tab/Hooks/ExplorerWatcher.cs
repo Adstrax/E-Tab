@@ -529,7 +529,6 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         var currentItems = new List<(object Item, nint Hwnd)>();
-        var shellAnswered = false;
         if (fullPassNeeded)
         {
             _lastFullShellPollTicks = Stopwatch.GetTimestamp();
@@ -554,7 +553,6 @@ public sealed class ExplorerWatcher : IDisposable
                         currentItems.Add((item, hwnd));
                 }
 
-                shellAnswered = true;
             }
             catch
             {
@@ -628,7 +626,7 @@ public sealed class ExplorerWatcher : IDisposable
                         // here, because a tab whose folder stays unknown is a
                         // folder that cannot be found again: opening it a second
                         // time opened another tab for it instead of going back.
-                        if (info.Location == null)
+                        if (info.Location == null || info.WindowHandle != hwnd)
                         {
                             var locationNow = TryGetLocation(item);
                             if (locationNow != null) info.Location = locationNow;
@@ -658,16 +656,17 @@ public sealed class ExplorerWatcher : IDisposable
                 // pruning on it threw away every tab this app knew: a folder that
                 // was already open then looked like one it had never seen, and
                 // opening it again opened a second tab for it.
-                var nothingToPrune = currentItems.Count == 0
-                    && WinApi.FindAllWindowsEx("CabinetWClass").Any();
-
-                if (shellAnswered && !nothingToPrune)
+                // A tab is forgotten only when its window is really gone. Pruning
+                // on what a pass happened to return threw away tabs that were
+                // open: while a window is being created the shell can answer with
+                // a part of the list, and the tabs left out of it looked closed.
+                // A folder that was open then looked like one this app had never
+                // seen, so opening it opened a second tab for it instead of going
+                // back to the tab it had.
+                foreach (var staleTab in _tabInfos.Keys.Where(k => !WinApi.IsWindow(k)).ToList())
                 {
-                    foreach (var staleTab in _tabInfos.Keys.Where(k => !currentTabHandles.Contains(k)).ToList())
-                    {
-                        _tabToItem.TryRemove(staleTab, out _);
-                        _tabInfos.Remove(staleTab);
-                    }
+                    _tabToItem.TryRemove(staleTab, out _);
+                    _tabInfos.Remove(staleTab);
                 }
             }
 
@@ -2100,19 +2099,36 @@ public sealed class ExplorerWatcher : IDisposable
             })
             .ToList();
 
-        // A window that is on screen comes first; a window Explorer is holding
-        // back is taken when that is all there is, and put on screen once the
-        // folder is in it (see ConvertToTabCoreAsync). Taking the one with the
-        // most tabs keeps the user's own window as the one folders gather in.
-        _mainWindowHandle = allWindows
+        if (allWindows.Count == 0)
+        {
+            _mainWindowHandle = 0;
+            return 0;
+        }
+
+        // The window the user is looking at comes first, then the window folders
+        // have been gathering in, then any window that is on screen, and only
+        // then a window Explorer is holding back - which is put on screen once
+        // the folder is in it (see ConvertToTabCoreAsync).
+        var foreground = WinApi.GetForegroundWindow();
+        if (allWindows.Contains(foreground) && WinApi.IsWindowVisible(foreground))
+        {
+            _mainWindowHandle = foreground;
+            return _mainWindowHandle;
+        }
+
+        if (allWindows.Contains(_mainWindowHandle) && WinApi.IsWindowVisible(_mainWindowHandle))
+            return _mainWindowHandle;
+
+        var visible = allWindows
             .Where(WinApi.IsWindowVisible)
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
-            .FirstOrDefault();
+            .ToList();
 
-        if (_mainWindowHandle == 0)
-            _mainWindowHandle = allWindows
+        _mainWindowHandle = visible.Count > 0
+            ? visible[0]
+            : allWindows
                 .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
-                .FirstOrDefault();
+                .First();
 
         return _mainWindowHandle;
     }
