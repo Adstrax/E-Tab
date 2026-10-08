@@ -705,7 +705,7 @@ public sealed class ExplorerWatcher : IDisposable
 
         lock (_itemsLock)
         {
-            if (!HasVisibleExplorerWindow(hwnd))
+            if (!HasUsableExplorerWindow(hwnd))
             {
                 // Nothing to merge into - yet. Explorer very often has the
                 // window this folder belongs in off screen at exactly this
@@ -1080,7 +1080,7 @@ public sealed class ExplorerWatcher : IDisposable
 
             // Nothing to merge into: leave the window alone instead of hiding
             // it and having to put it back a moment later.
-            if (!HasVisibleExplorerWindow(hWnd)) return;
+            if (!HasUsableExplorerWindow(hWnd)) return;
         }
 
         // A window that was moved out of the way is only registered as hidden
@@ -1122,7 +1122,7 @@ public sealed class ExplorerWatcher : IDisposable
             if (_knownTopLevelWindows.Contains(hWnd)) return;
             // Nothing to merge into: leave the window alone instead of moving
             // it and having to put it back a moment later.
-            if (!HasVisibleExplorerWindow(hWnd)) return;
+            if (!HasUsableExplorerWindow(hWnd)) return;
         }
 
         if (!Helper.ParkWindow(hWnd)) return;
@@ -1141,17 +1141,31 @@ public sealed class ExplorerWatcher : IDisposable
     private static bool IsHomeTitle(string title)
         => title.StartsWith("Home", StringComparison.OrdinalIgnoreCase);
 
-    private static bool HasVisibleExplorerWindow(nint except)
+    /// <summary>
+    /// True when there is any File Explorer window a folder can be turned into a
+    /// tab in.
+    ///
+    /// Being on screen is not required. Explorer keeps windows of its own hidden
+    /// and hands the next folder to one of them, and it hides the window a folder
+    /// is opened from for a moment while that folder is turned into a tab - so a
+    /// window that is not on screen at this instant is very often the window the
+    /// folder belongs in. Requiring one to be visible made those folders open as
+    /// windows of their own, which is the failure that looked random. A window a
+    /// merge is already working on is left out, and one this app moved out of the
+    /// way is not counted while it really is off screen.
+    /// </summary>
+    private bool HasUsableExplorerWindow(nint except)
     {
         foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
         {
             if (hWnd == except) continue;
-            if (!WinApi.IsWindowVisible(hWnd)) continue;
-            // A window this app has moved out of the way is not a place the
-            // user can see - but only while it really is off screen. The record
-            // can be stale, and a window that is on screen is somewhere to
-            // merge into no matter what this app remembers about it.
             if (Helper.IsParkedOffScreen(hWnd) && Helper.IsOffScreen(hWnd)) continue;
+
+            lock (_itemsLock)
+            {
+                if (_pendingConversions.Contains(hWnd)) continue;
+            }
+
             return true;
         }
 
@@ -1311,6 +1325,15 @@ public sealed class ExplorerWatcher : IDisposable
             // folders in a row does not queue behind the first one.
             step.Set(TabStepStage);
             var (targetWindow, newTabHandle, firstNewIndex) = await CreateNewTabAsync(preferredWindow);
+
+            // A folder merged into a window nobody can see is no better than a
+            // window of its own: the window it went into is put on screen.
+            if (targetWindow != 0 && !WinApi.IsWindowVisible(targetWindow))
+            {
+                if (!Helper.ShowWindow(targetWindow, removeCache: false))
+                    WinApi.ShowWindow(targetWindow, WinApi.SW_SHOWNOACTIVATE);
+                Log.Info($"Window 0x{targetWindow:X} was put on screen to show the new tab.");
+            }
             createMs = sw.ElapsedMilliseconds;
             if (targetWindow == 0 || newTabHandle == 0)
             {
@@ -2067,12 +2090,29 @@ public sealed class ExplorerWatcher : IDisposable
             && !Helper.IsParkedOffScreen(_mainWindowHandle))
             return _mainWindowHandle;
 
-        var allWindows = WinApi.FindAllWindowsEx("CabinetWClass");
-        _mainWindowHandle = allWindows
+        var allWindows = WinApi.FindAllWindowsEx("CabinetWClass")
             .Where(h => h != otherThan)
-            .Where(h => WinApi.IsWindowVisible(h) && !Helper.IsParkedOffScreen(h))
+            .Where(h => !Helper.IsParkedOffScreen(h))
+            .Where(h =>
+            {
+                lock (_itemsLock)
+                    return !_pendingConversions.Contains(h);
+            })
+            .ToList();
+
+        // A window that is on screen comes first; a window Explorer is holding
+        // back is taken when that is all there is, and put on screen once the
+        // folder is in it (see ConvertToTabCoreAsync). Taking the one with the
+        // most tabs keeps the user's own window as the one folders gather in.
+        _mainWindowHandle = allWindows
+            .Where(WinApi.IsWindowVisible)
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
             .FirstOrDefault();
+
+        if (_mainWindowHandle == 0)
+            _mainWindowHandle = allWindows
+                .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
+                .FirstOrDefault();
 
         return _mainWindowHandle;
     }
