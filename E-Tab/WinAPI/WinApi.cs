@@ -220,4 +220,27 @@ public static class WinApi
 
     [DllImport("dwmapi.dll", PreserveSig = true)]
     public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("psapi.dll")]
+    private static extern bool EmptyWorkingSet(nint hProcess);
+
+    /// <summary>
+    /// Hands idle, private working-set pages back to the OS. Called only while
+    /// the app is idle; it lowers the memory shown in Task Manager and does not
+    /// change any behaviour - the pages come back the moment they are needed.
+    /// </summary>
+    public static void TrimWorkingSet()
+    {
+        try
+        {
+            EmptyWorkingSet(GetCurrentProcess());
+        }
+        catch
+        {
+            // Trimming memory must never throw.
+        }
+    }
 }

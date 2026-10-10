@@ -45,6 +45,14 @@ public class ExplorerWatcher : IHook
     private bool _reuseTabs = true;
     private bool _isForcingTabs;
     public bool IsHookActive => _isForcingTabs;
+
+    /// <summary>
+    /// When a folder was last taken on. Read by the app to tell an idle minute
+    /// from a busy one, which is the only moment the memory it is holding can be
+    /// handed back.
+    /// </summary>
+    public static long LastActivityTicks { get; private set; } = Stopwatch.GetTimestamp();
+
     public event Action? OnShellInitialized;
 
     public ExplorerWatcher()
@@ -415,6 +423,7 @@ public class ExplorerWatcher : IHook
     }
     private async void OnShellWindowRegistered(int __)
     {
+        LastActivityTicks = Stopwatch.GetTimestamp();
         var sw = Stopwatch.StartNew();
         var showAgain = true;
         nint hWnd = 0;
