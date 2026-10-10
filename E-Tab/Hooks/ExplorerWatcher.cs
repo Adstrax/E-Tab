@@ -1483,9 +1483,21 @@ public sealed class ExplorerWatcher : IDisposable
                 _ = Task.Delay(3_000).ContinueWith(_ =>
                 {
                     if (WinApi.IsWindow(windowToClose) && WinApi.IsWindowHasClassName(windowToClose, "CabinetWClass"))
-                        Log.Warn($"Window 0x{windowToClose:X} should have closed after its folder went into a tab, but it is still there.");
+                    {
+                        // It would not close. It is put back on screen rather
+                        // than left hidden: a hidden window is a window Explorer
+                        // hands the next folder to, and one this app hid and
+                        // forgot is how folders ended up in a window of their
+                        // own instead of the one the user was working in.
+                        Helper.ShowWindow(windowToClose, removeCache: true);
+                        if (!WinApi.IsWindowVisible(windowToClose))
+                            WinApi.ShowWindow(windowToClose, WinApi.SW_SHOWNOACTIVATE);
+                        Log.Warn($"Window 0x{windowToClose:X} should have closed after its folder went into a tab, but it is still there; it was put back on screen.");
+                    }
                     else
+                    {
                         Log.Info($"Merge of 0x{windowToClose:X}: the window that was replaced is closed.");
+                    }
                 }, TaskScheduler.Default);
 
                 closeMs = sw.ElapsedMilliseconds - closeStart;
@@ -1846,25 +1858,31 @@ public sealed class ExplorerWatcher : IDisposable
         // read, a pass that did not come back), and acting on that opened a
         // second tab for a folder that was already open, leaving the user on the
         // newest one. The shell knows its own tabs.
-        var live = await RunConversionInStaThread(() => FindExistingTabByLocation(targetPath, sourceWindow))
-            .ConfigureAwait(false);
-        if (live != 0)
-        {
-            Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{live:X}) by asking the shell.");
-            return live;
-        }
-
-        // The shell's list of tabs can come back empty or partial while a window
-        // is being created. Each tab window carries the name of the page it
-        // shows, though, so the tabs of every window can be walked directly - no
-        // list involved - which is what keeps a folder that is already open from
-        // being opened a second time.
+        // Each tab window carries the name of the page it shows, so the tabs of
+        // every window can be walked directly - no list involved. This is the
+        // cheap look and it is tried before the shell's own list, which is what
+        // takes seconds on a machine where that list is slow or busy.
         var byTitle = await RunConversionInStaThread(() => FindTabByTitle(sourceWindow, targetPath))
             .ConfigureAwait(false);
         if (byTitle != 0)
         {
             Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{byTitle:X}) by its name.");
             return byTitle;
+        }
+
+        // Asking the shell for its list of tabs is the expensive one, and it is
+        // only worth it when this app knows nothing at all - which means the poll
+        // has not had its say yet. When the folder really is not open, this is
+        // the cost of opening it, and opening folders is the whole point.
+        if (known.Count == 0)
+        {
+            var live = await RunConversionInStaThread(() => FindExistingTabByLocation(targetPath, sourceWindow))
+                .ConfigureAwait(false);
+            if (live != 0)
+            {
+                Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{live:X}) by asking the shell.");
+                return live;
+            }
         }
 
         if (IsFileSystemPath(targetPath))
@@ -2119,7 +2137,7 @@ public sealed class ExplorerWatcher : IDisposable
         => FrontTab(windowHandle) == tabHandle;
 
     private static nint FrontTab(nint windowHandle)
-        => WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
+        => Helper.GetAllExplorerTabs(windowHandle).FirstOrDefault();
 
     /// <summary>
     /// Waits until the tab in front is no longer the one it was. The tab strip
@@ -2203,6 +2221,7 @@ public sealed class ExplorerWatcher : IDisposable
         var allWindows = WinApi.FindAllWindowsEx("CabinetWClass")
             .Where(h => h != otherThan)
             .Where(h => !Helper.IsParkedOffScreen(h))
+            .Where(h => !Helper.IsHidden(h))
             .Where(h =>
             {
                 lock (_itemsLock)
@@ -2216,30 +2235,22 @@ public sealed class ExplorerWatcher : IDisposable
             return 0;
         }
 
-        // The window the user is looking at comes first, then the window folders
-        // have been gathering in, then any window that is on screen, and only
-        // then a window Explorer is holding back - which is put on screen once
-        // the folder is in it (see ConvertToTabCoreAsync).
-        var foreground = WinApi.GetForegroundWindow();
-        if (allWindows.Contains(foreground) && WinApi.IsWindowVisible(foreground))
-        {
-            _mainWindowHandle = foreground;
-            return _mainWindowHandle;
-        }
-
-        if (allWindows.Contains(_mainWindowHandle) && WinApi.IsWindowVisible(_mainWindowHandle))
+        // The window folders have been gathering in keeps that place while it is
+        // still there. It is not asked to be on screen: Explorer hides windows of
+        // its own and hides the window it is working with from time to time, and
+        // a hidden window still has every tab in it. Choosing among the windows
+        // that happen to be on screen instead picked whichever window Explorer
+        // had just put there - a fresh one with one or two tabs - and that is why
+        // folders stopped gathering in the same window every few clicks.
+        if (allWindows.Contains(_mainWindowHandle))
             return _mainWindowHandle;
 
-        var visible = allWindows
-            .Where(WinApi.IsWindowVisible)
+        // Otherwise the window with the most tabs is the one the user has been
+        // working in; being on screen only settles a draw.
+        _mainWindowHandle = allWindows
             .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
-            .ToList();
-
-        _mainWindowHandle = visible.Count > 0
-            ? visible[0]
-            : allWindows
-                .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
-                .First();
+            .ThenByDescending(h => WinApi.IsWindowVisible(h))
+            .First();
 
         return _mainWindowHandle;
     }
@@ -2395,6 +2406,7 @@ public sealed class ExplorerWatcher : IDisposable
         if (!tabs.Contains(tabHandle)) return null;
 
         var pairedTabs = new HashSet<nint>();
+        var unpairedItemList = new List<object>();
         object? unpairedItem = null;
         var unpairedItems = 0;
 
@@ -2425,6 +2437,7 @@ public sealed class ExplorerWatcher : IDisposable
 
                 unpairedItem = item;
                 unpairedItems++;
+                unpairedItemList.Add(item);
             }
         }
         catch
@@ -2433,8 +2446,44 @@ public sealed class ExplorerWatcher : IDisposable
         }
 
         var unpairedTabs = tabs.Where(tab => !pairedTabs.Contains(tab)).ToList();
-        if (unpairedItems != 1 || unpairedTabs.Count != 1) return null;
-        return unpairedTabs[0] == tabHandle ? unpairedItem : null;
+        if (unpairedItems == 1 && unpairedTabs.Count == 1)
+            return unpairedTabs[0] == tabHandle ? unpairedItem : null;
+
+        // More than one tab can be waiting for its browser at the same time when
+        // folders are opened in a row. They are then told apart by the name each
+        // one carries, which the tab window and the item both have.
+        var wanted = WinApi.GetWindowTitle(tabHandle);
+        if (string.IsNullOrWhiteSpace(wanted)) return null;
+
+        object? match = null;
+        var matches = 0;
+        foreach (var candidate in unpairedItemList)
+        {
+            var name = TryGetDisplayName(candidate);
+            if (!string.Equals(name, wanted, StringComparison.OrdinalIgnoreCase)) continue;
+            match = candidate;
+            matches++;
+        }
+
+        return matches == 1 && unpairedTabs.Count == unpairedItems ? match : null;
+    }
+
+    /// <summary>
+    /// The name the shell shows for one of its items - the folder's own name for
+    /// a folder, or Explorer's own page name. Used to tell one waiting tab from
+    /// another when several are waiting at once.
+    /// </summary>
+    private static string? TryGetDisplayName(object item)
+    {
+        try
+        {
+            var name = (string?)((dynamic)item).LocationName;
+            return string.IsNullOrWhiteSpace(name) ? null : name;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>

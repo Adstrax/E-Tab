@@ -178,15 +178,61 @@ public static class WinApi
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     public static extern int SHGetNameFromIDList(nint pidl, uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string? ppszName);
 
+    private delegate bool EnumWindowsProc(nint hWnd, nint lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, nint lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(nint parent, EnumWindowsProc callback, nint lParam);
+
+    /// <summary>
+    /// Every window of a class: the top-level ones when no parent is given, and
+    /// everything below a window otherwise - at any depth.
+    ///
+    /// The depth matters. Explorer's tab windows are not always direct children
+    /// of the frame: while a window is new they are, and once it has been around
+    /// for a while Explorer moves them one level down. Looking only at direct
+    /// children found no tabs at all in the windows that had been open longest,
+    /// which made this app read a window with twelve tabs as one with none: it
+    /// picked the wrong window to merge folders into, could not find a tab that
+    /// was already showing a folder, and could not tell whether switching tabs
+    /// had worked.
+    /// </summary>
     public static IEnumerable<nint> FindAllWindowsEx(string className, nint parent = 0, string? windowTitle = null)
     {
-        nint handle = 0;
-        do
+        var found = new List<nint>();
+
+        if (parent == 0)
         {
-            handle = FindWindowEx(parent, handle, className, windowTitle);
-            if (handle == 0) continue;
-            yield return handle;
-        } while (handle != 0);
+            if (windowTitle == null)
+            {
+                EnumWindows((hWnd, _) =>
+                {
+                    if (IsWindowHasClassName(hWnd, className)) found.Add(hWnd);
+                    return true;
+                }, 0);
+            }
+            else
+            {
+                nint handle = 0;
+                do
+                {
+                    handle = FindWindowEx(0, handle, className, windowTitle);
+                    if (handle != 0) found.Add(handle);
+                } while (handle != 0);
+            }
+        }
+        else
+        {
+            EnumChildWindows(parent, (hWnd, _) =>
+            {
+                if (IsWindowHasClassName(hWnd, className)) found.Add(hWnd);
+                return true;
+            }, 0);
+        }
+
+        return found;
     }
 
     /// <summary>
