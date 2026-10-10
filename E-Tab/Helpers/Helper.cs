@@ -1,442 +1,296 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
+using System.Drawing;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Reflection;
+using System.Diagnostics;
+using System.ComponentModel;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using ETab.Interop;
+using ETab.Managers;
+using ETab.Models;
 using ETab.WinAPI;
-using Microsoft.Win32;
 
 namespace ETab.Helpers;
 
 public static class Helper
 {
-    /// <summary>
-    /// A window this app has taken off the screen, plus everything needed to
-    /// put it back exactly where Explorer meant to open it.
-    /// </summary>
-    /// <param name="HiddenAtTicks">When the window was last touched by this app.</param>
-    /// <param name="WasMinimized">Whether the window was minimized before it was hidden.</param>
-    /// <param name="OriginalRect">Where the window was before it was moved out of the way.</param>
-    /// <param name="Parked">Whether the window was moved off screen.</param>
-    /// <param name="Hidden">Whether the window was hidden with SW_HIDE.</param>
-    public readonly record struct HiddenWindow(
-        long HiddenAtTicks,
-        bool WasMinimized,
-        WinApi.RECT OriginalRect,
-        bool Parked,
-        bool Hidden);
+    private static int _lastCtrlShiftCheckAt;
+    private static bool _lastCtrlShiftCheckValue;
+    public static readonly ConcurrentDictionary<nint, RECT?> HiddenWindows = new();
 
-    public static readonly ConcurrentDictionary<nint, HiddenWindow> HiddenWindows = new();
-
-    // Far enough outside any real desktop that a window parked here cannot be
-    // seen on any monitor, but still a normal window position that Explorer
-    // can be moved back from without recalculating the frame.
-    private const int OffScreenX = -32_000;
-    private const int OffScreenY = -32_000;
-
-    public static async Task<T> DoUntilNotDefaultAsync<T>(
-        Func<T> action,
-        int timeMs = 500,
-        int sleepMs = 20,
-        CancellationToken cancellationToken = default)
+    public static Task DoDelayedBackgroundAsync(Action action, int delayMs = 2_000, CancellationToken cancellationToken = default)
     {
-        return await DoUntilConditionAsync(
+        return Task.Run(async () =>
+        {
+            await Task.Delay(delayMs, cancellationToken);
+            action();
+        }, cancellationToken);
+    }
+    public static Task DoDelayedBackgroundAsync(Func<Task> action, int delayMs = 2_000, CancellationToken cancellationToken = default)
+    {
+        return Task.Run(async () =>
+        {
+            await Task.Delay(delayMs, cancellationToken);
+            await action();
+        }, cancellationToken);
+    }
+    public static Task<T> DoDelayedBackgroundAsync<T>(Func<Task<T>> action, int delayMs = 2_000, CancellationToken cancellationToken = default)
+    {
+        return Task.Run(async () =>
+        {
+            await Task.Delay(delayMs, cancellationToken);
+            return await action();
+        }, cancellationToken);
+    }
+
+    public static T DoUntilNotDefault<T>(Func<T> action, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        return DoUntilCondition(
             action,
             result => !EqualityComparer<T?>.Default.Equals(result, default),
             timeMs,
             sleepMs,
             cancellationToken);
     }
-
-    public static async Task<T> DoUntilNotDefaultAsync<T>(
-        Func<T> action,
-        Predicate<T> predicate,
-        int timeMs = 500,
-        int sleepMs = 20,
-        CancellationToken cancellationToken = default)
+    public static void DoUntilTimeEnd(Action action, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
     {
-        return await DoUntilConditionAsync(action, predicate, timeMs, sleepMs, cancellationToken);
+        DoUntilCondition(action, static () => false, timeMs, sleepMs, cancellationToken);
     }
-
-    private static async Task<T> DoUntilConditionAsync<T>(
-        Func<T> action,
-        Predicate<T> predicate,
-        int timeMs = 500,
-        int sleepMs = 20,
-        CancellationToken cancellationToken = default)
+    public static void DoUntilCondition(Action action, Func<bool> predicate, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
     {
         var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            action();
+            if (predicate())
+                return;
+
+            Thread.Sleep(sleepMs);
+        }
+    }
+    public static T DoUntilCondition<T>(Func<T> action, Predicate<T> predicate, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
         while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
         {
             var result = action();
-            if (predicate(result)) return result;
-            await Task.Delay(sleepMs, cancellationToken);
+            if (predicate(result))
+                return result;
+
+            Thread.Sleep(sleepMs);
         }
 
         return action();
     }
+    public static void DoIfCondition(Action action, Func<bool> predicate, bool justOnce = false, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            if (predicate())
+            {
+                action();
+
+                if (justOnce) return;
+            }
+            Thread.Sleep(sleepMs);
+        }
+    }
+    public static Task<T> DoUntilNotDefaultAsync<T>(Func<Task<T>> action, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        return DoUntilConditionAsync(
+            action,
+            result => !EqualityComparer<T?>.Default.Equals(result, default),
+            timeMs,
+            sleepMs,
+            cancellationToken);
+    }
+    public static Task<T> DoUntilNotDefaultAsync<T>(Func<T> action, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        return DoUntilConditionAsync(
+            action,
+            result => !EqualityComparer<T?>.Default.Equals(result, default),
+            timeMs,
+            sleepMs,
+            cancellationToken);
+    }
+    public static Task DoUntilTimeEndAsync(Func<Task> action, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        return DoUntilConditionAsync(action, static () => false, timeMs, sleepMs, cancellationToken);
+    }
+    public static async Task DoUntilConditionAsync(Func<Task> action, Func<bool> predicate, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            await action();
+            if (predicate())
+                return;
+
+            await Task.Delay(sleepMs);
+        }
+    }
+    public static async Task<T> DoUntilConditionAsync<T>(Func<T> action, Predicate<T> predicate, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            var result = action();
+            if (predicate(result))
+                return result;
+
+            await Task.Delay(sleepMs);
+        }
+
+        return action();
+    }
+    public static async Task<T> DoUntilConditionAsync<T>(Func<Task<T>> action, Predicate<T> predicate, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            var result = await action();
+            if (predicate(result))
+                return result;
+
+            await Task.Delay(sleepMs);
+        }
+
+        return await action();
+    }
+    public static async Task DoIfConditionAsync(Func<Task> action, Func<bool> predicate, bool justOnce = false, int timeMs = 500, int sleepMs = 20, CancellationToken cancellationToken = default)
+    {
+        var startTicks = Stopwatch.GetTimestamp();
+
+        while (!cancellationToken.IsCancellationRequested && !IsTimeUp(startTicks, timeMs))
+        {
+            if (predicate())
+            {
+                await action();
+
+                if (justOnce) return;
+            }
+            await Task.Delay(sleepMs);
+        }
+    }
 
     public static bool IsTimeUp(long startTicks, int timeMs)
     {
-        return Stopwatch.GetElapsedTime(startTicks).TotalMilliseconds >= timeMs;
+
+#if NET7_0_OR_GREATER
+        var elapsedTime = Stopwatch.GetElapsedTime(startTicks);
+#else
+        var elapsedTime = GetElapsedTime(startTicks);
+#endif
+
+        return elapsedTime.TotalMilliseconds >= timeMs;
+    }
+    public static TimeSpan GetElapsedTime(long startTicks)
+    {
+        var tickFrequency = (double)10_000_000 / Stopwatch.Frequency;
+        return new TimeSpan((long)((Stopwatch.GetTimestamp() - startTicks) * tickFrequency));
+    }
+    public static T Clamp<T>(this T val, T min, T max) where T : IComparable<T>
+    {
+        if (val.CompareTo(min) < 0) return min;
+        if (val.CompareTo(max) > 0) return max;
+        return val;
     }
 
+    public static Icon? GetIcon() => Icon.ExtractAssociatedIcon(GetExecutablePath());
+    public static string GetEnumDescription(Enum value)
+    {
+        var fieldInfo = value.GetType().GetField(value.ToString());
+        return fieldInfo?.GetCustomAttribute<DescriptionAttribute>()?.Description ?? value.ToString();
+    }
+    public static bool IsExplorerEmptySpace(Point point)
+    {
+        var hr = WinApi.AccessibleObjectFromPoint(point, out var accObj, out var childId);
+        if (hr != 0 || childId is not 0) return false;
+
+        var role = accObj.get_accRole(0);
+        return role is 0x21; //IAccessible.Role:list (ROLE_SYSTEM_LIST 0x21)
+    }
+    public static bool IsFileExplorerTab(nint tab)
+    {
+        return tab != 0 && WinApi.IsWindowHasClassName(tab, "ShellTabWindowClass");
+    }
     public static bool IsFileExplorerWindow(nint window)
     {
         return window != 0 && WinApi.IsWindowHasClassName(window, "CabinetWClass");
     }
+    public static bool IsFileExplorerForeground(out nint foregroundWindow)
+    {
+        foregroundWindow = WinApi.GetForegroundWindow();
+        return IsFileExplorerWindow(foregroundWindow);
+    }
+    public static nint GetAnotherExplorerWindow(nint currentWindow)
+    {
+        return currentWindow == 0
+            ? WinApi.FindWindow("CabinetWClass", null)
+            : GetAllExplorerWindows()
+                .FirstOrDefault(window => window != currentWindow);
+    }
+    public static Task<nint> ListenForNewExplorerWindowAsync(IReadOnlyCollection<nint> currentWindows, int searchTimeMs = 1000)
+    {
+        return DoUntilNotDefaultAsync(() =>
+                GetAllExplorerWindows()
+                    .Except(currentWindows)
+                    .FirstOrDefault(),
+            searchTimeMs);
+    }
 
+    public static nint ListenForNewExplorerTab(IReadOnlyCollection<nint> currentTabs, int searchTimeMs = 1000)
+    {
+        return DoUntilNotDefault(() =>
+                GetAllExplorerTabs()
+                    .Except(currentTabs)
+                    .FirstOrDefault(),
+            searchTimeMs);
+    }
+    public static Task<nint> ListenForNewExplorerTabAsync(IReadOnlyCollection<nint> currentTabs, int searchTimeMs = 1000)
+    {
+        return DoUntilNotDefaultAsync(() =>
+                GetAllExplorerTabs()
+                    .Except(currentTabs)
+                    .FirstOrDefault(),
+            searchTimeMs);
+    }
+    public static Task<nint> ListenForNewExplorerTabAsync(nint window, IReadOnlyCollection<nint> currentTabs, int searchTimeMs = 1000)
+    {
+        return DoUntilNotDefaultAsync(() =>
+                GetAllExplorerTabs(window)
+                    .Except(currentTabs)
+                    .FirstOrDefault(),
+            searchTimeMs);
+    }
+    public static List<nint> GetAllExplorerTabs()
+    {
+        var tabs = new List<nint>();
+
+        foreach (var window in GetAllExplorerWindows())
+            tabs.AddRange(GetAllExplorerTabs(window));
+
+        return tabs;
+    }
     public static IEnumerable<nint> GetAllExplorerTabs(nint window)
     {
         return WinApi.FindAllWindowsEx("ShellTabWindowClass", window);
     }
-
-    public static Task<nint> ListenForNewExplorerTabAsync(
-        nint window,
-        IReadOnlyCollection<nint> currentTabs,
-        int searchTimeMs = 1_000,
-        int sleepMs = 20)
+    public static IEnumerable<nint> GetAllExplorerWindows()
     {
-        return DoUntilNotDefaultAsync(
-            () => GetAllExplorerTabs(window).Except(currentTabs).FirstOrDefault(),
-            searchTimeMs,
-            sleepMs);
+        return WinApi.FindAllWindowsEx("CabinetWClass");
     }
-
-    /// <summary>
-    /// Moves a File Explorer window that has just been created - but not
-    /// revealed yet - out of the way.
-    ///
-    /// Explorer creates the frame window and only shows it a moment later
-    /// (measured: 130-250 ms), and once it is shown the window stays on screen
-    /// for as long as Explorer keeps its own thread busy: a hide request sent
-    /// at that point waits behind that work, which measured 30-110 ms of a
-    /// window the user can see, i.e. a flash. Moving the window while it is
-    /// still invisible costs nothing, is already applied by the time Explorer
-    /// shows it, and the window is then never painted on screen at all.
-    ///
-    /// Only the position is touched: size, frame and Z-order are left alone,
-    /// which is what kept the older SWP_FRAMECHANGED version from garbling the
-    /// layout of the window it was applied to.
-    /// </summary>
-    /// <returns>True when the window was moved out of the way.</returns>
-    public static bool ParkWindow(nint hWnd)
-    {
-        if (hWnd == 0) return false;
-        if (!WinApi.IsWindow(hWnd)) return false;
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return false;
-
-        // Never touch a window the user can already see, and never take over a
-        // window this app is already tracking.
-        if (WinApi.IsWindowVisible(hWnd)) return false;
-        if (!WinApi.GetWindowRect(hWnd, out var original)) return false;
-        if (original.Right <= original.Left || original.Bottom <= original.Top) return false;
-
-        if (!HiddenWindows.TryAdd(
-                hWnd,
-                new HiddenWindow(Stopwatch.GetTimestamp(), false, original, Parked: true, Hidden: false)))
-            return false;
-
-        MoveOffScreen(hWnd);
-        return true;
-    }
-
-    /// <summary>
-    /// Hides an Explorer window without touching its geometry or its frame.
-    ///
-    /// The window used to be moved to (-32000, -32000) with SWP_FRAMECHANGED,
-    /// which forced Explorer to recalculate its non-client area while the
-    /// window was still initializing. That could leave the tab strip and
-    /// address bar laid out for the wrong size after the window was restored,
-    /// and it left fully off-screen windows behind whenever a merge was
-    /// abandoned. SW_HIDE keeps size, position, Z-order and the
-    /// maximized/minimized state untouched, so restoring it is exact.
-    /// </summary>
-    /// <returns>True when this call hid the window.</returns>
-    public static bool HideWindow(nint hWnd) => HideWindowCore(hWnd, hideInBackground: false);
-
-    /// <summary>
-    /// Same as HideWindow, except that the window call itself is made on a
-    /// background thread.
-    ///
-    /// Explorer is normally still finishing the window when it is hidden here,
-    /// and SW_HIDE then waits for Explorer's thread to service the request
-    /// (measured 30-110 ms). Nothing may sit on that wait: the merge that turns
-    /// the window into a tab starts from the caller, and every millisecond spent
-    /// waiting is added to how long the user waits for their folder. The
-    /// bookkeeping is still done by the caller, so the window counts as hidden
-    /// immediately either way.
-    /// </summary>
-    public static bool HideWindowInBackground(nint hWnd) => HideWindowCore(hWnd, hideInBackground: true);
-
-    private static bool HideWindowCore(nint hWnd, bool hideInBackground)
-    {
-        if (hWnd == 0) return false;
-        if (!WinApi.IsWindow(hWnd)) return false;
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return false;
-
-        if (HiddenWindows.TryGetValue(hWnd, out var tracked))
-        {
-            if (tracked.Hidden)
-            {
-                // Explorer does not always reveal a window in one step: when it
-                // shows a window this app is already hiding, it has to be hidden
-                // again, otherwise it sits on screen for the rest of the merge.
-                Hide(hWnd, hideInBackground);
-                return false;
-            }
-
-            // Parked before Explorer revealed it: this is the first moment the
-            // window could have been seen, and therefore the moment the merge
-            // may take it over.
-            Hide(hWnd, hideInBackground);
-            HiddenWindows[hWnd] = tracked with { Hidden = true, HiddenAtTicks = Stopwatch.GetTimestamp() };
-            return true;
-        }
-
-        // Only ever hide a real, visible Explorer window: a window the user has
-        // not seen yet must never end up in the restore list.
-        if (!WinApi.IsWindowVisible(hWnd)) return false;
-
-        var state = new HiddenWindow(
-            Stopwatch.GetTimestamp(),
-            WinApi.IsIconic(hWnd),
-            default,
-            Parked: false,
-            Hidden: true);
-        if (!HiddenWindows.TryAdd(hWnd, state)) return false;
-
-        Hide(hWnd, hideInBackground);
-        return true;
-    }
-
-    private static void Hide(nint hWnd, bool inBackground)
-    {
-        if (!inBackground)
-        {
-            if (WinApi.IsWindowVisible(hWnd))
-                WinApi.ShowWindow(hWnd, WinApi.SW_HIDE);
-            return;
-        }
-
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            try
-            {
-                // Re-validated on this thread: the window may have been
-                // destroyed, or its handle recycled, while the request was
-                // queued, and this app only ever hides windows it still tracks.
-                if (HiddenWindows.ContainsKey(hWnd) &&
-                    WinApi.IsWindow(hWnd) &&
-                    WinApi.IsWindowHasClassName(hWnd, "CabinetWClass") &&
-                    WinApi.IsWindowVisible(hWnd))
-                {
-                    WinApi.ShowWindow(hWnd, WinApi.SW_HIDE);
-                }
-            }
-            catch
-            {
-                // Hiding must never throw.
-            }
-        });
-    }
-
-    private static void MoveOffScreen(nint hWnd)
-    {
-        WinApi.SetWindowPos(
-            hWnd,
-            0,
-            OffScreenX,
-            OffScreenY,
-            0,
-            0,
-            WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
-    }
-
-    /// <summary>
-    /// Puts a window hidden by this app back on screen.
-    ///
-    /// Windows the app never hid are left alone, and the window is never
-    /// activated: SW_SHOWNOACTIVATE re-shows it with the exact size, position
-    /// and state it had before it was hidden. The handle is validated first so
-    /// a recycled handle can never make an unrelated window appear.
-    /// </summary>
-    public static bool ShowWindow(nint hWnd, bool removeCache)
-    {
-        if (!HiddenWindows.TryGetValue(hWnd, out var state)) return false;
-
-        if (removeCache)
-            HiddenWindows.TryRemove(hWnd, out _);
-
-        if (!WinApi.IsWindow(hWnd)) return false;
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return false;
-
-        // A window that was parked has to be put back where Explorer meant to
-        // open it, otherwise the user gets it somewhere else entirely. The move
-        // happens while the window is still hidden, so nothing jumps on screen.
-        if (state.Parked)
-        {
-            WinApi.SetWindowPos(
-                hWnd,
-                0,
-                state.OriginalRect.Left,
-                state.OriginalRect.Top,
-                0,
-                0,
-                WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE);
-        }
-
-        // Only a window the user has already seen may be put back on screen. A
-        // window that was merely parked was never shown by Explorer, and
-        // revealing it here decides, on Explorer's behalf, that the user wants
-        // a window they never asked for - which is how stray File Explorer
-        // windows used to pop up. Explorer keeps that decision: if it reveals
-        // the window, the SHOW event hands it to the normal merge path. The
-        // position has already been put back above, so the window appears
-        // where Explorer meant it to if it is shown later.
-        if (!state.Hidden) return false;
-
-        return WinApi.ShowWindow(
-            hWnd,
-            state.WasMinimized ? WinApi.SW_SHOWMINNOACTIVE : WinApi.SW_SHOWNOACTIVATE);
-    }
-
-    /// <summary>
-    /// Restores every window this app is still hiding. Used when the app exits
-    /// (and as a last-resort safety net); a watcher re-initialization restores
-    /// windows one by one instead, so a running merge is not flashed back on
-    /// screen.
-    /// </summary>
-    public static void RestoreAllHiddenWindows()
-    {
-        foreach (var hWnd in HiddenWindows.Keys.ToList())
-            ShowWindow(hWnd, removeCache: true);
-    }
-
-    /// <summary>
-    /// True for a window that was moved out of the way but not hidden: it still
-    /// reports itself as visible, so it must never be picked as the window a
-    /// merge targets or as the window a merge should be hosted in.
-    /// </summary>
-    public static bool IsParkedOffScreen(nint hWnd)
-        => HiddenWindows.TryGetValue(hWnd, out var state) && state.Parked && !state.Hidden;
-
-    /// <summary>
-    /// True when the window is being tracked at all (parked, hidden, or both).
-    /// </summary>
-    public static bool IsTracked(nint hWnd) => HiddenWindows.ContainsKey(hWnd);
-
-    /// <summary>
-    /// True when the window is sitting outside every screen - where this app
-    /// moves the windows it holds out of the way - rather than merely being
-    /// recorded as such. The record can outlive the move: Explorer may put a
-    /// window back, or this app may restore one without clearing it. A window
-    /// the user can actually see has to be treated as one, whatever this app
-    /// remembers, or a folder is told there is nothing to merge into.
-    /// </summary>
-    public static bool IsOffScreen(nint hWnd)
-    {
-        if (!WinApi.GetWindowRect(hWnd, out var rect)) return false;
-
-        var x = WinApi.GetSystemMetrics(WinApi.SM_XVIRTUALSCREEN);
-        var y = WinApi.GetSystemMetrics(WinApi.SM_YVIRTUALSCREEN);
-        var width = WinApi.GetSystemMetrics(WinApi.SM_CXVIRTUALSCREEN);
-        var height = WinApi.GetSystemMetrics(WinApi.SM_CYVIRTUALSCREEN);
-
-        return rect.Right <= x || rect.Left >= x + width
-            || rect.Bottom <= y || rect.Top >= y + height;
-    }
-
-    /// <summary>
-    /// True when the window has actually been hidden, as opposed to only moved
-    /// out of the way before Explorer revealed it.
-    /// </summary>
-    public static bool IsHidden(nint hWnd)
-        => HiddenWindows.TryGetValue(hWnd, out var state) && state.Hidden;
-
-    /// <summary>
-    /// A window that was parked and that nothing has claimed yet is left where
-    /// it is.
-    ///
-    /// It used to be moved back to where Explorer meant to open it a couple of
-    /// seconds after being parked, and that is what turned the folder Explorer
-    /// hands such a window into something the user saw: Explorer reveals a
-    /// window it is about to give a folder to, so a window put back on screen
-    /// first appears in front of the user and is taken away again a moment
-    /// later, once the merge has turned it into a tab. While the window is still
-    /// off screen, that reveal happens out of sight. Whenever a merge is given
-    /// up on, Helper.ShowWindow puts the position Explorer meant back first, so
-    /// the folder can never be left off screen.
-    /// </summary>
-    public static void KeepOutOfTheWayIfUntouched(nint hWnd)
-    {
-        if (!HiddenWindows.TryGetValue(hWnd, out var state)) return;
-        if (!state.Parked || state.Hidden) return;
-
-        if (!WinApi.IsWindow(hWnd))
-            HiddenWindows.TryRemove(hWnd, out _);
-    }
-
-    public static string NormalizeLocation(string location)
-    {
-        if (location.IndexOf('%') > -1)
-            location = Environment.ExpandEnvironmentVariables(location);
-
-        if (location.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                location = new Uri(location).LocalPath;
-            }
-            catch
-            {
-                location = location.Substring("file:".Length);
-            }
-        }
-
-        if (location.StartsWith("::", StringComparison.Ordinal))
-            location = $"shell:{location}";
-        else if (location.StartsWith("{", StringComparison.Ordinal))
-            location = $"shell:::{location}";
-
-        location = location.Trim(' ', '/', '\\', '\n', '\'', '"');
-        return location.Replace('/', '\\');
-    }
-
-    public static string GetDefaultExplorerLocation(ShellPathComparer? shellPathComparer = null)
-    {
-        using var advancedKey = Registry.CurrentUser.OpenSubKey(
-            @"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
-        var id = advancedKey?.GetValue("LaunchTo") as int? ?? 1;
-
-        var location = id switch
-        {
-            2 => "shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", // Home / Quick Access
-            3 => "shell:::{088E3905-0323-4B02-9826-5D99428E115F}", // Downloads
-            4 => "shell:::{018D5C66-4533-4307-9B53-224DE2ED1FE6}", // OneDrive
-            _ => "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"  // This PC
-        };
-
-        if (shellPathComparer == null)
-            return location;
-
-        var pidl = shellPathComparer.GetPidlFromPath(location);
-        if (pidl == 0) return location;
-
-        try
-        {
-            var path = ShellPathComparer.GetPathFromPidl(pidl);
-            return NormalizeLocation(path ?? location);
-        }
-        finally
-        {
-            System.Runtime.InteropServices.Marshal.FreeCoTaskMem(pidl);
-        }
-    }
-
     public static Process? GetMainExplorerProcess()
     {
         Process? best = null;
@@ -444,34 +298,212 @@ public static class Helper
         var expectedPath = System.IO.Path.Combine(windowsFolder, "explorer.exe");
         var bestStart = DateTime.MaxValue;
 
-        foreach (var hWnd in WinApi.FindAllWindowsEx("Shell_TrayWnd"))
+        foreach (var hWnd in WinApi.FindAllWindowsEx("Shell_TrayWnd")) // Taskbar
         {
             if (WinApi.GetWindowThreadProcessId(hWnd, out var pid) <= 0) continue;
-
+        
             var processPath = WinApi.GetProcessPath((int)pid);
             if (!string.Equals(processPath, expectedPath, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             try
             {
+                // Pick the earliest start
                 var proc = Process.GetProcessById((int)pid);
                 if (proc.StartTime < bestStart)
                 {
                     bestStart = proc.StartTime;
-                    best?.Dispose();
                     best = proc;
                 }
-                else
-                {
-                    proc.Dispose();
-                }
             }
-            catch
+            catch { /* The Process might have terminated */ }
+        }
+        return best;
+    }
+    
+    public static void UpdateWindowLayered(nint hWnd, bool remove)
+    {
+        var exStyle = WinApi.GetWindowLong(hWnd, WinApi.GWL_EXSTYLE);
+        var isLayered = (exStyle & WinApi.WS_EX_LAYERED) != 0;
+        
+        if (remove && isLayered) // Remove
+            WinApi.SetWindowLong(hWnd, WinApi.GWL_EXSTYLE, exStyle & ~WinApi.WS_EX_LAYERED);
+        
+        if (!remove && !isLayered) // Add
+            WinApi.SetWindowLong(hWnd, WinApi.GWL_EXSTYLE, exStyle | WinApi.WS_EX_LAYERED);
+    }
+    public static void HideWindow(nint hWnd, bool keepTheme = false)
+    {
+        HiddenWindows.GetOrAdd(hWnd, static (hWnd, keepTheme) =>
+        {
+            if (keepTheme)
             {
-                // The process may have terminated.
+                WinApi.GetWindowRect(hWnd, out var originalPos);
+                HiddenWindows[hWnd] = originalPos;
+
+                // Move it off-screen
+                const uint flags = WinApi.SWP_HIDEWINDOW | WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_FRAMECHANGED;
+                WinApi.SetWindowPos(hWnd, 0, -32_000, -32_000, 0, 0, flags);
+                return originalPos;
             }
+
+            // Set the transparency (alpha value) of the window (0 = transparent, 255 = opaque)
+            UpdateWindowLayered(hWnd, remove: false);
+            WinApi.SetLayeredWindowAttributes(hWnd, 0, 0, WinApi.LWA_ALPHA);
+            return null;
+        }, keepTheme);
+    }
+    public static bool ShowWindow(nint hWnd, bool removeCache)
+    {
+        if (!HiddenWindows.TryGetValue(hWnd, out var originalPos))
+            return false;
+
+        if (removeCache)
+            HiddenWindows.TryRemove(hWnd, out _);
+
+        if (originalPos != null) // keep theme
+        {
+            const uint flags = WinApi.SWP_SHOWWINDOW | WinApi.SWP_NOSIZE | WinApi.SWP_NOZORDER | WinApi.SWP_NOACTIVATE | WinApi.SWP_FRAMECHANGED;
+            WinApi.SetWindowPos(hWnd, 0, originalPos.Value.Left, originalPos.Value.Top, 0, 0, flags);
+            return true;
         }
 
-        return best;
+        WinApi.SetLayeredWindowAttributes(hWnd, 0, 255, WinApi.LWA_ALPHA);
+        return true;
+    }
+
+    public static bool IsCtrlShiftDown()
+    {
+        if (_lastCtrlShiftCheckValue && Environment.TickCount - _lastCtrlShiftCheckAt < 1_000)
+            return true;
+        
+        _lastCtrlShiftCheckValue =
+            (KeyboardSimulator.IsKeyPressed((int)VirtualKey.LeftControl) || KeyboardSimulator.IsKeyPressed((int)VirtualKey.RightControl)) &&
+               (KeyboardSimulator.IsKeyPressed((int)VirtualKey.LeftShift) || KeyboardSimulator.IsKeyPressed((int)VirtualKey.RightShift));
+        
+        _lastCtrlShiftCheckAt = Environment.TickCount;
+        return _lastCtrlShiftCheckValue;
+    }
+    public static void BypassWinForegroundRestrictions()
+    {
+        // Simulate a key press to bypass the Foreground restriction
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow#remarks
+        KeyboardSimulator.SendKeyPress(VirtualKey.F23);
+    }
+
+    public static string NormalizeLocation(string location)
+    {
+        if (location.IndexOf('%') > -1)
+            location = Environment.ExpandEnvironmentVariables(location);
+
+        if (location.StartsWith("::", StringComparison.Ordinal))
+            location = $"shell:{location}";
+
+        else if (location.StartsWith("{", StringComparison.Ordinal))
+            location = $"shell:::{location}";
+
+        location = location.Trim(' ', '/', '\\', '\n', '\'', '"');
+
+        return location.Replace('/', '\\');
+    }
+    public static string GetDefaultExplorerLocation(ShellPathComparer? shellPathComparer = null)
+    {
+        var id = GetDefaultExplorerLaunchId();
+        var location = id switch
+        {
+            2 => "shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}",// Home, Quick Access
+            3 => "shell:::{088E3905-0323-4B02-9826-5D99428E115F}",// Downloads
+            4 => "shell:::{018D5C66-4533-4307-9B53-224DE2ED1FE6}",// OneDrive
+            _ => "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}" // This PC
+        };
+
+        if (shellPathComparer == null)
+            return location;
+
+        var pidl = shellPathComparer.GetPidlFromPath(location);
+        var path = ShellPathComparer.GetPathFromPidl(pidl); //SIGDN_URL: Downloads -> file:///C:/Users/Username/Downloads
+        Marshal.FreeCoTaskMem(pidl);
+
+        return NormalizeLocation(path ?? location);
+    }
+
+    public static string GetExecutablePath()
+    {
+        var processName = Process.GetCurrentProcess().MainModule?.FileName;
+        return processName is { Length: > 0 } ? processName : $"{AppDomain.CurrentDomain.FriendlyName}.exe";
+    }
+
+    /// <summary>
+    /// What the "open File Explorer to" setting says: 1 = This PC, 2 = Home.
+    /// Read straight from the registry, because it is the only place it lives.
+    /// </summary>
+    private static int GetDefaultExplorerLaunchId()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+            return key?.GetValue("LaunchTo") as int? ?? 1;
+        }
+        catch
+        {
+            return 1;
+        }
+    }
+
+    /// <summary>
+    /// Puts every window this app took off screen back on screen. Used when the
+    /// app exits, so a window it was holding can never outlive it.
+    /// </summary>
+    public static void RestoreAllHiddenWindows()
+    {
+        foreach (var hWnd in HiddenWindows.Keys.ToList())
+            ShowWindow(hWnd, removeCache: true);
+    }
+
+    public static async Task<List<SupporterInfo>> GetSupporters()
+    {
+        try
+        {
+            using var client = new System.Net.Http.HttpClient();
+            var svgContent = await client.GetStringAsync("https://cdn.jsdelivr.net/gh/w4po/sponsors/sponsors.svg");
+
+            var supporters = new List<SupporterInfo>();
+            var xmlDoc = new System.Xml.XmlDocument();
+            xmlDoc.LoadXml(svgContent);
+
+            // Find all <a> elements (supporters)
+            var linkNodes = xmlDoc.GetElementsByTagName("a");
+
+            foreach (System.Xml.XmlNode linkNode in linkNodes)
+            {
+                if (linkNode is not System.Xml.XmlElement linkElement)
+                    continue;
+
+                var href = linkElement.GetAttribute("href");
+                var id = linkElement.GetAttribute("id");
+
+                // Find the image element inside the link
+                var imageElements = linkElement.GetElementsByTagName("image");
+                if (imageElements.Count <= 0 || imageElements[0] is not System.Xml.XmlElement imageElement)
+                    continue;
+
+                var imageUrl = imageElement.GetAttribute("href");
+
+                supporters.Add(new SupporterInfo
+                {
+                    Name = string.IsNullOrWhiteSpace(id) ? "Unknown" : id,
+                    ProfileUrl = string.IsNullOrEmpty(href) ? string.Empty : href,
+                    ImageUrl = string.IsNullOrEmpty(imageUrl) ? string.Empty : imageUrl
+                });
+            }
+
+            return supporters;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error parsing SVG: {ex.Message}");
+            return [];
+        }
     }
 }

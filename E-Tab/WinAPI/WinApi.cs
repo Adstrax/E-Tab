@@ -1,67 +1,39 @@
+// ReSharper disable IdentifierTypo
+// ReSharper disable InconsistentNaming
+
 using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
 using System.Text;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using ETab.Interop;
+using ETab.Helpers;
 
 namespace ETab.WinAPI;
 
 public static class WinApi
 {
-    public const int EVENT_OBJECT_CREATE = 0x8000;
     public const int EVENT_OBJECT_SHOW = 0x8002;
-    public const int WM_COMMAND = 0x111;
-    public const int WM_HOTKEY = 0x312;
-    public const int WM_SYSCOMMAND = 0x0112;
 
-    /// <summary>
-    /// The command behind a window's own close button. Posted, it closes an
-    /// Explorer window without asking the shell to do anything, and so without
-    /// ever waiting for it.
-    /// </summary>
-    public const int SC_CLOSE = 0xF060;
-    public const uint MOD_ALT = 0x0001;
-    public const uint MOD_CONTROL = 0x0002;
-    public const uint MOD_SHIFT = 0x0004;
-    public const uint MOD_WIN = 0x0008;
-    public const uint VK_E = 0x45;
-    public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
-    public const int DWMWCP_ROUND = 2;
-    public const int SW_HIDE = 0;
+    public const int WM_COMMAND = 0x111; // Send a command
+
+    public const int SW_SHOWNOACTIVATE = 4; // Show window but not activated
+
     public const uint SWP_NOSIZE = 0x0001;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
-    public const int SW_SHOWNOACTIVATE = 4;
-    public const int SW_SHOWMINNOACTIVE = 7;
+    public const uint SWP_FRAMECHANGED = 0x0020;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SWP_HIDEWINDOW = 0x0080;
+
+    public const int GWL_EXSTYLE = -20; // Extended window style.
+    public const int WS_EX_LAYERED = 0x80000; // Layered window.
+    public const int LWA_ALPHA = 0x2; // Determine the opacity of a layered window
 
     public const uint SIGDN_URL = 0x80068000;
 
     [DllImport("user32.dll")]
-    public static extern nint SetWinEventHook(
-        uint eventMin,
-        uint eventMax,
-        nint hModWinEventProc,
-        WinEventDelegate lPfnWinEventProc,
-        uint idProcess,
-        uint idThread,
-        uint dwFlags);
-
-    [DllImport("user32.dll")]
-    public static extern bool RegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
-
-    [DllImport("user32.dll")]
-    public static extern bool UnregisterHotKey(nint hWnd, int id);
-
-    /// <summary>
-    /// The id of a window message that every application can agree on by name.
-    /// Windows broadcasts "TaskbarCreated" this way when Explorer starts, which
-    /// is the only signal an application gets that its notification icon is
-    /// gone: the icon belongs to the old taskbar and is not put back for it.
-    /// </summary>
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern int RegisterWindowMessage(string message);
-
-    [DllImport("dwmapi.dll", PreserveSig = true)]
-    public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+    public static extern nint SetWinEventHook(uint eventMin, uint eventMax, nint hModWinEventProc, WinEventDelegate lPfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
     [DllImport("user32.dll")]
     public static extern bool UnhookWinEvent(nint hWinEventHook);
@@ -70,76 +42,28 @@ public static class WinApi
     public static extern nint GetParent(nint hWnd);
 
     [DllImport("user32.dll", SetLastError = true)]
+    public static extern nint FindWindow(string lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern nint FindWindowEx(nint parentHandle, nint childAfter, string className, string? windowTitle);
+
+    [DllImport("user32.dll", ExactSpelling = true, EntryPoint = "MapVirtualKeyW")]
+    public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    public static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, [MarshalAs(UnmanagedType.LPArray), In] INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(nint hWnd, nint hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(nint handle, int nCmdShow);
 
-    public const uint PM_REMOVE = 0x0001;
-    public const uint QS_ALLINPUT = 0x04FF;
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MSG
-    {
-        public nint hwnd;
-        public uint message;
-        public nuint wParam;
-        public nint lParam;
-        public uint time;
-        public int ptX;
-        public int ptY;
-        public uint lPrivate;
-    }
-
-    [DllImport("user32.dll")]
-    public static extern bool PeekMessage(out MSG msg, nint hWnd, uint filterMin, uint filterMax, uint removeMsg);
-
-    [DllImport("user32.dll")]
-    public static extern bool TranslateMessage(ref MSG msg);
-
-    [DllImport("user32.dll")]
-    public static extern nint DispatchMessage(ref MSG msg);
-
-    /// <summary>
-    /// Waits for any of the handles, for a message to arrive in this thread's
-    /// queue, or for the timeout - whichever comes first. A thread that owns COM
-    /// objects has to keep its message queue serviced, because calls from other
-    /// threads are delivered through that queue.
-    /// </summary>
-    [DllImport("user32.dll")]
-    public static extern uint MsgWaitForMultipleObjectsEx(uint count, nint[] handles, uint milliseconds, uint wakeMask, uint flags);
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool SetWindowPos(nint hWnd, nint hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
-
-    public const int SM_XVIRTUALSCREEN = 76;
-    public const int SM_YVIRTUALSCREEN = 77;
-    public const int SM_CXVIRTUALSCREEN = 78;
-    public const int SM_CYVIRTUALSCREEN = 79;
-
-    [DllImport("user32.dll")]
-    public static extern int GetSystemMetrics(int nIndex);
-
     [DllImport("user32.dll")]
     public static extern bool IsIconic(nint handle);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(nint handle);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsWindow(nint handle);
 
     [DllImport("user32.dll")]
     public static extern nint GetForegroundWindow();
@@ -148,29 +72,41 @@ public static class WinApi
     public static extern bool SetForegroundWindow(nint hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern int GetWindowLong(nint hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    public static extern int SetWindowLong(nint hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetLayeredWindowAttributes(nint hWnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("user32.dll")]
     public static extern uint RealGetWindowClass(nint hwnd, StringBuilder pszType, uint cchType);
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    public static extern nint SendMessage(nint hWnd, uint msg, nint wParam, nint lParam);
+    public static extern nint SendMessage(nint hWnd, uint Msg, nint wParam, nint lParam);
 
     [return: MarshalAs(UnmanagedType.Bool)]
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    public static extern bool PostMessage(nint hWnd, uint msg, nint wParam, nint lParam);
-
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern int GetWindowText(nint hWnd, StringBuilder lpString, int nMaxCount);
-
+    public static extern bool PostMessage(nint hWnd, uint Msg, nint wParam, nint lParam);
+    
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(nint hWnd, out uint lpdwProcessId);
-
+    
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nint OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
-
+    
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(nint hObject);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern bool QueryFullProcessImageName(nint hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
+    
+    [DllImport("shell32.dll", SetLastError = true)]
+    public static extern int SHOpenFolderAndSelectItems(nint pidlFolder, uint cIdl, [In, MarshalAs(UnmanagedType.LPArray)] nint[] apidl, uint dwFlags);
 
     [DllImport("shell32.dll")]
     public static extern int SHGetDesktopFolder(out nint ppshf);
@@ -178,76 +114,41 @@ public static class WinApi
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     public static extern int SHGetNameFromIDList(nint pidl, uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string? ppszName);
 
-    private delegate bool EnumWindowsProc(nint hWnd, nint lParam);
+    [DllImport("oleacc.dll")]
+    public static extern nint AccessibleObjectFromPoint(Point pt, [Out, MarshalAs(UnmanagedType.Interface)] out IAccessible accObj, [Out] out object ChildID);
 
-    [DllImport("user32.dll")]
-    private static extern bool EnumWindows(EnumWindowsProc callback, nint lParam);
-
-    [DllImport("user32.dll")]
-    private static extern bool EnumChildWindows(nint parent, EnumWindowsProc callback, nint lParam);
-
-    /// <summary>
-    /// Every window of a class: the top-level ones when no parent is given, and
-    /// everything below a window otherwise - at any depth.
-    ///
-    /// The depth matters. Explorer's tab windows are not always direct children
-    /// of the frame: while a window is new they are, and once it has been around
-    /// for a while Explorer moves them one level down. Looking only at direct
-    /// children found no tabs at all in the windows that had been open longest,
-    /// which made this app read a window with twelve tabs as one with none: it
-    /// picked the wrong window to merge folders into, could not find a tab that
-    /// was already showing a folder, and could not tell whether switching tabs
-    /// had worked.
-    /// </summary>
     public static IEnumerable<nint> FindAllWindowsEx(string className, nint parent = 0, string? windowTitle = null)
     {
-        var found = new List<nint>();
-
-        if (parent == 0)
+        nint handle = 0;
+        do
         {
-            if (windowTitle == null)
-            {
-                EnumWindows((hWnd, _) =>
-                {
-                    if (IsWindowHasClassName(hWnd, className)) found.Add(hWnd);
-                    return true;
-                }, 0);
-            }
-            else
-            {
-                nint handle = 0;
-                do
-                {
-                    handle = FindWindowEx(0, handle, className, windowTitle);
-                    if (handle != 0) found.Add(handle);
-                } while (handle != 0);
-            }
-        }
-        else
-        {
-            EnumChildWindows(parent, (hWnd, _) =>
-            {
-                if (IsWindowHasClassName(hWnd, className)) found.Add(hWnd);
-                return true;
-            }, 0);
-        }
+            handle = FindWindowEx(parent, handle, className, windowTitle);
 
-        return found;
+            if (handle == 0) continue;
+
+            yield return handle;
+
+        } while (handle != 0);
     }
 
     /// <summary>
-    /// Best-effort "bring this window to the front", without synthetic input.
-    ///
-    /// The previous implementation sent a fake F23 key press system-wide to
-    /// defeat the foreground lock, which could disturb whatever the user was
-    /// typing into. When Windows denies the request the Z-order is left alone.
+    /// Restores the specified window to the foreground even if it was minimized.
     /// </summary>
-    public static bool TryActivate(nint window)
+    /// <param name="window">The handle to the window that needs to be restored to the foreground.</param>
+    public static void RestoreWindowToForeground(nint window)
     {
-        if (window == 0 || !IsWindow(window)) return false;
+        //If Minimized
         if (IsIconic(window))
+        {
+            // Show the window but don't activate it, SetForegroundWindow is going to activate it. 
             ShowWindow(window, SW_SHOWNOACTIVATE);
-        return SetForegroundWindow(window);
+        }
+
+        if (SetForegroundWindow(window)) return;
+
+        Helper.BypassWinForegroundRestrictions();
+
+        SetForegroundWindow(window);
     }
 
     public static string GetWindowClassName(nint hWnd, int maxClassNameLength = 254)
@@ -256,58 +157,22 @@ public static class WinApi
 
         var className = new StringBuilder(maxClassNameLength + 1);
         RealGetWindowClass(hWnd, className, (uint)className.Capacity);
+
         return className.ToString();
     }
-
-    /// <summary>
-    /// Title of a window - for an Explorer tab window that is the name of the
-    /// page the tab is showing, which makes this a cheap way to see whether a
-    /// tab has finished loading the folder it was sent to.
-    /// </summary>
-    public static string GetWindowTitle(nint hWnd, int maxLength = 512)
-    {
-        if (hWnd == 0) return string.Empty;
-
-        var title = new StringBuilder(maxLength + 1);
-        var length = GetWindowText(hWnd, title, title.Capacity);
-        return length > 0 ? title.ToString() : string.Empty;
-    }
-
     public static bool IsWindowHasClassName(nint hWnd, string className, StringComparison comparison = StringComparison.OrdinalIgnoreCase)
     {
         var currentClassName = GetWindowClassName(hWnd, className.Length);
+
         return string.Equals(currentClassName, className, comparison);
     }
-
-    [DllImport("kernel32.dll")]
-    private static extern nint GetCurrentProcess();
-
-    [DllImport("psapi.dll")]
-    private static extern bool EmptyWorkingSet(nint hProcess);
-
-    /// <summary>
-    /// Hands idle, private working-set pages back to the OS. Called only while
-    /// the app is idle; it lowers the Working Set shown in Task Manager without
-    /// affecting the app's behavior (pages are re-faulted on next access).
-    /// </summary>
-    public static void TrimWorkingSet()
-    {
-        try
-        {
-            EmptyWorkingSet(GetCurrentProcess());
-        }
-        catch
-        {
-            // Best effort: trimming memory must never throw.
-        }
-    }
-
+    
     public static string? GetProcessPath(int pid)
     {
-        const uint processQueryLimitedInformation = 0x1000;
-        var procHandle = OpenProcess(processQueryLimitedInformation, false, (uint)pid);
+        const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        var procHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
         if (procHandle == 0) return null;
-
+        
         try
         {
             var capacity = 260;
@@ -319,4 +184,40 @@ public static class WinApi
             CloseHandle(procHandle);
         }
     }
+
+    // ---- the tray icon's own needs -------------------------------------
+
+    public const int WM_HOTKEY = 0x0312;
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(nint hWnd);
+
+    /// <summary>
+    /// True when Windows is showing the window at this moment - it is not
+    /// minimized away or hidden. A minimized window still counts as visible.
+    /// </summary>
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(nint hWnd);
+
+    public const uint MOD_CONTROL = 0x0002;
+    public const uint MOD_SHIFT = 0x0004;
+    public const uint VK_E = 0x45;
+    public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    public const int DWMWCP_ROUND = 2;
+
+    [DllImport("user32.dll")]
+    public static extern bool RegisterHotKey(nint hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnregisterHotKey(nint hWnd, int id);
+
+    /// <summary>
+    /// The id of a window message every application agrees on by name. Windows
+    /// broadcasts "TaskbarCreated" this way when Explorer starts, which is the
+    /// only signal an application gets that its notification icon is gone.
+    /// </summary>
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int RegisterWindowMessage(string message);
+
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 }

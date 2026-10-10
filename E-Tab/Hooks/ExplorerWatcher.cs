@@ -1,1880 +1,176 @@
+using Shell32;
+using SHDocVw;
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
+using System.Windows;
 using System.Threading;
+using System.Diagnostics;
 using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using ETab.Helpers;
 using ETab.Interop;
+using ETab.Managers;
 using ETab.Models;
 using ETab.WinAPI;
 
 namespace ETab.Hooks;
 
-public sealed class ExplorerWatcher : IDisposable
+using WindowEntry = DualKeyEntry<InternetExplorer, nint?, WindowInfo>;
+
+public class ExplorerWatcher : IHook
 {
-    private const string ControlPanelLocation = "shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}";
-    private static Guid ShellBrowserGuid = typeof(IShellBrowser).GUID;
-    private const int FastPollMs = 200;
-    private const int IdlePollMs = 1000;
-    private const int FastPollDurationMs = 3000;
-    private const int FullShellPollIntervalMs = 5000;
-    /// <summary>
-    /// How often the shell is checked while Explorer is holding a window of its
-    /// own that the next folder can land in. Such a window comes on screen the
-    /// moment it is given a folder, so it is looked at more often than
-    /// everything else. The check is a window enumeration and knows nothing
-    /// about the shell, so it costs almost nothing.
-    /// </summary>
-    private const int SparePollMs = 300;
-    /// <summary>
-    /// A merge that has not moved on for this long is stuck: one of the calls
-    /// into Explorer never came back. The window is then handed back to the
-    /// user, so a folder can never end up with neither a window nor a tab to
-    /// show for it.
-    /// </summary>
-    private const int MergeStuckMs = 6000;
-    /// <summary>
-    /// The longest a merge waits for its turn at the tab creation step, no
-    /// matter how much the queue in front of it keeps moving.
-    /// </summary>
-    private const int TabCreationGiveUpMs = 30_000;
-    /// <summary>
-    /// How often the shell is asked whether the new tab has registered yet. The
-    /// look is a handful of calls on one thread, so it can be much more often
-    /// than the old "when the count changes, or every quarter second" - which
-    /// is what made a folder wait for an entry that had been there for a while.
-    /// </summary>
-    private const int ItemLookMs = 40;
-    /// <summary>
-    /// The same, while several merges are running at once. They all take their
-    /// turn on one thread and on one shell, so looking this often for each of
-    /// them would crowd out the very work they are all waiting for.
-    /// </summary>
-    private const int ItemLookBusyMs = 150;
-    /// <summary>
-    /// A full pass over every open tab, in case the new entry did not land at
-    /// the end of the list. Rare on purpose: it is the expensive one.
-    /// </summary>
-    private const int ItemFullLookMs = 500;
-    /// <summary>
-    /// How long a merge waits for Explorer to register the tab it asked for.
-    /// Explorer is often busy at exactly this moment - several folders opened in
-    /// a row is the same as a burst of tabs - and giving up here handed the
-    /// folder back as a window of its own, or as nothing at all when the folder
-    /// was only being pointed at.
-    /// </summary>
-    private const int TabRegistrationWaitMs = 25_000;
-    /// <summary>
-    /// A merge that has not moved from its current step for this long is handed
-    /// back even if other merges are still getting through. Without this, one
-    /// merge could wait quietly forever while the others worked, and the folder
-    /// it was holding would never appear - as a window or as a tab. Every step
-    /// except waiting for the tab queue should take a fraction of a second, so
-    /// this limit is short; the tab queue is what TabCreationGiveUpMs is for.
-    /// </summary>
-    private const int MergeHardStuckMs = 12_000;
-    /// <summary>
-    /// However long a merge takes, this is the end of it: the window is put
-    /// back on screen and the log says which step it was in. Nothing may stay
-    /// quiet for longer than this - that used to be a folder nobody could see.
-    /// </summary>
-    private const int MergeDeadlineMs = 45_000;
-    /// <summary>
-    /// The step a merge sits in while it waits its turn at the tab creation
-    /// step, where a wait is normal and only the queue moving matters.
-    /// </summary>
-    private const string TabStepStage = "asking Explorer for a new tab";
-    private const double IdleTrimAfterSeconds = 90;
-    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(30);
+    private static bool _instanceRunning;
+    private static Guid _shellBrowserGuid = typeof(IShellBrowser).GUID;
 
-    private readonly SynchronizationContext _syncContext;
-    private readonly object _itemsLock = new();
-    private readonly object _processLock = new();
-    private readonly Dictionary<nint, WindowInfo> _tabInfos = new();
-    private readonly ConcurrentDictionary<nint, object> _tabToItem = new();
-
-    /// <summary>
-    /// Every File Explorer window that is none of this app's business: the ones
-    /// the user already had open when it started, and the ones it has looked at
-    /// and left alone since.
-    ///
-    /// A window only ends up here once this app has seen what is in it. A window
-    /// whose folder the shell cannot be asked about yet is not written off - it
-    /// keeps its place until the folder is there. Writing a window off before
-    /// that is what made a folder stay a window of its own at random: the window
-    /// it was opened in had already been given up on.
-    /// </summary>
-    private readonly HashSet<nint> _leftAlone = new();
-
-    /// <summary>Windows that were already open when this app started.</summary>
-    private readonly HashSet<nint> _windowsAtStartup = new();
-
-    /// <summary>
-    /// Windows this app has taken on and is still waiting for a folder in, with
-    /// the title each of them carried when it was taken on. Explorer gives a
-    /// window the name of the folder it is showing, so the title is what says
-    /// whether the folder has arrived.
-    /// </summary>
-    private readonly Dictionary<nint, string> _candidates = new();
-
-    /// <summary>
-    /// When to stop waiting for a window that is on screen and still shows
-    /// nothing but Explorer's own page. A window like that is one this app could
-    /// merge the moment a folder lands in it, and on Windows 11 the folder
-    /// regularly arrives a moment after the window does - but a window left like
-    /// that for a long time is the user's own, and it is let go of. Windows
-    /// Explorer is holding back have no deadline: those wait for the next folder
-    /// however long it takes.
-    /// </summary>
-    private readonly Dictionary<nint, long> _candidateUntil = new();
-
-    private const int ScreenSpareWatchMs = 60_000;
-    /// <summary>
-    /// How long a folder waits for a window to merge into before it is left as
-    /// its own. Explorer regularly has that window off screen for a moment right
-    /// as a folder is opened, so this is waited out rather than given up on.
-    /// </summary>
-    private const int NoHostWaitMs = 5_000;
-
-    private readonly HashSet<nint> _pendingConversions = new();
-
-    /// <summary>
-    /// The merges that are running, with the step each of them is on. Kept for
-    /// the watchdog below.
-    /// </summary>
-    private readonly List<(nint Hwnd, MergeStep Step)> _runningMerges = new();
-    private Thread? _mergeWatchdogThread;
-
-    /// <summary>
-    /// Where a merge is right now, so a merge that gets stuck can name the step
-    /// it is waiting in instead of ending up as silence in the log.
-    /// </summary>
-    private sealed class MergeStep
-    {
-        private readonly nint _hwnd;
-        private readonly long _startedTicks = Stopwatch.GetTimestamp();
-        private long _changedTicks = Stopwatch.GetTimestamp();
-        private string _stage = "starting";
-        private int _reported;
-        private int _abandoned;
-
-        public MergeStep(nint hwnd) => _hwnd = hwnd;
-
-        /// <summary>True once this merge has been handed back to the user.</summary>
-        public bool Abandoned => Volatile.Read(ref _abandoned) == 1;
-
-        public void MarkAbandoned() => Interlocked.Exchange(ref _abandoned, 1);
-
-        /// <summary>True when this merge has been running for longer than that.</summary>
-        public bool OlderThan(int ms)
-            => Stopwatch.GetTimestamp() - _startedTicks > Stopwatch.Frequency * ms / 1000;
-
-
-        public string Stage => _stage;
-
-        /// <summary>True when this step has not moved on for the given time.</summary>
-        public bool StaleFor(int ms)
-            => Stopwatch.GetTimestamp() - Interlocked.Read(ref _changedTicks)
-               > Stopwatch.Frequency * ms / 1000;
-
-        public bool TryClaimReport() => Interlocked.Exchange(ref _reported, 1) == 0;
-
-        public long AgeMs => (long)Stopwatch.GetElapsedTime(_startedTicks).TotalMilliseconds;
-
-        public void Set(string stage)
-        {
-            _stage = stage;
-            Interlocked.Exchange(ref _changedTicks, Stopwatch.GetTimestamp());
-            ExplorerWatcher.NoteMergeProgress();
-            Log.Info($"Merge of 0x{_hwnd:X}: {stage} (+{AgeMs} ms)");
-        }
-    }
-
-    /// <summary>
-    /// The last moment any merge moved on. Waiting its turn behind other
-    /// merges is normal and can take seconds when several folders are opened
-    /// one after another, so a merge is only ever treated as stuck when
-    /// nothing at all has moved - which is what a call into Explorer that
-    /// never comes back looks like.
-    /// </summary>
-    private static long _lastMergeProgressTicks = Stopwatch.GetTimestamp();
-
-    private static void NoteMergeProgress() => Interlocked.Exchange(ref _lastMergeProgressTicks, Stopwatch.GetTimestamp());
-
-    private static bool NothingMovedFor(int ms)
-        => Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastMergeProgressTicks)
-           > Stopwatch.Frequency * ms / 1000;
-    private readonly SemaphoreSlim _toOpenWindowsLock = new(1, 1);
-    private readonly StaTaskScheduler _staTaskScheduler;
-    private readonly StaTaskScheduler _conversionStaTaskScheduler;
-
-    private object? _shellApp;
-    /// <summary>
-    /// The shell object the merge thread owns itself.
-    ///
-    /// A shell object created on one thread can only be used from another
-    /// through that thread's message queue, so a merge that reached for the
-    /// object this app's poll owns had to wait for the poll to be free - which
-    /// it often was not, because a poll pass is a full walk of every open tab.
-    /// That wait is what the merge paid on every look for the new tab, tens of
-    /// times per folder. This object belongs to the merge thread, so its calls
-    /// are answered on the spot.
-    /// </summary>
-    private object? _conversionShellApp;
-    private ShellPathComparer? _shellPathComparer;
-    private string _defaultLocation = string.Empty;
+    private ShellWindows _shellWindows = null!;
+    private ShellPathComparer _shellPathComparer = null!;
+    private StaTaskScheduler _staTaskScheduler = null!;
     private nint _mainWindowHandle;
+    private readonly ConcurrentDictionary<nint, byte> _processedHWnds = new();
+    private readonly DualKeyDictionary<InternetExplorer, nint?, WindowInfo> _windowEntryDict = [];
+    private readonly List<WindowRecord> _closedWindows = new();
+    private readonly object _windowEntryDictLock = new(), _closedWindowsLock = new(), _processLock = new();
+    private readonly SemaphoreSlim _toOpenWindowsLock = new(1);
+    private readonly ProcessWatcher _processWatcher;
     private int _mainExplorerProcessId;
-    private Process? _mainExplorerProcess;
     private Timer? _explorerCheckTimer;
-    private Timer? _pollTimer;
-    private nint _eventObjectCreateHookId;
+
     private nint _eventObjectShowHookId;
-    private WinEventDelegate? _eventObjectCreateHookCallback;
     private WinEventDelegate? _eventObjectShowHookCallback;
-    private int _polling;
-    // Guards the periodic Explorer check against overlapping ticks.
-    private int _explorerCheckBusy;
-    private long _fastPollUntilTicks;
-    private long _lastFullShellPollTicks;
-    private long _lastActivityTicks;
-    private Timer? _maintenanceTimer;
-    private readonly object _tabWaitLock = new();
-    private readonly Dictionary<nint, List<TabWaitRequest>> _tabWaiters = new();
+    private DShellWindowsEvents_WindowRegisteredEventHandler? _windowRegisteredHandler;
 
-    private volatile bool _autoMerge = Settings.AutoMerge;
-
-    public bool AutoMerge
-    {
-        get => _autoMerge;
-        set
-        {
-            _autoMerge = value;
-            try { Settings.AutoMerge = value; }
-            catch (Exception ex) { Log.Warn("Failed to persist AutoMerge: " + ex.Message); }
-        }
-    }
-
-    private bool _disposed;
+    private string _defaultLocation = null!;
+    private bool _reuseTabs = true;
+    private bool _isForcingTabs;
+    public bool IsHookActive => _isForcingTabs;
+    public event Action? OnShellInitialized;
 
     public ExplorerWatcher()
     {
-        _syncContext = SynchronizationContext.Current
-                       ?? throw new InvalidOperationException("ExplorerWatcher must be created on a UI thread.");
-        _staTaskScheduler = new StaTaskScheduler("Shell poll STA");
-        // Conversions get their own STA thread so they never queue behind the
-        // periodic shell polls, which can hold the shared STA thread for tens
-        // of milliseconds per full enumeration.
-        _conversionStaTaskScheduler = new StaTaskScheduler("Conversion STA");
+        if (_instanceRunning)
+            throw new InvalidOperationException("Only one instance of ExplorerWatcher is allowed at a time.");
+        _instanceRunning = true;
+
+        _processWatcher = new ProcessWatcher("explorer");
+        _processWatcher.ProcessTerminated += OnExplorerProcessTerminated;
         StartExplorerProcessCheck();
-        _lastActivityTicks = Stopwatch.GetTimestamp();
-        StartMemoryMaintenance();
     }
 
-    private void CheckForMainExplorer(object? state)
+    public void StartHook()
     {
-        if (_disposed) return;
-
-        // Ticks are one second apart and the first shell snapshot can take
-        // longer than that, so two ticks used to be able to overlap: the
-        // second one saw "process id known, Process object not attached yet"
-        // and read that as "Explorer died", which reset the watcher and put
-        // every hidden window back on screen. Only one check runs at a time.
-        if (Interlocked.CompareExchange(ref _explorerCheckBusy, 1, 0) != 0) return;
-        try
-        {
-            CheckForMainExplorerCore();
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _explorerCheckBusy, 0);
-        }
+        if (_isForcingTabs) return;
+        _isForcingTabs = true;
+        SettingsManager.AutoMerge = true;
     }
 
-    private void CheckForMainExplorerCore()
+    public void StopHook()
     {
-        // Once the main explorer process is known, the periodic check is just
-        // a cheap liveness probe: Process.Exited normally notifies instantly,
-        // but this catches the rare case where the event is missed (or its
-        // subscription failed).
-        lock (_processLock)
-        {
-            if (_mainExplorerProcessId != 0)
-            {
-                // The Process object is attached only after the first shell
-                // snapshot has been taken. "No object yet" means this check is
-                // still initializing, not that Explorer exited.
-                if (_mainExplorerProcess is not { } current) return;
-
-                bool exited;
-                try
-                {
-                    exited = current.HasExited;
-                }
-                catch
-                {
-                    // The Process object can be in an inconsistent state after
-                    // Explorer terminates.
-                    exited = true;
-                }
-
-                if (!exited) return;
-                HandleMainExplorerTerminated();
-                return;
-            }
-        }
-
-        var process = Helper.GetMainExplorerProcess();
-        if (process == null) return;
-
-        lock (_processLock)
-        {
-            if (_mainExplorerProcessId != 0)
-            {
-                process.Dispose();
-                return;
-            }
-
-            _mainExplorerProcessId = process.Id;
-        }
-
-        try
-        {
-            RunInStaThread(InitializeShellObjects).GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            Log.Error("Failed to initialize shell objects.", ex);
-            lock (_processLock)
-                _mainExplorerProcessId = 0;
-            process.Dispose();
-            return;
-        }
-
-        lock (_processLock)
-        {
-            _mainExplorerProcess?.Dispose();
-            _mainExplorerProcess = process;
-            try
-            {
-                process.EnableRaisingEvents = true;
-                process.Exited += OnMainExplorerExited;
-            }
-            catch
-            {
-                // Exit-event subscription is best effort; the periodic liveness
-                // check above still detects Explorer termination.
-            }
-        }
-
-        // Install the WinEvent hooks on the UI thread. Out-of-context hook
-        // callbacks are delivered on the thread that registered the hook, and
-        // that thread must pump Windows messages. The WPF UI thread does, while
-        // the dedicated STA scheduler thread does not (which previously left
-        // these callbacks undelivered).
-        _syncContext.Post(_ => InstallWinEventHooks(), null);
-    }
-
-    private void InitializeShellObjects()
-    {
-        _shellPathComparer = new ShellPathComparer();
-        _shellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
-        _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
-
-        PollShellCore(convertNewWindows: false);
-        _fastPollUntilTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FastPollDurationMs / 1000;
-        _pollTimer = new Timer(PollShell, null, 0, FastPollMs);
-        Log.Info($"Explorer watcher initialized (explorer PID {_mainExplorerProcessId}).");
-    }
-
-    private void InstallWinEventHooks()
-    {
-        if (_disposed) return;
-        if (_eventObjectCreateHookId != 0 || _eventObjectShowHookId != 0) return;
-
-        _eventObjectCreateHookCallback = OnWindowShown;
-        _eventObjectCreateHookId = WinApi.SetWinEventHook(
-            WinApi.EVENT_OBJECT_CREATE,
-            WinApi.EVENT_OBJECT_CREATE,
-            0,
-            _eventObjectCreateHookCallback,
-            0,
-            0,
-            0);
-
-        _eventObjectShowHookCallback = OnWindowShown;
-        _eventObjectShowHookId = WinApi.SetWinEventHook(
-            WinApi.EVENT_OBJECT_SHOW,
-            WinApi.EVENT_OBJECT_SHOW,
-            0,
-            _eventObjectShowHookCallback,
-            0,
-            0,
-            0);
-    }
-
-    private void PollShell(object? state)
-    {
-        if (_disposed || _shellApp == null) return;
-        if (Interlocked.CompareExchange(ref _polling, 1, 0) != 0) return;
-
-        try
-        {
-            RunInStaThread(() => PollShellCore()).GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"Shell poll failed: {ex.Message}");
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _polling, 0);
-            AdjustPollInterval();
-        }
-    }
-
-    private void RequestFastPoll()
-    {
-        _fastPollUntilTicks = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FastPollDurationMs / 1000;
-        try
-        {
-            _pollTimer?.Change(FastPollMs, FastPollMs);
-        }
-        catch
-        {
-            // The timer may already be disposed during shutdown.
-        }
-    }
-
-    private void AdjustPollInterval()
-    {
-        if (_disposed || _pollTimer == null) return;
-
-        var fast = Stopwatch.GetTimestamp() < _fastPollUntilTicks;
-        // A window Explorer is holding back can be given a folder at any
-        // moment, and it comes on screen as soon as that happens. Those windows
-        // are checked more often than the idle rate, so the folder is turned
-        // into a tab before the user has time to see the window at all.
-        var interval = fast ? FastPollMs : _candidates.Count > 0 ? SparePollMs : IdlePollMs;
-        try
-        {
-            _pollTimer.Change(interval, interval);
-        }
-        catch
-        {
-            // The timer may already be disposed during shutdown.
-        }
-    }
-
-    private void PollShellCore(bool convertNewWindows = true)
-    {
-        if (_shellApp == null) return;
-
-        var currentTopLevel = WinApi.FindAllWindowsEx("CabinetWClass").ToHashSet();
-
-        if (!convertNewWindows)
-        {
-            // First look at the desktop: every window that is open belongs to
-            // the user, and is left alone from here on.
-            lock (_itemsLock)
-            {
-                _windowsAtStartup.Clear();
-                _windowsAtStartup.UnionWith(currentTopLevel);
-                _leftAlone.Clear();
-                _leftAlone.UnionWith(currentTopLevel);
-                _candidates.Clear();
-                _candidateUntil.Clear();
-
-                // A window that is not on screen was not opened by the user:
-                // Explorer keeps spare windows of its own around, and one of
-                // those is what the next folder is opened in. They are taken on
-                // the moment a folder lands in one of them.
-                foreach (var hwnd in currentTopLevel.Where(h => !WinApi.IsWindowVisible(h)))
-                {
-                    _leftAlone.Remove(hwnd);
-                    _candidates[hwnd] = WinApi.GetWindowTitle(hwnd);
-                }
-            }
-        }
-        else if (AutoMerge)
-        {
-            // A File Explorer window that appeared while this app was running is
-            // one Explorer opened for a folder - or one of its own spare windows
-            // being handed a folder. Either way the folder belongs in a tab, so
-            // the window is taken on here and looked at until the folder is in
-            // it. Nothing is decided about a window before that: it is the
-            // window written off too early that left a folder as a window of its
-            // own while every other folder became a tab.
-            lock (_itemsLock)
-            {
-                foreach (var hwnd in currentTopLevel)
-                {
-                    if (_leftAlone.Contains(hwnd)) continue;
-                    if (_candidates.ContainsKey(hwnd)) continue;
-                    if (_pendingConversions.Contains(hwnd)) continue;
-                    _candidates[hwnd] = WinApi.GetWindowTitle(hwnd);
-                }
-            }
-        }
-
-        // The ShellWindows COM snapshot is the most expensive step: it costs
-        // several COM round-trips per open tab. It is what says which folder a
-        // window is showing, so it runs while a window is waiting for its folder
-        // - the only moment its answer decides anything - or every few seconds
-        // to keep the tab bookkeeping fresh, instead of on every poll.
-        bool fullPassNeeded;
-        lock (_itemsLock)
-        {
-            fullPassNeeded = !convertNewWindows ||
-                             _candidates.Count > 0 ||
-                             Helper.IsTimeUp(_lastFullShellPollTicks, FullShellPollIntervalMs) ||
-                             currentTopLevel.Any(h => !_leftAlone.Contains(h));
-        }
-
-        var currentItems = new List<(object Item, nint Hwnd)>();
-        if (fullPassNeeded)
-        {
-            _lastFullShellPollTicks = Stopwatch.GetTimestamp();
-            try
-            {
-                dynamic windows = ((dynamic)_shellApp).Windows();
-                var count = (int)windows.Count;
-                for (var i = 0; i < count; i++)
-                {
-                    object item;
-                    try
-                    {
-                        item = (object)windows.Item(i);
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-
-                    var hwnd = GetWindowHandle(item);
-                    if (hwnd != 0)
-                        currentItems.Add((item, hwnd));
-                }
-            }
-            catch
-            {
-                // ShellWindows can be temporarily unavailable during Explorer restart.
-            }
-        }
-
-        var mainBefore = _mainWindowHandle;
-        nint mainAfter;
-        lock (_itemsLock)
-        {
-            _leftAlone.RemoveWhere(h => !currentTopLevel.Contains(h));
-            foreach (var gone in _candidates.Keys.Where(h => !currentTopLevel.Contains(h)).ToList())
-            {
-                _candidates.Remove(gone);
-                _candidateUntil.Remove(gone);
-            }
-
-            if (fullPassNeeded)
-            {
-                var currentTabHandles = new HashSet<nint>();
-                foreach (var (item, hwnd) in currentItems)
-                {
-                    var tabHandle = GetTabHandle(item);
-                    if (tabHandle == 0) continue;
-                    currentTabHandles.Add(tabHandle);
-
-                    if (_tabInfos.TryGetValue(tabHandle, out var info))
-                    {
-                        info.WindowHandle = hwnd;
-                        info.TabHandle = tabHandle;
-
-                        // A tab that was still coming up when it first appeared
-                        // may have shown no folder at all. It is looked at again
-                        // here, because a tab whose folder stays unknown is a
-                        // folder that cannot be found again: opening it a second
-                        // time opened another tab for it instead of going back.
-                        if (info.Location == null || info.WindowHandle != hwnd)
-                        {
-                            var locationNow = TryGetLocation(item);
-                            if (locationNow != null) info.Location = locationNow;
-                        }
-                        continue;
-                    }
-
-                    // The folder this tab shows is read here rather than left
-                    // for a merge to look up later. This pass owns the shell
-                    // items it just enumerated, so the read is a local call; a
-                    // merge runs on another thread, and reading these items from
-                    // there would have to go through this thread's queue - which
-                    // is busy exactly when many folders are opened at once, the
-                    // moment a merge needs the answer most.
-                    _tabInfos[tabHandle] = new WindowInfo
-                    {
-                        WindowHandle = hwnd,
-                        TabHandle = tabHandle,
-                        Location = TryGetLocation(item)
-                    };
-                }
-
-                // What this app knows about the open tabs is only pruned when the
-                // shell actually answered. An answer of "no tabs at all" while
-                // there are still File Explorer windows on screen is a shell that
-                // did not answer properly - Explorer restarting, or too busy - and
-                // pruning on it threw away every tab this app knew: a folder that
-                // was already open then looked like one it had never seen, and
-                // opening it again opened a second tab for it.
-                // A tab is forgotten only when its window is really gone. Pruning
-                // on what a pass happened to return threw away tabs that were
-                // open: while a window is being created the shell can answer with
-                // a part of the list, and the tabs left out of it looked closed.
-                // A folder that was open then looked like one this app had never
-                // seen, so opening it opened a second tab for it instead of going
-                // back to the tab it had.
-                var forgotten = 0;
-                foreach (var staleTab in _tabInfos.Keys.Where(k => !WinApi.IsWindow(k)).ToList())
-                {
-                    _tabToItem.TryRemove(staleTab, out _);
-                    _tabInfos.Remove(staleTab);
-                    forgotten++;
-                }
-                if (forgotten > 0)
-                    Log.Info($"Forgot {forgotten} tab(s) whose window is gone; {_tabInfos.Count} tab(s) left in the bookkeeping.");
-            }
-
-            // The window the folders gather in is only given up when it is
-            // really gone. Dropping it because it was not on screen at this
-            // instant - Explorer hides windows of its own, and this app hides
-            // the window a folder is being moved out of - is what made folders
-            // start gathering in a fresh one- or two-tab window every few
-            // clicks, with the window that had all of them still right there.
-            if (currentTopLevel.Count == 0)
-                _mainWindowHandle = 0;
-            else if (!WinApi.IsWindow(_mainWindowHandle) || Helper.IsParkedOffScreen(_mainWindowHandle))
-                _mainWindowHandle = GetMainWindowHWnd(0);
-            mainAfter = _mainWindowHandle;
-        }
-
-        // Each window that is waiting for its folder is looked at here, with the
-        // shell's own answer about it in hand - which is what the reference
-        // implementation gets from the shell telling it a window was registered.
-        if (convertNewWindows && AutoMerge)
-        {
-            List<(nint Hwnd, string Title)> waiting;
-            lock (_itemsLock)
-            {
-                waiting = _candidates
-                    .Where(p => currentTopLevel.Contains(p.Key))
-                    .Select(p => (p.Key, p.Value))
-                    .ToList();
-            }
-
-            foreach (var (hwnd, titleWhenTakenOn) in waiting)
-                TakeOnWindow(hwnd, titleWhenTakenOn, currentItems);
-        }
-
-        if (mainAfter != mainBefore)
-            Log.Info(
-                $"Window the folders gather in: 0x{mainBefore:X} -> 0x{mainAfter:X} " +
-                $"({_candidates.Count} window(s) waiting, {currentTopLevel.Count} in total). Windows: {Census()}");
+        if (!_isForcingTabs) return;
+        _isForcingTabs = false;
+        SettingsManager.AutoMerge = false;
     }
 
     /// <summary>
-    /// Looks at a window this app has taken on, the way the reference
-    /// implementation looks at a window the shell has just registered: a File
-    /// Explorer window that holds one folder in a single tab, while another
-    /// window is there for that folder to go into, has its folder put into a tab
-    /// of that window instead.
-    ///
-    /// Nothing is written off here. A window whose folder the shell cannot be
-    /// asked about yet is looked at again on the next pass - which is the whole
-    /// difference from what this app used to do, and what made it fail at
-    /// random: a window given up on in its first second was never looked at
-    /// again, so the folder that landed in it stayed a window of its own.
-    /// </summary>
-    /// <param name="titleWhenTakenOn">The title the window carried when it was
-    /// taken on, which is Explorer's own page for a window that has no folder
-    /// yet.</param>
-    private void TakeOnWindow(nint hwnd, string titleWhenTakenOn, List<(object Item, nint Hwnd)> items)
-    {
-        lock (_itemsLock)
-        {
-            if (_pendingConversions.Contains(hwnd)) return;
-        }
-
-        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowHasClassName(hwnd, "CabinetWClass"))
-        {
-            LetGoOfWindow(hwnd, showAgain: false);
-            return;
-        }
-
-        // A window the user has been working in has several tabs. One with no
-        // tab at all is a window Explorer is still building, and it is looked at
-        // again on the next pass.
-        var tabCount = Helper.GetAllExplorerTabs(hwnd).Count();
-        if (tabCount == 0) return;
-        if (tabCount > 1)
-        {
-            LetGoOfWindow(hwnd, showAgain: true);
-            return;
-        }
-
-        // The window folders gather in: the first one there is, and whatever is
-        // left when it is closed. Its folder is never moved anywhere.
-        if (_mainWindowHandle == hwnd)
-        {
-            LetGoOfWindow(hwnd, showAgain: false);
-            return;
-        }
-        if (_mainWindowHandle == 0 || !WinApi.IsWindow(_mainWindowHandle))
-        {
-            lock (_itemsLock)
-                _mainWindowHandle = hwnd;
-            Log.Info($"Window 0x{hwnd:X} is where folders gather from now on.");
-            // It is the only window there is, so the folder it holds stays where
-            // it is - and the window is put back on screen, since this app may
-            // have moved it out of the way while it was still deciding.
-            LetGoOfWindow(hwnd, showAgain: true);
-            return;
-        }
-
-        object? item = null;
-        foreach (var (candidate, candidateHwnd) in items)
-        {
-            if (candidateHwnd == hwnd)
-            {
-                item = candidate;
-                break;
-            }
-        }
-
-        if (item == null)
-        {
-            // The shell has not taken this window on yet. Explorer creates the
-            // frame first and registers it a moment later - later still when
-            // folders are opened in a row - and until it has, there is nothing
-            // to ask it about this window. It is looked at again on the next
-            // pass; the app never decides anything about a window here.
-            LookAgainLater(hwnd, titleWhenTakenOn, "the shell has not registered it yet");
-            return;
-        }
-
-        var location = TryGetLocation(item);
-        if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
-        {
-            LetGoOfWindow(hwnd, showAgain: true);
-            return;
-        }
-
-        // A window that does not say which folder it shows - Explorer's Home
-        // page, or a window that is still coming up - is nothing this app can
-        // merge yet. It is looked at again on the next pass instead of being
-        // written off, which is what makes a folder that arrives a moment later
-        // still end up as a tab.
-        if (string.IsNullOrWhiteSpace(location))
-        {
-            LookAgainLater(hwnd, titleWhenTakenOn, "Explorer has not put a folder in it yet");
-            return;
-        }
-
-        // A window whose tab this app cannot talk to yet is looked at again as
-        // well: creating the tab inside a fresh window is the last thing
-        // Explorer finishes.
-        if (GetTabHandle(item) == 0)
-        {
-            LookAgainLater(hwnd, titleWhenTakenOn, "its tab is not ready");
-            return;
-        }
-
-        Helper.HideWindowInBackground(hwnd);
-        lock (_itemsLock)
-            _pendingConversions.Add(hwnd);
-        ScheduleShowFallback(hwnd);
-        ScheduleHideRecheck(hwnd);
-        RequestFastPoll();
-        // Run the conversion off the UI thread: its awaits would otherwise
-        // resume on the WPF dispatcher and hold the UI thread for the whole
-        // conversion (COM lookups, navigation), delaying
-        // WinEvent hook delivery for any new window that appears meanwhile.
-        _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location));
-    }
-
-    /// <summary>
-    /// Stops waiting for a window: whatever is in it is the user's own business
-    /// from here on, and it is handed back if this app had taken it off screen.
-    /// </summary>
-    private void LetGoOfWindow(nint hwnd, bool showAgain)
-    {
-        bool wasWaiting;
-        lock (_itemsLock)
-        {
-            wasWaiting = _candidates.Remove(hwnd);
-            _candidateUntil.Remove(hwnd);
-            _leftAlone.Add(hwnd);
-        }
-
-        if (!wasWaiting || !showAgain) return;
-        if (Helper.ShowWindow(hwnd, removeCache: true))
-            Log.Info($"Window 0x{hwnd:X} is handed back to the user.");
-    }
-
-    /// <summary>
-    /// Keeps a window that is waiting for its folder where it is, so the next
-    /// pass looks at it again.
-    ///
-    /// A window that is on screen and still shows Explorer's own page minute
-    /// after minute is the user's own, and is let go of. A window Explorer is
-    /// holding back has no such deadline: the folder that belongs in it may be
-    /// opened at any time, and that is precisely the window a folder used to be
-    /// lost on - it was written off while it sat there waiting.
-    /// </summary>
-    private void LookAgainLater(nint hwnd, string titleWhenTakenOn, string reason)
-    {
-        var title = WinApi.GetWindowTitle(hwnd);
-        bool moved = !string.Equals(title, titleWhenTakenOn, StringComparison.Ordinal);
-        if (moved)
-        {
-            // The title moved, so something is happening in this window and the
-            // folder may be arriving right now. What it says now is remembered,
-            // and the next pass looks at it again.
-            lock (_itemsLock)
-                _candidates[hwnd] = title;
-        }
-
-        long until;
-        lock (_itemsLock)
-        {
-            if (!_candidateUntil.TryGetValue(hwnd, out until))
-            {
-                if (moved)
-                    return;               // it is on its way in: give it time
-
-                _candidateUntil[hwnd] = Stopwatch.GetTimestamp()
-                    + Stopwatch.Frequency * ScreenSpareWatchMs / 1000;
-                Log.Info($"Window 0x{hwnd:X} ('{title}') is not ready to be merged yet ({reason}); kept for the next pass.");
-                return;
-            }
-        }
-
-        if (Stopwatch.GetTimestamp() < until) return;
-
-        Log.Info(
-            $"Window 0x{hwnd:X} ('{title}') is still not showing a folder after " +
-            $"{ScreenSpareWatchMs / 1000} s ({reason}); it is left alone as the user's own window.");
-        LetGoOfWindow(hwnd, showAgain: true);
-    }
-
-    private List<(object Item, nint Hwnd)> EnumerateShellWindows()
-    {
-        var result = new List<(object Item, nint Hwnd)>();
-        if (_shellApp == null) return result;
-        try
-        {
-            dynamic windows = ((dynamic)_shellApp).Windows();
-            var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
-            {
-                object item;
-                try
-                {
-                    item = (object)windows.Item(i);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                var hwnd = GetWindowHandle(item);
-                if (hwnd != 0)
-                    result.Add((item, hwnd));
-            }
-        }
-        catch
-        {
-            // ShellWindows can be temporarily unavailable.
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Collapses every currently-open Explorer window (except the main window)
-    /// into tabs of the main window. Used by the manual merge command, which is
-    /// useful when auto-merge is switched off so the user can still collapse
-    /// several windows in one go.
+    /// Turns every File Explorer window that is not the one folders gather in
+    /// into a tab of that window - the same move the hook makes for a window
+    /// that is opened, applied to the windows that are already there. Useful
+    /// with the hook switched off, and from the tray menu.
     /// </summary>
     public void MergeAllWindowsNow()
     {
-        if (_disposed || _shellApp == null) return;
-
-        MarkActivity();
-        ThreadPool.QueueUserWorkItem(_ =>
+        _ = Task.Run(async () =>
         {
             try
             {
-                RunInStaThread(() =>
+                var main = _mainWindowHandle != 0 ? _mainWindowHandle : Helper.GetAnotherExplorerWindow(0);
+                if (main == 0) return;
+
+                List<WindowEntry> entries;
+                lock (_windowEntryDictLock)
+                    entries = new List<WindowEntry>(_windowEntryDict);
+
+                foreach (var (window, info) in entries)
                 {
-                    var items = EnumerateShellWindows();
-                    var host = PickMergeTarget();
-                    if (host == 0)
+                    try
                     {
-                        Log.Warn("Manual merge ignored: no visible Explorer window to be the target.");
-                        return;
-                    }
+                        var hwnd = new IntPtr(window.HWND);
+                        if (hwnd == main) continue;
+                        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd)) continue;
 
-                    Log.Info($"Manual merge: target 0x{host:X}; {items.Count} window(s) enumerated.");
-                    foreach (var (item, hwnd) in items)
+                        var location = info.Location ?? GetLocation(window);
+                        if (string.IsNullOrWhiteSpace(location)) continue;
+
+                        await SwitchTo(location, 0, GetSelectedItems(window), asTab: true);
+                        window.Quit();
+                    }
+                    catch
                     {
-                        if (hwnd == host) continue;
-                        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd))
-                        {
-                            Log.Info($"Manual merge: skip 0x{hwnd:X} (not a visible window).");
-                            continue;
-                        }
-
-                        var location = TryGetLocation(item);
-                        if (location != null && location.StartsWith(ControlPanelLocation, StringComparison.OrdinalIgnoreCase))
-                        {
-                            Log.Info($"Manual merge: skip 0x{hwnd:X} (control panel).");
-                            continue;
-                        }
-                        if (string.IsNullOrWhiteSpace(location))
-                        {
-                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no location).");
-                            continue;
-                        }
-                        if (GetTabHandle(item) == 0)
-                        {
-                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no tab handle).");
-                            continue;
-                        }
-                        if (!WinApi.FindAllWindowsEx("ShellTabWindowClass", hwnd).Any())
-                        {
-                            Log.Info($"Manual merge: skip 0x{hwnd:X} (no shell tab).");
-                            continue;
-                        }
-
-                        Log.Info($"Manual merge: merging 0x{hwnd:X} into {location}.");
-                        Helper.HideWindow(hwnd);
-                        lock (_itemsLock)
-                            _pendingConversions.Add(hwnd);
-                        _ = Task.Run(() => ConvertToTabAsync(item, hwnd, location, forceNew: true, preferredWindow: host));
+                        // One window that will not move must not stop the rest.
                     }
-                }).GetAwaiter().GetResult();
+                }
             }
             catch (Exception ex)
             {
-                Log.Warn("Merge all windows failed: " + ex.Message);
+                Log.Warn("Merging the open windows failed: " + ex.Message);
             }
         });
     }
+    public void SetReuseTabs(bool reuseTabs) => _reuseTabs = reuseTabs;
 
-    /// <summary>
-    /// Chooses the window that should become the target of a manual merge:
-    /// the focused Explorer window if there is one, otherwise the recorded main
-    /// window, otherwise the first visible Explorer window.
-    /// </summary>
-    private nint PickMergeTarget()
+    public void ClearClosedWindows()
     {
-        var foreground = WinApi.GetForegroundWindow();
-        if (Helper.IsFileExplorerWindow(foreground) && WinApi.IsWindowVisible(foreground))
-            return foreground;
-
-        var main = GetMainWindowHWnd(0);
-        if (main != 0) return main;
-
-        return WinApi.FindAllWindowsEx("CabinetWClass")
-            .FirstOrDefault(h => WinApi.IsWindowVisible(h) && !Helper.IsParkedOffScreen(h));
+        lock (_closedWindowsLock)
+            _closedWindows.Clear();
     }
 
-    private void OnWindowShown(
-        nint hWinEventHook,
-        uint eventType,
-        nint hWnd,
-        int idObject,
-        int idChild,
-        uint dwEventThread,
-        uint dwmsEventTime)
+    public IReadOnlyCollection<WindowRecord> GetWindows()
     {
-        if (idObject != 0 || idChild != 0) return;
-        if (WinApi.IsWindowHasClassName(hWnd, "ShellTabWindowClass"))
-        {
-            NotifyTabCreated(hWnd);
-            return;
-        }
-        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
-        if (!AutoMerge) return;
+        var result = new List<WindowRecord>();
+        
+        // Add open windows
+        lock (_windowEntryDictLock)
+            result.AddRange(
+                _windowEntryDict.Keys.Select(ie => new WindowRecord(GetLocation(ie), new IntPtr(ie.HWND), GetSelectedItems(ie), ie.LocationName)));
+        
+        // Add closed windows in reverse order (last closed on top)
+        lock (_closedWindowsLock)
+            result.AddRange(_closedWindows.AsEnumerable().Reverse());
+        
+        return result.GroupBy(w => w.Location).Select(g => g.First()).ToList();
+    }
 
-        // Explorer creates the frame window and only reveals it a moment later
-        // (~150 ms), and once revealed the window stays on screen for as long as
-        // Explorer keeps its own thread busy: a hide request sent at that point
-        // waits behind that work, which measured 30-110 ms of a window the user
-        // can see, i.e. a flash. Moving the window while it is still invisible
-        // costs nothing and is already applied by the time Explorer shows it, so
-        // the window is never painted on screen at all. See Helper.ParkWindow.
-        if (eventType == WinApi.EVENT_OBJECT_CREATE)
+    public async Task SwitchTo(string location, nint windowHandle = 0, string[]? selectedItems = null, bool asTab = true, bool duplicate = false)
+    {
+        var windowToOpen = new WindowRecord(location, windowHandle, selectedItems);
+        if (!asTab)
         {
-            TryParkNewWindow(hWnd);
+            await OpenNewWindowWithSelection(windowToOpen);
             return;
         }
 
-        // A window this app is already hiding must be hidden again the moment
-        // Explorer shows it (see HideWindow): otherwise it stays visible until
-        // the merge finishes and reads as a flash of the new window.
-        //
-        // The hide itself is handed to a background thread. Hiding a window
-        // waits for Explorer's own thread to service the request, and when
-        // several folders are opened at once that thread is busy: the wait then
-        // holds this message loop, which is the loop that has to hand the next
-        // window its hide request. Waiting here is what let the following
-        // windows sit on screen for up to a second. The window is already on
-        // screen at this point, so hiding it a moment later changes nothing for
-        // this one.
-        if (Helper.IsHidden(hWnd))
-        {
-            if (WinApi.IsWindowVisible(hWnd))
-            {
-                Helper.HideWindowInBackground(hWnd);
-                Log.Info($"Window 0x{hWnd:X} was shown again by Explorer; hidden again.");
-            }
-            return;
-        }
-
-        lock (_itemsLock)
-        {
-            // A window this app has already decided about - one of the user's
-            // own - is left alone.
-            if (_leftAlone.Contains(hWnd)) return;
-        }
-
-        // A window that was moved out of the way is only registered as hidden
-        // here, the first moment it could have been seen; from then on
-        // HideWindow keeps it hidden and reports nothing new, so this detection
-        // branch runs once per window. Windows that are not visible yet are left
-        // for their SHOW event.
-        var wasParked = Helper.IsTracked(hWnd);
-        if (!Helper.HideWindowInBackground(hWnd)) return;
-
-        MarkActivity();
-        ScheduleShowFallback(hWnd);
-        ScheduleHideRecheck(hWnd);
-        RequestFastPoll();
-        // dwmsEventTime is the moment Explorer made the window visible; the gap
-        // to now is how long the user could actually see it before this app was
-        // able to hide it, i.e. the length of the flash.
-        var detectedMs = MsSinceEvent(dwmsEventTime);
-        Log.Info(wasParked
-            ? $"New Explorer window detected (0x{hWnd:X}); was already out of the way, hidden {detectedMs} ms after Explorer revealed it."
-            : $"New Explorer window detected (0x{hWnd:X}); visible for {detectedMs} ms before hiding.");
-
-        // Poll the shell off the UI thread: PollShell blocks on the STA
-        // scheduler, and this callback now runs on the UI thread.
-        ThreadPool.QueueUserWorkItem(_ => PollShell(null));
-        _ = Task.Delay(60).ContinueWith(
-            _ => ThreadPool.QueueUserWorkItem(_ => PollShell(null)),
-            TaskScheduler.Default);
+        await OpenTabNavigateWithSelection(windowToOpen, windowHandle, duplicate, true);
     }
-
-    /// <summary>
-    /// Moves a freshly created Explorer window out of the way before Explorer
-    /// shows it, which is the only moment at which this costs the user nothing.
-    /// </summary>
-    private void TryParkNewWindow(nint hWnd)
+    
+    public nint SearchForTab(string targetPath)
     {
-        lock (_itemsLock)
-        {
-            if (_leftAlone.Contains(hWnd)) return;
-            if (_pendingConversions.Contains(hWnd)) return;
-            if (hWnd == _mainWindowHandle) return;
-        }
-
-        if (!Helper.ParkWindow(hWnd)) return;
-
-        // Explorer almost always reveals the window a moment later, which is
-        // what starts the merge. If it never does, nothing else would put the
-        // window back, so it is put back here.
-        _ = Task.Delay(2_000).ContinueWith(_ => Helper.KeepOutOfTheWayIfUntouched(hWnd), TaskScheduler.Default);
-    }
-
-    /// <summary>
-    /// True for the title Explorer gives a window that shows its Home page
-    /// ("Home - File Explorer", "Home and 2 more tabs - File Explorer"). Such a
-    /// window is not showing a folder, so it is never merged.
-    /// </summary>
-    private static bool IsHomeTitle(string title)
-        => title.StartsWith("Home", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// One line describing a window: whether it is on screen, how many tabs it
-    /// holds and what it is showing.
-    /// </summary>
-    private static string DescribeWindow(nint window)
-    {
-        if (window == 0 || !WinApi.IsWindow(window)) return "the window is gone";
-
-        var tabs = WinApi.FindAllWindowsEx("ShellTabWindowClass", window).Count();
-        var state = WinApi.IsWindowVisible(window) ? "on screen" : "not shown";
-        if (Helper.IsParkedOffScreen(window)) state += ", moved out of the way";
-
-        return $"{state}, {tabs} tab(s), '{WinApi.GetWindowTitle(window)}'";
-    }
-
-    /// <summary>
-    /// One line describing every other File Explorer window there is, so a
-    /// merge that found nothing to merge into says exactly what it saw.
-    /// </summary>
-    private static string DescribeExplorerWindows(nint except)
-    {
-        var parts = new List<string>();
-        foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
-        {
-            if (hWnd == except) continue;
-
-            var state = WinApi.IsWindowVisible(hWnd) ? "on screen" : "not shown";
-            if (Helper.IsParkedOffScreen(hWnd)) state += ", moved out of the way";
-            else if (Helper.IsHidden(hWnd)) state += ", hidden by E-Tab";
-
-            parts.Add($"0x{hWnd:X} {state} '{WinApi.GetWindowTitle(hWnd)}'");
-        }
-
-        return parts.Count == 0 ? "there is no other File Explorer window at all" : string.Join("; ", parts);
-    }
-
-    /// <summary>
-    /// One line describing every File Explorer window there is, together with
-    /// everything this app knows about it. Written at the moments a merge picks
-    /// the window a folder goes into, so the log says why a folder went where it
-    /// went instead of only where it ended up.
-    /// </summary>
-    private string Census()
-    {
-        var parts = new List<string>();
-        foreach (var hWnd in WinApi.FindAllWindowsEx("CabinetWClass"))
-        {
-            var state = WinApi.IsWindowVisible(hWnd) ? "on screen" : "not shown";
-            if (Helper.IsParkedOffScreen(hWnd)) state += ", parked";
-            if (Helper.IsHidden(hWnd)) state += ", hidden by E-Tab";
-
-            string flags;
-            lock (_itemsLock)
-            {
-                flags = _windowsAtStartup.Contains(hWnd) ? "the user's" : "new";
-                if (_candidates.ContainsKey(hWnd)) flags += ", waiting for its folder";
-                if (_pendingConversions.Contains(hWnd)) flags += ", merging";
-                if (_leftAlone.Contains(hWnd) && !_windowsAtStartup.Contains(hWnd)) flags += ", left alone";
-            }
-            if (hWnd == _mainWindowHandle) flags += ", gather window";
-
-            parts.Add(
-                $"0x{hWnd:X} {state}, {Helper.GetAllExplorerTabs(hWnd).Count()} tab(s), {flags}, '{WinApi.GetWindowTitle(hWnd)}'");
-        }
-
-        return parts.Count == 0
-            ? "there is no File Explorer window at all"
-            : string.Join("; ", parts);
-    }
-
-    /// <summary>
-    /// Puts a window back on screen when no merge has taken it over.
-    ///
-    /// A window is hidden the moment it appears, but the Shell item needed to
-    /// merge it only comes from a full ShellWindows pass, which takes a few
-    /// hundred milliseconds. When that lookup never succeeds the window has to
-    /// be given back to the user, so it stays hidden for at most this long. A
-    /// conversion that is already running owns the window instead, and
-    /// ConvertToTabAsync restores it when the merge fails.
-    /// </summary>
-    private void ScheduleShowFallback(nint hWnd)
-    {
-        _ = Task.Delay(1_500).ContinueWith(_ =>
-        {
-            lock (_itemsLock)
-            {
-                if (_pendingConversions.Contains(hWnd)) return;
-                // A window this app took on is not put back on screen here: it is
-                // either merged or handed back by LetGoOfWindow, which knows what
-                // became of it. Putting it back in between is what a folder that
-                // was still on its way looked like - the window appearing again
-                // for a moment before it was taken away.
-                if (_candidates.ContainsKey(hWnd)) return;
-                if (!Helper.HiddenWindows.ContainsKey(hWnd)) return;
-            }
-
-            if (Helper.ShowWindow(hWnd, removeCache: true))
-                Log.Warn($"Window 0x{hWnd:X} could not be merged; restored after 1.5 s.");
-        }, TaskScheduler.Default);
-    }
-
-    /// <summary>
-    /// One extra visibility check while a merge is running.
-    ///
-    /// Explorer reveals a new window more than once as its shell view comes up,
-    /// and the SHOW event normally hides it again straight away. This covers
-    /// the case where a window is revealed without an event this app can see:
-    /// without it the window would sit on screen for the whole merge.
-    /// </summary>
-    private void ScheduleHideRecheck(nint hWnd)
-    {
-        _ = Task.Delay(250).ContinueWith(_ =>
-        {
-            lock (_itemsLock)
-            {
-                if (!_pendingConversions.Contains(hWnd)) return;
-            }
-
-            Helper.HideWindow(hWnd);
-        }, TaskScheduler.Default);
-    }
-
-    /// <summary>
-    /// Runs one merge and makes sure that every way it can end is reported and
-    /// that the window is never left behind. ConvertToTabCoreAsync has its own
-    /// handling for the failures it expects, but a call that throws while the
-    /// last of the work is being cleaned up - closing the window that was
-    /// replaced, say - used to escape the method, and the task that ran it was
-    /// never waited on: the merge simply stopped, with no log line and a window
-    /// that stayed hidden for good.
-    /// </summary>
-    private async Task ConvertToTabAsync(object item, nint sourceHwnd, string? location, bool forceNew = false, nint preferredWindow = 0)
-    {
-        try
-        {
-            await ConvertToTabCoreAsync(item, sourceHwnd, location, forceNew, preferredWindow);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"Merge of 0x{sourceHwnd:X} failed unexpectedly: {ex}");
-            lock (_itemsLock)
-                _pendingConversions.Remove(sourceHwnd);
-            if (Helper.ShowWindow(sourceHwnd, removeCache: true))
-                Log.Warn($"Window 0x{sourceHwnd:X} is on screen again so the folder is not lost.");
-            else if (WinApi.IsWindow(sourceHwnd) && !WinApi.IsWindowVisible(sourceHwnd))
-                WinApi.ShowWindow(sourceHwnd, WinApi.SW_SHOWNOACTIVATE);
-        }
-    }
-
-    private async Task ConvertToTabCoreAsync(object item, nint sourceHwnd, string? location, bool forceNew = false, nint preferredWindow = 0)
-    {
-        var sw = Stopwatch.StartNew();
-        MarkActivity();
-        long searchMs = 0, createMs = 0, itemMs = 0, navMs = 0, drawMs = 0, showMs = 0, closeMs = 0;
-        var converted = false;
-        var step = new MergeStep(sourceHwnd);
-        var stopWatchdog = WatchForStuckMerge(sourceHwnd, step);
-        try
-        {
-            var target = string.IsNullOrWhiteSpace(location) ? TryGetLocation(item) : location;
-            if (string.IsNullOrWhiteSpace(target))
-            {
-                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: the window does not say which folder it shows.");
-                return;
-            }
-
-            Log.Info($"Merging 0x{sourceHwnd:X} into '{target}'.");
-            Log.Info($"Windows at that moment: {Census()}");
-
-            // Fast path: the folder is already open as a tab, so just select
-            // that tab instead of creating a new one.
-            step.Set("looking for a tab that already shows this folder");
-            var existingTab = await SearchForTabAsync(target, sourceHwnd).ConfigureAwait(false);
-            searchMs = sw.ElapsedMilliseconds;
-            if (!forceNew && existingTab != 0)
-            {
-                var windowHandle = WinApi.GetParent(existingTab);
-                if (windowHandle != 0 && WinApi.IsWindow(windowHandle) && WinApi.IsWindow(existingTab))
-                {
-                    await SelectTabByHandle(windowHandle, existingTab);
-
-                    // Only treat the conversion as done when the tab is
-                    // still alive and attached to the same window. If the
-                    // window was closed while we were selecting the tab, fall
-                    // through to the normal path so the source window is
-                    // restored instead of silently disappearing.
-                    if (WinApi.IsWindow(existingTab) && WinApi.GetParent(existingTab) == windowHandle)
-                    {
-                        object? existingItem = null;
-                        if (_tabToItem.TryGetValue(existingTab, out var cached))
-                            existingItem = cached;
-                        else
-                            existingItem = await RunConversionInStaThread(() => FindShellItemForTab(existingTab));
-
-                        if (existingItem != null)
-                            SelectItems(existingItem, TryGetSelectedItems(item));
-
-                        WinApi.TryActivate(windowHandle);
-                        converted = true;
-                        return;
-                    }
-                }
-            }
-
-            // Serialize only the tab-creation step; the item wait and the
-            // navigation can overlap between conversions so opening several
-            // folders in a row does not queue behind the first one.
-            step.Set(TabStepStage);
-            var (targetWindow, newTabHandle, firstNewIndex) = await CreateNewTabAsync(preferredWindow);
-
-            Log.Info(
-                $"Merge of 0x{sourceHwnd:X}: writing into window 0x{targetWindow:X} " +
-                $"({DescribeWindow(targetWindow)}).");
-
-            // A folder merged into a window nobody can see is no better than a
-            // window of its own: the window it went into is put on screen.
-            if (targetWindow != 0 && !WinApi.IsWindowVisible(targetWindow))
-            {
-                if (!Helper.ShowWindow(targetWindow, removeCache: false))
-                    WinApi.ShowWindow(targetWindow, WinApi.SW_SHOWNOACTIVATE);
-                Log.Info($"Window 0x{targetWindow:X} was put on screen to show the new tab.");
-            }
-
-            createMs = sw.ElapsedMilliseconds;
-            if (targetWindow == 0 || newTabHandle == 0)
-            {
-                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: Explorer did not open a new tab (window 0x{targetWindow:X}, tab 0x{newTabHandle:X}).");
-                return;
-            }
-
-            // Explorer can take a long while to register the tab it was asked
-            // for - it is busy serveral times over when folders are opened in a
-            // row - so the tab is waited for rather than given up on. Asking for
-            // a second tab instead left the first one behind, empty, on
-            // Explorer's own page.
-            step.Set("waiting for the new tab to register");
-            var tabItem = await WaitForTabItemAsync(newTabHandle, TabRegistrationWaitMs, firstNewIndex);
-            itemMs = sw.ElapsedMilliseconds;
-            if (tabItem == null)
-            {
-                Log.Warn($"Merge of 0x{sourceHwnd:X} abandoned: the new tab 0x{newTabHandle:X} did not register with the shell in {itemMs} ms.");
-                return;
-            }
-
-            // Title of the tab while it still shows Explorer's default page;
-            // the tab keeps it until the folder it was sent to is on screen.
-            var defaultTitle = WinApi.GetWindowTitle(newTabHandle);
-
-            // Navigate the new tab to the target via its Shell item (no simulated
-            // address-bar keystrokes). Navigate2 runs when the fresh tab is not
-            // already at the target, which is the normal case for a new tab.
-            var currentLocation = TryGetLocation(tabItem);
-            if (!string.Equals(currentLocation, target, StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    step.Set("sending the new tab to the folder");
-                    await Navigate(tabItem, target);
-                }
-                catch (Exception ex)
-                {
-                    // Navigation failed (Explorer may be closing or busy).
-                    // Close the half-created tab so no stray default tab is
-                    // left behind, then restore the source window.
-                    Log.Warn($"Navigation failed for '{target}': {ex.Message}");
-                    if (Helper.GetAllExplorerTabs(targetWindow).Count() > 1)
-                        TryQuitTabItem(tabItem);
-                    return;
-                }
-            }
-            SelectItems(tabItem, TryGetSelectedItems(item));
-            navMs = sw.ElapsedMilliseconds;
-            RememberTabLocation(newTabHandle, target);
-
-            // If the target window disappeared mid-conversion, restore the
-            // source window instead of pretending the tab exists.
-            if (WinApi.IsWindow(newTabHandle) && WinApi.GetParent(newTabHandle) == targetWindow)
-            {
-                // Let the tab draw the folder before it is brought forward:
-                // Explorer lays the new view out asynchronously and keeps the
-                // default page up for a few hundred milliseconds after the
-                // navigation was handed over (measured 300-650 ms). Switching
-                // during that window is what looks like the tab jumping from
-                // Home to the folder.
-                step.Set("waiting for the folder to draw");
-                var drawStart = sw.ElapsedMilliseconds;
-                await WaitForTabLoadedAsync(newTabHandle, defaultTitle, TabLoadWaitMs);
-                drawMs = sw.ElapsedMilliseconds - drawStart;
-
-                step.Set("showing the new tab");
-                var showStart = sw.ElapsedMilliseconds;
-                await BringNewTabToFrontAsync(targetWindow, newTabHandle);
-                WinApi.TryActivate(targetWindow);
-                showMs = sw.ElapsedMilliseconds - showStart;
-
-                // The window that was replaced is only closed once the folder
-                // is really in the new tab. Closing it on the strength of the
-                // tab existing is what could leave the user with neither: a tab
-                // still on Explorer's own page, and the folder gone with the
-                // window. When that cannot be confirmed the window stays, so the
-                // folder is always somewhere the user can see.
-                if (TabShowsFolder(newTabHandle, tabItem, target, defaultTitle))
-                {
-                    converted = true;
-                }
-                else
-                {
-                    Log.Warn(
-                        $"Tab 0x{newTabHandle:X} does not show '{target}' yet " +
-                        $"(its title is '{WinApi.GetWindowTitle(newTabHandle)}'); " +
-                        $"the window that was replaced is kept so the folder is not lost.");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            // Any unexpected failure leaves converted = false, so the
-            // finally block below restores the source window.
-            Log.Warn($"Conversion failed for 0x{sourceHwnd:X}: {ex}");
-        }
-        finally
-        {
-            if (converted)
-            {
-                step.Set("closing the window that was replaced");
-                var closeStart = sw.ElapsedMilliseconds;
-
-                // Everything remembered about that window is dropped first, by
-                // window handle alone - no call into the shell for a window that
-                // is about to go.
-                RemoveTabsOfWindow(sourceHwnd);
-                Helper.HiddenWindows.TryRemove(sourceHwnd, out _);
-
-                // Closing it is a posted message and not a call into the shell.
-                // The shell call that used to do this closes the window and then,
-                // every so often, never comes back: the merge ended with no
-                // summary line, no watchdog report, and a thread stuck inside it
-                // for the rest of the session. A posted close cannot wait for
-                // anything.
-                WinApi.PostMessage(sourceHwnd, WinApi.WM_SYSCOMMAND, WinApi.SC_CLOSE, 0);
-
-                var windowToClose = sourceHwnd;
-                _ = Task.Delay(3_000).ContinueWith(_ =>
-                {
-                    if (WinApi.IsWindow(windowToClose) && WinApi.IsWindowHasClassName(windowToClose, "CabinetWClass"))
-                    {
-                        // It would not close. It is put back on screen rather
-                        // than left hidden: a hidden window is a window Explorer
-                        // hands the next folder to, and one this app hid and
-                        // forgot is how folders ended up in a window of their
-                        // own instead of the one the user was working in.
-                        Helper.ShowWindow(windowToClose, removeCache: true);
-                        if (!WinApi.IsWindowVisible(windowToClose))
-                            WinApi.ShowWindow(windowToClose, WinApi.SW_SHOWNOACTIVATE);
-                        Log.Warn($"Window 0x{windowToClose:X} should have closed after its folder went into a tab, but it is still there; it was put back on screen.");
-                    }
-                    else
-                    {
-                        Log.Info($"Merge of 0x{windowToClose:X}: the window that was replaced is closed.");
-                    }
-                }, TaskScheduler.Default);
-
-                closeMs = sw.ElapsedMilliseconds - closeStart;
-            }
-            else
-            {
-                // Hand the window back exactly as the user left it. A failed
-                // merge must never lose the window the user opened: it would
-                // otherwise stay hidden with no taskbar button.
-                if (Helper.ShowWindow(sourceHwnd, removeCache: true))
-                    Log.Warn($"Merge of 0x{sourceHwnd:X} failed; source window restored.");
-            }
-
-            lock (_itemsLock)
-                _pendingConversions.Remove(sourceHwnd);
-
-            // Stopped last: a call that hangs while the replaced window is
-            // closed is one of the ways a merge used to go quiet for good.
-            stopWatchdog();
-
-            // Written here rather than after the method: a merge that finds the
-            // folder already open leaves through a return of its own, and it
-            // used to leave without saying anything at all.
-            Log.Info(
-                $"Conversion of 0x{sourceHwnd:X} finished in {sw.ElapsedMilliseconds} ms " +
-                $"(search {searchMs}ms, create {createMs}ms, item {itemMs}ms, " +
-                $"navigate {navMs}ms, draw {drawMs}ms, show {showMs}ms, close {closeMs}ms, " +
-                $"converted={converted}).");
-        }
-    }
-
-    /// <summary>
-    /// Watches one merge and hands the window back to the user if the merge
-    /// stops moving. Every step of a merge is a call into Explorer, and a call
-    /// that never comes back would otherwise leave the folder opened with
-    /// neither a window nor a tab to show for it.
-    /// </summary>
-    private Action WatchForStuckMerge(nint hwnd, MergeStep step)
-    {
-        EnsureMergeWatchdog();
-
-        lock (_runningMerges)
-            _runningMerges.Add((hwnd, step));
-
-        return () =>
-        {
-            lock (_runningMerges)
-                _runningMerges.RemoveAll(m => m.Hwnd == hwnd);
-        };
-    }
-
-    /// <summary>
-    /// One thread whose only job is to make sure no merge ends in silence.
-    ///
-    /// This used to be a task per merge, which turned out to be exactly what a
-    /// merge cannot rely on: opening several folders at once fills the thread
-    /// pool with waiting continuations, and the tasks that were supposed to
-    /// report a merge that never finished were waiting for their turn along
-    /// with everything else. A thread of its own is never in that queue.
-    /// </summary>
-
-    private void EnsureMergeWatchdog()
-    {
-        if (_mergeWatchdogThread != null) return;
-
-        _mergeWatchdogThread = new Thread(MergeWatchdogLoop)
-        {
-            IsBackground = true,
-            Name = "E-Tab merge watchdog"
-        };
-        _mergeWatchdogThread.Start();
-    }
-
-    private void MergeWatchdogLoop()
-    {
-        while (!_disposed)
-        {
-            Thread.Sleep(500);
-
-            List<(nint Hwnd, MergeStep Step)> snapshot;
-            lock (_runningMerges)
-                snapshot = _runningMerges.ToList();
-
-
-
-            foreach (var (hwnd, step) in snapshot)
-            {
-                if (step.Abandoned) continue;
-
-                // Waiting its turn behind other merges is normal and can take
-                // seconds, so that on its own is not being stuck. It is being
-                // stuck when nothing at all is moving any more - which is what a
-                // call into Explorer that never comes back looks like - or when
-                // this one merge has been sitting on the same step for far
-                // longer than any queue of merges could explain, or when it has
-                // simply taken too long.
-                var overdue = step.OlderThan(MergeDeadlineMs);
-                if (!overdue)
-                {
-                    if (!step.StaleFor(MergeStuckMs)) continue;
-
-                    var hardLimit = step.Stage == TabStepStage ? TabCreationGiveUpMs : MergeHardStuckMs;
-                    if (!NothingMovedFor(MergeStuckMs) && !step.StaleFor(hardLimit)) continue;
-                }
-                if (!step.TryClaimReport()) continue;
-
-                step.MarkAbandoned();
-                Log.Warn(
-                    $"Merge of 0x{hwnd:X} is being handed back without finishing " +
-                    $"(last step: '{step.Stage}'); the folder is put on screen. " +
-                    $"Windows found: {DescribeExplorerWindows(hwnd)}.");
-                if (Helper.ShowWindow(hwnd, removeCache: true))
-                    Log.Info($"Window 0x{hwnd:X} is on screen again so the folder is not lost.");
-                else if (WinApi.IsWindow(hwnd) && !WinApi.IsWindowVisible(hwnd))
-                    WinApi.ShowWindow(hwnd, WinApi.SW_SHOWNOACTIVATE);
-
-                lock (_itemsLock)
-                    _pendingConversions.Remove(hwnd);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Delays, in milliseconds, at which the window is put back on the tab the
-    /// user was on after a new tab was requested, counted from the new-tab
-    /// command. One request is posted straight away (see CreateNewTabAsync);
-    /// these cover Explorer adding the tab a little later than that.
-    /// </summary>
-    private static readonly int[] SwitchBackDelaysMs = { 20, 60 };
-
-    private async Task<(nint WindowHandle, nint TabHandle, int FirstNewIndex)> CreateNewTabAsync(nint preferredWindow = 0)
-    {
-        if (!await WaitForTabStepAsync().ConfigureAwait(false))
-            return (0, 0, 0);
-
-        try
-        {
-            var mainWindowHWnd = preferredWindow != 0 && WinApi.IsWindowVisible(preferredWindow) ? preferredWindow : GetMainWindowHWnd(0);
-            if (mainWindowHWnd == 0)
-            {
-                // No visible Explorer window is available to merge into.
-                // Restore the source window instead of opening a brand-new
-                // one, so a window does not "reappear" right after the user
-                // closes File Explorer.
-                Log.Warn("No File Explorer window is on screen to merge into; the new folder is left as its own window.");
-                return (0, 0, 0);
-            }
-
-            var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
-
-            // Explorer opens a new tab on its default "Home" page and switches to
-            // it, so the folder the user was looking at would be replaced by Home
-            // and then by the target folder. Remember which tab the user is on and
-            // send the window straight back to it, so the new tab can load in the
-            // background unseen.
-            var activeTab = currentTabs.Length > 0 ? currentTabs[0] : 0;
-            var backIndex = activeTab != 0
-                ? await RunConversionInStaThread(() => FindTabStripIndex(mainWindowHWnd, activeTab))
-                : -1;
-
-            // The entries that appear after this point are the ones the new
-            // tab can be, which is what the item wait starts from.
-            var shellWindowsBefore = await RunConversionInStaThread(GetShellWindowCount);
-
-            await RequestToOpenNewTab(mainWindowHWnd);
-
-            if (backIndex >= 0)
-            {
-                // Back to the tab the user was on as early as possible. The
-                // first request is posted while Explorer is still busy with the
-                // new tab, so it is already queued when that tab appears and the
-                // default page never gets a frame on screen; the later attempts
-                // cover a tab that Explorer adds a little later.
-                PostSelectTabByIndex(mainWindowHWnd, backIndex);
-                foreach (var delayMs in SwitchBackDelaysMs)
-                {
-                    await Task.Delay(delayMs);
-                    if (!WinApi.IsWindow(mainWindowHWnd)) return (0, 0, 0);
-
-                    // Already back on the tab the user was looking at: there is
-                    // nothing left to post, and waiting out the rest of these
-                    // delays would only make the folder later.
-                    var tabsNow = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
-                    if (tabsNow.Length > 0 && tabsNow[0] == activeTab) break;
-
-                    PostSelectTabByIndex(mainWindowHWnd, backIndex);
-                }
-            }
-
-            var newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_000);
-            if (newTabHandle == 0)
-            {
-                // Explorer can take longer than that when it is busy. Giving up
-                // here would hand the folder the user opened back as a window
-                // of its own, so the tab is given one more chance before that
-                // happens; this costs nothing in the normal case.
-                Log.Warn($"Explorer has not opened the new tab in 0x{mainWindowHWnd:X} yet; waiting a little longer.");
-                newTabHandle = await WaitForNewTabAsync(mainWindowHWnd, currentTabs, 2_500);
-            }
-
-            return (mainWindowHWnd, newTabHandle, shellWindowsBefore);
-        }
-        finally
-        {
-            _toOpenWindowsLock.Release();
-        }
-    }
-
-    /// <summary>
-    /// Takes the turn at the tab creation step, which only ever runs one merge
-    /// at a time because Explorer creates the tab in one window and the folder
-    /// has to be handed to the tab that this merge asked for.
-    ///
-    /// A merge used to give up after a fixed five seconds, which left the
-    /// folder as a window of its own whenever several folders were opened in
-    /// quick succession - the wait was long because the queue was long, not
-    /// because anything was wrong. The wait now only ends when nothing at all
-    /// has moved for the stuck threshold, i.e. when a call into Explorer has
-    /// stopped coming back, with a generous cap as a last resort.
-    /// </summary>
-    private async Task<bool> WaitForTabStepAsync()
-    {
-        var startTicks = Stopwatch.GetTimestamp();
-
-        while (true)
-        {
-            if (await _toOpenWindowsLock.WaitAsync(2_000).ConfigureAwait(false)) return true;
-
-            if (NothingMovedFor(MergeStuckMs))
-            {
-                Log.Warn($"Nothing has moved for over {MergeStuckMs} ms while waiting for the tab step; this folder is left as its own window.");
-                return false;
-            }
-
-            if (Helper.IsTimeUp(startTicks, TabCreationGiveUpMs))
-            {
-                Log.Warn($"Waited over {TabCreationGiveUpMs} ms for the tab step; this folder is left as its own window.");
-                return false;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Waits for a new Explorer tab in the given window. The WinEvent hook
-    /// reports the tab the moment its window appears (event-driven, low CPU);
-    /// a slow polling fallback keeps it robust if the hook does not fire for a
-    /// particular tab window.
-    /// </summary>
-    private async Task<nint> WaitForNewTabAsync(nint window, IReadOnlyCollection<nint> currentTabs, int timeoutMs)
-    {
-        var eventTcs = new TaskCompletionSource<nint>(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (_tabWaitLock)
-        {
-            if (!_tabWaiters.TryGetValue(window, out var list))
-            {
-                list = new List<TabWaitRequest>();
-                _tabWaiters[window] = list;
-            }
-            list.Add(new TabWaitRequest(currentTabs, eventTcs));
-        }
-
-        try
-        {
-            var eventTask = eventTcs.Task;
-            var pollTask = Helper.ListenForNewExplorerTabAsync(window, currentTabs, timeoutMs, sleepMs: 50);
-            var winner = await Task.WhenAny(eventTask, pollTask);
-            var result = await winner;
-            if (result != 0) return result;
-
-            // One side may still be waiting, and the event side has no timeout
-            // of its own: awaiting it here used to leave a merge (and the
-            // window it had taken over) waiting forever when Explorer never
-            // created the tab at all. Only a result that is already there is
-            // taken.
-            var other = winner == eventTask ? pollTask : eventTask;
-            return other.IsCompleted ? await other : 0;
-        }
-        finally
-        {
-            lock (_tabWaitLock)
-            {
-                if (_tabWaiters.TryGetValue(window, out var list))
-                {
-                    list.RemoveAll(r => r.Tcs == eventTcs);
-                    if (list.Count == 0) _tabWaiters.Remove(window);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Called on the UI thread when a new ShellTabWindowClass window appears;
-    /// completes any waiter bound to its parent window.
-    /// </summary>
-    private void NotifyTabCreated(nint tabHandle)
-    {
-        var parent = WinApi.GetParent(tabHandle);
-        if (parent == 0) return;
-
-        lock (_tabWaitLock)
-        {
-            if (!_tabWaiters.TryGetValue(parent, out var list)) return;
-            for (var i = list.Count - 1; i >= 0; i--)
-            {
-                var request = list[i];
-                if (request.CurrentTabs.Contains(tabHandle)) continue;
-                if (request.Tcs.TrySetResult(tabHandle))
-                    list.RemoveAt(i);
-            }
-            if (list.Count == 0) _tabWaiters.Remove(parent);
-        }
-    }
-
-    private sealed class TabWaitRequest
-    {
-        public TabWaitRequest(IReadOnlyCollection<nint> currentTabs, TaskCompletionSource<nint> tcs)
-        {
-            CurrentTabs = currentTabs;
-            Tcs = tcs;
-        }
-
-        public IReadOnlyCollection<nint> CurrentTabs { get; }
-        public TaskCompletionSource<nint> Tcs { get; }
-    }
-    private static void TryQuitTabItem(object tabItem)
-    {
-        try
-        {
-            ((dynamic)tabItem).Quit();
-        }
-        catch
-        {
-            // The tab may already be gone.
-        }
-    }
-
-    private async Task<nint> SearchForTabAsync(string targetPath, nint sourceWindow)
-    {
-        // Nothing here reads a Shell item while holding the lock. A Shell item
-        // can only be read from another thread through the message queue of the
-        // thread that created it, so a thread that waits on the shell inside
-        // this lock stops the queue from turning - and a merge that started
-        // there waited for a call that could never be delivered, silently and
-        // without end. This app's window bookkeeping lock must never be held
-        // across a call into the shell.
-        var known = SnapshotTabLocations();
-
-        foreach (var (tabHandle, comparePath) in known)
-        {
-            if (comparePath == null) continue;
-            if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase))
-                return tabHandle;
-        }
-
-        // Nothing in the bookkeeping - so ask the shell itself before deciding
-        // that this folder is not open anywhere. What this app remembers can be
-        // thin for a moment (a tab that appeared before its folder could be
-        // read, a pass that did not come back), and acting on that opened a
-        // second tab for a folder that was already open, leaving the user on the
-        // newest one. The shell knows its own tabs.
-        // Each tab window carries the name of the page it shows, so the tabs of
-        // every window can be walked directly - no list involved. This is the
-        // cheap look and it is tried before the shell's own list, which is what
-        // takes seconds on a machine where that list is slow or busy.
-        var byTitle = await RunConversionInStaThread(() => FindTabByTitle(sourceWindow, targetPath))
-            .ConfigureAwait(false);
-        if (byTitle != 0)
-        {
-            Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{byTitle:X}) by its name.");
-            return byTitle;
-        }
-
-        // Asking the shell for its list of tabs is the expensive one, and it is
-        // only worth it when this app knows nothing at all - which means the poll
-        // has not had its say yet. When the folder really is not open, this is
-        // the cost of opening it, and opening folders is the whole point.
-        if (known.Count == 0)
-        {
-            var live = await RunConversionInStaThread(() => FindExistingTabByLocation(targetPath, sourceWindow))
-                .ConfigureAwait(false);
-            if (live != 0)
-            {
-                Log.Info($"SearchForTab('{targetPath}'): found an open tab (0x{live:X}) by asking the shell.");
-                return live;
-            }
-        }
-
-        if (IsFileSystemPath(targetPath))
-        {
-            Log.Info($"SearchForTab('{targetPath}'): no tab shows this folder; tabs known: " +
-                     string.Join("; ", known.Select(k => $"0x{k.TabHandle:X}='{k.Location ?? "<unknown>"}'")));
-            return 0;
-        }
-
-        var comparer = _shellPathComparer;
-        if (comparer == null) return 0;
-
         nint targetPidl = 0;
         try
         {
-            targetPidl = comparer.GetPidlFromPath(targetPath);
+            targetPidl = _shellPathComparer.GetPidlFromPath(targetPath);
             if (targetPidl == 0) return 0;
 
-            foreach (var (tabHandle, comparePath) in SnapshotTabLocations())
+            foreach (var (window, windowInfo, tabHandle) in _windowEntryDict)
             {
-                if (comparePath == null) continue;
-                if (string.Equals(targetPath, comparePath, StringComparison.OrdinalIgnoreCase)) continue;
-                if (comparer.IsEquivalent(targetPath, comparePath, targetPidl))
-                    return tabHandle;
+                // Make sure it is not the newly created window
+                if (!Helper.IsTimeUp(windowInfo.CreatedAt, 2_000) || !tabHandle.HasValue || tabHandle.Value == 0)
+                    continue;
+
+                var comparePath = windowInfo.Location ?? GetLocation(window);
+
+                if (_shellPathComparer.IsEquivalent(targetPath, comparePath, targetPidl))
+                    return tabHandle.Value;
             }
 
             return 0;
@@ -1889,907 +185,670 @@ public sealed class ExplorerWatcher : IDisposable
                 Marshal.FreeCoTaskMem(targetPidl);
         }
     }
-
-    /// <summary>
-    /// True when a tab is showing the folder it was sent to: either its title
-    /// has moved off Explorer's own page, or the shell says it is at the folder.
-    /// </summary>
-    private static bool TabShowsFolder(nint tabHandle, object tabItem, string target, string defaultTitle)
+    public async Task SelectTabByHandle(nint windowHandle, nint tabHandle)
     {
-        var title = WinApi.GetWindowTitle(tabHandle);
-        if (!string.IsNullOrWhiteSpace(title)
-            && !string.Equals(title, defaultTitle, StringComparison.Ordinal))
-            return true;
+        var tabs = Helper.GetAllExplorerTabs(windowHandle).ToArray();
+        if (tabs.Length == 0) return;
 
-        return string.Equals(TryGetLocation(tabItem), target, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>
-    /// Records which folder a tab shows, so looking for a tab that already
-    /// shows a folder stays a lookup in this app's own bookkeeping.
-    /// </summary>
-    private void RememberTabLocation(nint tabHandle, string location)
-    {
-        lock (_itemsLock)
+        var activeTab = tabs[0];
+        for (var i = 0; i < tabs.Length; i++)
         {
-            if (_tabInfos.TryGetValue(tabHandle, out var info))
-            {
-                info.Location = location;
-                return;
-            }
+            if (activeTab == tabHandle) break;
 
-            // The poll may not have come across this tab yet. Recording it here
-            // means the folder it shows is known from the moment the merge ends -
-            // which is what lets a folder that is opened again go back to this
-            // tab instead of opening a second one for the same folder.
-            _tabInfos[tabHandle] = new WindowInfo
-            {
-                TabHandle = tabHandle,
-                Location = location,
-            };
+            SelectTabByIndex(windowHandle, i);
+
+            // ReSharper disable once AccessToModifiedClosure
+            activeTab = await Helper.DoUntilConditionAsync(
+                () => WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null),
+                h => h != activeTab);
         }
     }
-
-    /// <summary>
-    /// A tab that shows this folder, found by walking the tabs of every window
-    /// and comparing the name each tab window carries with the folder's own
-    /// name. Nothing here asks the shell for its list of tabs, so it keeps
-    /// working on a machine where that list comes back empty.
-    /// </summary>
-    private nint FindTabByTitle(nint sourceWindow, string targetPath)
+    public void SelectLastTab(nint windowHandle)
     {
-        var name = Path.GetFileName(targetPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-        if (string.IsNullOrWhiteSpace(name)) return 0;
-
-        foreach (var window in WinApi.FindAllWindowsEx("CabinetWClass"))
-        {
-            if (window == sourceWindow) continue;
-
-            foreach (var tab in WinApi.FindAllWindowsEx("ShellTabWindowClass", window))
-            {
-                var title = WinApi.GetWindowTitle(tab);
-                if (string.IsNullOrWhiteSpace(title)) continue;
-                if (IsHomeTitle(title)) continue;
-                if (title.Equals(name, StringComparison.OrdinalIgnoreCase)) return tab;
-            }
-        }
-
-        return 0;
+        var count = Helper.GetAllExplorerTabs(windowHandle).Count();
+        SelectTabByIndex(windowHandle, count - 1);
     }
-
-    /// <summary>
-    /// Walks the shell's own tabs for one that shows this folder, ignoring what
-    /// this app remembers. The window that is being merged is left out: it shows
-    /// the same folder, and taking it for an open tab would close the only place
-    /// the folder is.
-    /// </summary>
-    private nint FindExistingTabByLocation(string targetPath, nint sourceWindow)
+    public void SelectTabByIndex(nint windowHandle, int index)
     {
-        var shell = ConversionShell();
-        if (shell == null) return 0;
-
-        try
-        {
-            dynamic windows = ((dynamic)shell).Windows();
-            var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
-            {
-                object item;
-                try
-                {
-                    item = (object)windows.Item(i);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (sourceWindow != 0 && GetWindowHandle(item) == sourceWindow) continue;
-
-                var tabHandle = GetTabHandle(item);
-                if (tabHandle == 0) continue;
-
-                var location = TryGetLocation(item);
-                if (location == null) continue;
-                if (string.Equals(location, targetPath, StringComparison.OrdinalIgnoreCase))
-                    return tabHandle;
-            }
-        }
-        catch
-        {
-            // The shell can be busy; the caller simply carries on without this.
-        }
-
-        return 0;
+        // Send 0xA221 magic command (CTRL + 1...n)
+        WinApi.SendMessage(windowHandle, WinApi.WM_COMMAND, 0xA221, index + 1);
     }
-
-    /// <summary>
-    /// The folder every open tab shows, taken in two steps: the handles and the
-    /// folders this app already knows under the lock, and the ones that still
-    /// have to be read from the shell without it.
-    /// </summary>
-    private List<(nint TabHandle, string? Location)> SnapshotTabLocations()
+    public async Task RequestToOpenNewTab(nint windowHandle, bool bringToFront = false, bool lockToOpenWindows = true)
     {
-        var snapshot = new List<(nint TabHandle, string? Location)>();
+        if (bringToFront && windowHandle == 0)
+            windowHandle = GetMainWindowHWnd(0);
 
-        lock (_itemsLock)
-        {
-            foreach (var info in _tabInfos.Values)
-            {
-                if (!Helper.IsTimeUp(info.CreatedAt, 2_000)) continue;
-                if (info.TabHandle == 0) continue;
-                snapshot.Add((info.TabHandle, info.Location));
-            }
-        }
-
-        for (var i = 0; i < snapshot.Count; i++)
-        {
-            if (snapshot[i].Location != null) continue;
-            if (!_tabToItem.TryGetValue(snapshot[i].TabHandle, out var tabItem)) continue;
-
-            var location = TryGetLocation(tabItem);
-            if (location == null) continue;
-
-            lock (_itemsLock)
-            {
-                if (_tabInfos.TryGetValue(snapshot[i].TabHandle, out var info))
-                    info.Location = location;
-            }
-            snapshot[i] = (snapshot[i].TabHandle, location);
-        }
-
-        return snapshot;
-    }
-
-    private static bool IsFileSystemPath(string path)
-    {
-        if (path.StartsWith(@"\\", StringComparison.Ordinal)) return true;
-        return path.Length >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/');
-    }
-
-    /// <summary>
-    /// Brings one tab of a window to the front, by its handle.
-    ///
-    /// The windows of a tab strip are enumerated in the order they were last
-    /// activated, which is not the order they sit in the strip: the first one is
-    /// whichever tab is in front and the rest follow by age. Their position in
-    /// that list was being used as the number for the switch command, so a
-    /// window with several tabs was told to switch to a tab that had nothing to
-    /// do with the one asked for - which is why opening a folder that was
-    /// already open left the user on whichever tab was in front instead of the
-    /// one they had clicked. The position in the strip is read from the shell.
-    /// </summary>
-    private async Task SelectTabByHandle(nint windowHandle, nint tabHandle)
-    {
-        if (IsTabInFront(windowHandle, tabHandle)) return;
-
-        // The position in the strip, when the shell can tell us: one command.
-        var stripIndex = await RunConversionInStaThread(() => FindTabStripIndex(windowHandle, tabHandle))
-            .ConfigureAwait(false);
-
-        if (stripIndex >= 0)
-        {
-            var before = FrontTab(windowHandle);
-            SelectTabByIndex(windowHandle, stripIndex);
-            await WaitForFrontTabToChangeAsync(windowHandle, before, 400).ConfigureAwait(false);
-            if (IsTabInFront(windowHandle, tabHandle)) return;
-        }
-
-        // Otherwise every position in the strip is tried in turn. Slower, but it
-        // depends on nothing except the window's own tabs - the shell's list,
-        // which is what the position was read from, can come back empty or in
-        // another order while Explorer is creating a window.
-        var tabCount = Helper.GetAllExplorerTabs(windowHandle).Count();
-        for (var index = 0; index < tabCount; index++)
-        {
-            if (index == stripIndex) continue;
-            if (IsTabInFront(windowHandle, tabHandle)) return;
-
-            var before = FrontTab(windowHandle);
-            SelectTabByIndex(windowHandle, index);
-
-            // Wait for the strip to follow this command before trying the next
-            // one: two switches in flight at once land on a tab that has nothing
-            // to do with the folder that was clicked.
-            await WaitForFrontTabToChangeAsync(windowHandle, before, 400).ConfigureAwait(false);
-            if (IsTabInFront(windowHandle, tabHandle)) return;
-        }
-
-        Log.Warn(
-            $"Could not bring tab 0x{tabHandle:X} of window 0x{windowHandle:X} to the front; " +
-            "the tab strip did not follow the switch command.");
-    }
-
-
-    private static bool IsTabInFront(nint windowHandle, nint tabHandle)
-        => FrontTab(windowHandle) == tabHandle;
-
-    private static nint FrontTab(nint windowHandle)
-        => Helper.GetAllExplorerTabs(windowHandle).FirstOrDefault();
-
-    /// <summary>
-    /// Waits until the tab in front is no longer the one it was. The tab strip
-    /// is driven by a posted command, so nothing may be posted after it until it
-    /// has been carried out.
-    /// </summary>
-    private static async Task WaitForFrontTabToChangeAsync(nint windowHandle, nint previousFront, int timeMs)
-    {
-        var startTicks = Stopwatch.GetTimestamp();
-        while (!Helper.IsTimeUp(startTicks, timeMs))
-        {
-            if (FrontTab(windowHandle) != previousFront) return;
-            await Task.Delay(15).ConfigureAwait(false);
-        }
-    }
-
-    private static void SelectTabByIndex(nint windowHandle, int index)
-    {
-        // 0xA221 is the magic CTRL + 1...n command. It is posted rather than
-        // sent: a send waits for Explorer's own thread to pick the message up,
-        // and a merge may not wait on another application at all - everything
-        // that follows already looks at the tab strip for the result.
-        WinApi.PostMessage(windowHandle, WinApi.WM_COMMAND, 0xA221, index + 1);
-    }
-
-    /// <summary>
-    /// The same "go to tab n" command as <see cref="SelectTabByIndex"/>, but
-    /// posted instead of sent. A sent message waits for a cross-process round
-    /// trip into Explorer, which is busy creating the tab at that very moment;
-    /// posting puts the request into Explorer's own queue right behind the
-    /// new-tab command, so it is handled before the fresh tab can draw the
-    /// default page.
-    /// </summary>
-    private static void PostSelectTabByIndex(nint windowHandle, int index)
-    {
-        WinApi.PostMessage(windowHandle, WinApi.WM_COMMAND, 0xA221, index + 1);
-    }
-
-    private async Task RequestToOpenNewTab(nint windowHandle, bool bringToFront = false)
-    {
         if (windowHandle == 0)
         {
-            await OpenNewWindow(string.Empty);
+            await OpenNewWindowWithSelection(new WindowRecord(string.Empty), lockToOpenWindows);
             return;
         }
 
         var tabHandle = WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
         if (tabHandle == 0) return;
 
-        // 0xA21B is the magic CTRL + T command.
+        // Send 0xA21B magic command (CTRL + T)
         WinApi.PostMessage(tabHandle, WinApi.WM_COMMAND, 0xA21B, 0);
 
         if (bringToFront)
-            WinApi.TryActivate(windowHandle);
+            WinApi.RestoreWindowToForeground(windowHandle);
     }
-
-    private async Task OpenNewWindow(string location)
+    public async Task Open(string? location, bool asTab, nint windowHandle, int delay = 0)
     {
-        var target = string.IsNullOrWhiteSpace(location) ? _defaultLocation : location;
-        await RunConversionInStaThread(() =>
+        if (delay > 0)
+            await Task.Delay(delay);
+
+        var normalizedPath = Helper.NormalizeLocation(location ?? string.Empty);
+        
+        if (normalizedPath.StartsWith("http", StringComparison.OrdinalIgnoreCase) ||
+            normalizedPath.StartsWith("www.", StringComparison.OrdinalIgnoreCase) ||
+            System.IO.File.Exists(normalizedPath))
         {
-            dynamic shell = CreateShell();
             try
             {
-                shell.ShellExecute(target, "", "", "open");
+                Helper.BypassWinForegroundRestrictions();
+                Process.Start(new ProcessStartInfo(normalizedPath) { UseShellExecute = true });
+                return;
             }
-            finally
+            catch
             {
-                Marshal.FinalReleaseComObject(shell);
-            }
-        });
-    }
-
-    private nint GetMainWindowHWnd(nint otherThan)
-    {
-        if (Helper.IsFileExplorerWindow(_mainWindowHandle)
-            && !Helper.IsParkedOffScreen(_mainWindowHandle)
-            && _mainWindowHandle != otherThan)
-        {
-            lock (_itemsLock)
-            {
-                if (!_pendingConversions.Contains(_mainWindowHandle))
-                    return _mainWindowHandle;
+                //
             }
         }
-
-        var allWindows = WinApi.FindAllWindowsEx("CabinetWClass")
-            .Where(h => h != otherThan)
-            .Where(h => !Helper.IsParkedOffScreen(h))
-            .Where(h => !Helper.IsHidden(h))
-            .Where(h =>
-            {
-                lock (_itemsLock)
-                    return !_pendingConversions.Contains(h);
-            })
-            .ToList();
-
-        if (allWindows.Count == 0)
+        
+        if (!asTab)
         {
-            _mainWindowHandle = 0;
-            return 0;
+            await OpenNewWindowWithSelection(new WindowRecord(normalizedPath));
+            return;
         }
 
-        // The window folders have been gathering in keeps that place while it is
-        // still there. It is not asked to be on screen: Explorer hides windows of
-        // its own and hides the window it is working with from time to time, and
-        // a hidden window still has every tab in it. Choosing among the windows
-        // that happen to be on screen instead picked whichever window Explorer
-        // had just put there - a fresh one with one or two tabs - and that is why
-        // folders stopped gathering in the same window every few clicks.
-        if (allWindows.Contains(_mainWindowHandle))
-            return _mainWindowHandle;
+        if (string.IsNullOrWhiteSpace(normalizedPath) && !_reuseTabs)
+        {
+            await RequestToOpenNewTab(windowHandle, bringToFront: true);
+            return;
+        }
 
-        // Otherwise the window with the most tabs is the one the user has been
-        // working in; being on screen only settles a draw.
-        _mainWindowHandle = allWindows
-            .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count())
-            .ThenByDescending(h => WinApi.IsWindowVisible(h))
-            .First();
+        if (_windowEntryDict.Count > 0)
+        {
+            OpenNewTab(windowHandle, normalizedPath);
+            return;
+        }
 
-        return _mainWindowHandle;
+        await OpenNewWindowWithSelection(new WindowRecord(normalizedPath));
     }
-
-    private nint GetTabHandle(object item)
+    public void OpenNewTab(nint windowHandle, string location)
     {
-        // Nothing may escape this method. It is called while the shell is
-        // tearing a window down, and a call that throws there used to take a
-        // whole merge with it: the merge never reached its summary line, the
-        // window it had taken over was never given back, and all that was left
-        // behind was a folder that had gone quiet. Anything that goes wrong
-        // here means the same as "no tab handle", which every caller already
-        // checks for.
-        ETab.Interop.IShellBrowser? shellBrowser = null;
+        _ = OpenTabNavigateWithSelection(new WindowRecord(location, windowHandle), windowHandle);
+    }
+    public async Task DuplicateActiveTab(nint windowHandle, bool asTab)
+    {
+        var activeTabHandle = GetActiveTabHandle(windowHandle);
+        if (activeTabHandle == 0) return;
+
+        var window = GetWindowByTabHandle(activeTabHandle);
+        if (window == null) return;
+
+        var location = _windowEntryDict[window].Value.Location ?? GetLocation(window);
+        var selectedItems = GetSelectedItems(window);
+        var windowRecord = new WindowRecord(location, windowHandle, selectedItems);
+
+        if (!asTab)
+        {
+            await OpenNewWindowWithSelection(windowRecord);
+            return;
+        }
+
+        await OpenTabNavigateWithSelection(windowRecord, windowHandle, isDuplicate: true);
+    }
+    public async Task ReopenClosedTab(bool asTab, nint windowHandle = 0)
+    {
+        WindowRecord? closedWindow;
+        lock (_closedWindowsLock)
+        {
+            closedWindow = _closedWindows.LastOrDefault(w => w.Location != _defaultLocation);
+            if (closedWindow == null) return;
+            _closedWindows.Remove(closedWindow);
+        }
+
+        if (!asTab)
+        {
+            closedWindow.CreatedAt = Environment.TickCount;
+            await OpenNewWindowWithSelection(closedWindow);
+            return;
+        }
+
+        await OpenTabNavigateWithSelection(closedWindow, windowHandle);
+    }
+    public async Task DetachCurrentTab(nint windowHandle)
+    {
+        if (Helper.GetAllExplorerTabs(windowHandle).Take(2).Count() < 2)
+            return;
+
+        var activeTabHandle = GetActiveTabHandle(windowHandle);
+        if (activeTabHandle == 0) return;
+
+        var window = GetWindowByTabHandle(activeTabHandle);
+        if (window == null) return;
+
+        var location = _windowEntryDict[window].Value.Location ?? GetLocation(window);
+        var selectedItems = GetSelectedItems(window);
+        var windowRecord = new WindowRecord(location, windowHandle, selectedItems);
+
+        // Send 0xA021 magic command (CTRL + W)
+        WinApi.SendMessage(activeTabHandle, WinApi.WM_COMMAND, 0xA021, 1);
+
+        await OpenNewWindowWithSelection(windowRecord);
+    }
+    public void SetTargetWindow(nint windowHandle)
+    {
+        if (Helper.IsFileExplorerWindow(windowHandle))
+            _mainWindowHandle = windowHandle;
+    }
+    public void NavigateBackForward(nint windowHandle, bool isForward)
+    {
+        var activeTabHandle = GetActiveTabHandle(windowHandle);
+        if (activeTabHandle == 0) return;
+
+        var window = GetWindowByTabHandle(activeTabHandle);
         try
         {
-            // ReSharper disable once SuspiciousTypeConversion.Global
-            if (item is not ETab.Interop.IServiceProvider sp) return 0;
-
-            sp.QueryService(ref ShellBrowserGuid, ref ShellBrowserGuid, out shellBrowser);
-            if (shellBrowser == null) return 0;
-
-            shellBrowser.GetWindow(out nint hWnd);
-            return hWnd;
+            if (isForward) window?.GoForward();
+            else window?.GoBack();
         }
         catch
         {
-            return 0;
+            // Will throw if there is no further history
+        }
+    }
+
+    private void PreventWindowHiding(nint hWnd)
+    {
+        if (_processedHWnds.TryAdd(hWnd, 0))
+        {
+            // Schedule removal after a short delay
+            _ = Task.Delay(7_000).ContinueWith(t => _processedHWnds.TryRemove(hWnd, out _), TaskScheduler.Default);
+        }
+    }
+    private void OnWindowShown(nint hWinEventHook, uint eventType, nint hWnd, int idObject, int idChild, uint dwEventThread, uint dWmsEventTime)
+    {
+        if (!_isForcingTabs || idObject != 0 || idChild != 0) return;
+        
+        // Check if the hWnd was processed by OnShellWindowRegistered
+        if (_processedHWnds.TryRemove(hWnd, out _)) return;
+        
+        if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
+
+        if (_windowEntryDict.Count < 2 || Helper.IsCtrlShiftDown()) return;
+        Helper.HideWindow(hWnd, SettingsManager.HaveThemeIssue);
+    }
+    private InternetExplorer? GetRecentlyCreatedWindow(out WindowInfo? windowInfo)
+    {
+        // When a new window is registered, it's typically the last in the collection
+        var count = _shellWindows.Count;
+        for (var i = count - 1; i >= 0; i--)
+        {
+            if (_shellWindows.Item(i) is not InternetExplorer window) continue;
+
+            lock (_windowEntryDictLock)
+            {
+                if (_windowEntryDict.Keys.Contains(window)) continue;
+                if (window.GetProperty("seenBefore") is not null) continue;
+                window.PutProperty("seenBefore", true);
+
+                windowInfo = new WindowInfo();
+                _windowEntryDict.Add(window, windowInfo);
+
+                if (_windowEntryDict.Count == 1)
+                {
+                    _mainWindowHandle = new IntPtr(window.HWND);
+
+                    if (SettingsManager.RestorePreviousWindows && _closedWindows.Any(w => w.Restore))
+                        _ = RestorePreviousWindows();
+                }
+                
+                return window;
+            }
+        }
+
+        windowInfo = null;
+        return null;
+    }
+    private async void OnShellWindowRegistered(int __)
+    {
+        var sw = Stopwatch.StartNew();
+        var showAgain = true;
+        nint hWnd = 0;
+        try
+        {
+            var shouldOpenAsWindow = Helper.IsCtrlShiftDown();
+
+            WindowInfo windowInfo = null!;
+            var window = await Helper.DoUntilNotDefaultAsync(() => GetRecentlyCreatedWindow(out windowInfo!), 2_500, 70);
+            if (window == null) return;
+
+            _ = GetTabHandle(window);
+
+            hWnd = new IntPtr(window.HWND);
+            
+            if (shouldOpenAsWindow)
+            {
+                PreventWindowHiding(hWnd);
+                HookWindowEvents(window, windowInfo);
+                return;
+            }
+            
+            var location = GetLocation(window);
+
+            //Control Panel
+            if (location.StartsWith("shell:::{26EE0668-A00A-44D7-9371-BEB064C98683}"))
+            {
+                PreventWindowHiding(hWnd);
+                RemoveWindowAndUnhookEvents(window, windowInfo);
+                return;
+            }
+
+            // Check if this is a single tab window and there are other windows
+            var shouldReopenAsTab = (_isForcingTabs || _reuseTabs) &&
+                                    _windowEntryDict.Count > 1 &&
+                                    hWnd != _mainWindowHandle &&
+                                    Helper.GetAllExplorerTabs(hWnd).Take(2).Count() == 1;
+
+            if (shouldReopenAsTab)
+                Helper.HideWindow(hWnd, SettingsManager.HaveThemeIssue);
+            else
+                PreventWindowHiding(hWnd);
+
+            Log.Info(
+                $"Window 0x{hWnd:X} ('{location}') appeared; " +
+                (shouldReopenAsTab ? "moving its folder into a tab." : "leaving it as a window."));
+
+            // Check if it is a detached tab
+            var isRecentlyClosed = TryGetRecentlyClosedWindow(location, out var closedWindow);
+            if (isRecentlyClosed)
+                SelectItems(window, closedWindow!.SelectedItems);
+
+            shouldReopenAsTab = shouldReopenAsTab && !isRecentlyClosed;
+
+            if (shouldReopenAsTab)
+            {
+                showAgain = false;
+
+                var converted = OpenTabNavigateWithSelection(
+                    new WindowRecord(location, hWnd, GetSelectedItems(window)), _mainWindowHandle);
+
+                window.Quit();
+                RemoveWindowAndUnhookEvents(window, windowInfo);
+                await converted;
+                Log.Info($"0x{hWnd:X} ('{location}') is a tab now after {sw.ElapsedMilliseconds} ms.");
+                return;
+            }
+
+            // OnQuit might fire after ShellWindowRegistered in case of reattached tab (and there were selected files)
+            if (!isRecentlyClosed)
+            {
+                isRecentlyClosed = await Helper.DoUntilNotDefaultAsync(() => TryGetRecentlyClosedWindow(location, out closedWindow), 700, 50);
+                if (isRecentlyClosed)
+                    SelectItems(window, closedWindow!.SelectedItems);
+            }
+
+            HookWindowEvents(window, windowInfo);
+        }
+        catch {/**/}
+        finally
+        {
+            if (showAgain)
+            {
+                await Helper.DoUntilNotDefaultAsync(() => Helper.ShowWindow(hWnd, removeCache: false), 1_500, 200);
+
+                if (!SettingsManager.HaveThemeIssue)
+                    Helper.UpdateWindowLayered(hWnd, remove: true);
+
+                // OnWindowShown might fire after ShellWindowRegistered and hide it again, keep the cache, wait a bit, then remove it.
+                _ = Task.Delay(3000).ContinueWith(t => Helper.HiddenWindows.TryRemove(hWnd, out _), TaskScheduler.Default);
+            }
+        }
+    }
+    private void HookWindowEvents(InternetExplorer window, WindowInfo windowInfo)
+    {
+        // Create strongly-typed handlers so we can remove them later
+        windowInfo.OnQuitHandler = () =>
+        {
+            var location = windowInfo.Location ?? GetLocation(window);
+            var locationName = windowInfo.Name ?? window.LocationName;
+            var windowRecord = new WindowRecord(location, new IntPtr(window.HWND), name: locationName);
+            lock (_closedWindowsLock) _closedWindows.Add(windowRecord);
+
+            // Home, This PC, etc
+            if (location == _defaultLocation)
+            {
+                RemoveWindowAndUnhookEvents(window, windowInfo);
+                return;
+            }
+
+            windowRecord.SelectedItems = GetSelectedItems(window);
+            RemoveWindowAndUnhookEvents(window, windowInfo);
+        };
+
+        if (SettingsManager.RestorePreviousWindows)
+            windowInfo.OnNavigateHandler = (object _, ref object _) =>
+            {
+                windowInfo.Location = GetLocation(window);
+                windowInfo.Name = window.LocationName;
+            };
+
+        try
+        {
+            // Subscribe
+            window.OnQuit += windowInfo.OnQuitHandler;
+            if (SettingsManager.RestorePreviousWindows)
+            {
+                windowInfo.Location = GetLocation(window);
+                windowInfo.Name = window.LocationName;
+                window.NavigateComplete2 += windowInfo.OnNavigateHandler;
+            }
+
+            // Make sure the window is still alive (User might have closed it immediately after opening it)
+            _ = window.HWND;
+        }
+        catch
+        {
+            lock (_windowEntryDictLock)
+                _windowEntryDict.Remove(window);
+        }
+    }
+    private void RemoveWindowAndUnhookEvents(InternetExplorer window, WindowInfo windowInfo, bool useLock = true)
+    {
+        // Unsubscribe
+        if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
+        if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
+
+        // Remove from dictionary
+        if (useLock)
+        {
+            lock (_windowEntryDictLock)
+                _windowEntryDict.Remove(window);
+        }
+        else
+            _windowEntryDict.Remove(window);
+
+        // Finally, release the COM reference for this InternetExplorer instance
+        Marshal.ReleaseComObject(window);
+    }
+
+    private async Task RestorePreviousWindows()
+    {
+        foreach (var record in _closedWindows.Where(record => record.Restore))
+        {
+            record.Restore = false;
+            _ = OpenTabNavigateWithSelection(record);
+        }
+    }
+    private async Task OpenNewWindowWithSelection(WindowRecord windowToOpen, bool duplicate = true, bool lockToOpenWindows = true)
+    {
+        if (lockToOpenWindows)
+            await _toOpenWindowsLock.WaitAsync();
+
+        try
+        {
+            lock (_closedWindowsLock)
+                _closedWindows.Add(windowToOpen);
+
+            var hasSelection = windowToOpen.SelectedItems?.Length > 0;
+
+            nint[]? currentWindows = null;
+            if (hasSelection)
+                currentWindows = Helper.GetAllExplorerWindows().ToArray();
+
+            Helper.BypassWinForegroundRestrictions();
+
+            var location = string.IsNullOrWhiteSpace(windowToOpen.Location) ? _defaultLocation : windowToOpen.Location;
+            await RunInStaThread(() =>
+            {
+                Shell? shell = null;
+                try
+                {
+                    shell = new Shell();
+                    shell.ShellExecute(location, "", "", duplicate ? "opennewwindow" : "open");
+                }
+                finally
+                {
+                    if (shell != null)
+                        Marshal.ReleaseComObject(shell);
+                }
+            });
+
+            if (!hasSelection) return;
+
+            var newWindowHandle = await Helper.ListenForNewExplorerWindowAsync(currentWindows ?? []);
+            if (newWindowHandle == 0) return;
+
+            var window = _windowEntryDict.Keys.FirstOrDefault(w => w.HWND == newWindowHandle);
+            if (window == null) return;
+
+            SelectItems(window, windowToOpen.SelectedItems);
         }
         finally
         {
-            if (shellBrowser != null)
-            {
-                try
-                {
-                    Marshal.ReleaseComObject(shellBrowser);
-                }
-                catch
-                {
-                    // Releasing a disconnected object must not matter either.
-                }
-            }
+            if (lockToOpenWindows)
+                _toOpenWindowsLock.Release();
         }
     }
-
-    /// <summary>
-    /// Looks up the Shell item for a tab handle without running the full shell
-    /// snapshot. This is used while waiting for a newly created tab so the wait
-    /// is both faster and cheaper than a complete PollShellCore pass.
-    /// </summary>
-    /// <summary>
-    /// The shell object for the thread a merge runs on, created the first time
-    /// that thread asks for one. Only ever touched from that thread.
-    /// </summary>
-    private object? ConversionShell()
+    private async Task OpenTabNavigateWithSelection(WindowRecord windowToOpen, nint windowHandle = 0, bool isDuplicate = false, bool forceTabReuse = false)
     {
-        if (_conversionShellApp != null) return _conversionShellApp;
+        await _toOpenWindowsLock.WaitAsync();
         try
         {
-            _conversionShellApp = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"The merge thread could not open the shell: {ex.Message}");
-        }
-        return _conversionShellApp;
-    }
-
-    private object? FindShellItemForTab(nint tabHandle, int startIndex = 0)
-    {
-        var shell = ConversionShell();
-        if (shell == null) return null;
-
-        // Cheap pre-filter: only ShellWindows items hosted in the same
-        // Explorer window can be this tab's item. Comparing the item HWND
-        // (one COM property read) before the QueryService/GetWindow lookup
-        // avoids several COM round-trips per unrelated window, which matters
-        // because this runs repeatedly while waiting for the tab to register.
-        var parentWindow = WinApi.GetParent(tabHandle);
-        if (parentWindow == 0) return null;
-
-        object? found = null;
-        try
-        {
-            dynamic windows = ((dynamic)shell).Windows();
-            var count = (int)windows.Count;
-            // Items are added in creation order, so a tab that has just been
-            // created can only be one of the entries added since the last look.
-            for (var i = Math.Max(startIndex, 0); i < count; i++)
+            if ((_reuseTabs || forceTabReuse) && !isDuplicate && _windowEntryDict.Count > 0)
             {
-                object item;
-                try
+                var existingTab = SearchForTab(windowToOpen.Location);
+                if (existingTab != 0)
                 {
-                    item = (object)windows.Item(i);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (GetWindowHandle(item) != parentWindow) continue;
-                if (GetTabHandle(item) != tabHandle)
-                    continue;
-
-                found = item;
-                break;
-            }
-        }
-        catch
-        {
-            // ShellWindows can be temporarily unavailable during tab creation.
-        }
-
-        if (found != null)
-        {
-            lock (_itemsLock)
-                _tabToItem[tabHandle] = found;
-            return found;
-        }
-
-        // A tab that was created in the background has no browser of its own
-        // yet, so the shell cannot say which tab an item belongs to: this tab's
-        // item is the one that pairs with no tab, and this tab is the one that
-        // pairs with no item. Together they are the same tab. Without this the
-        // tab was never matched - the folder was given up on and the tab was left
-        // sitting on Explorer's own page, which is what a click on that folder
-        // later found: no tab showing it, and nothing to go back to.
-        found = FindUnpairedItemForTab(tabHandle);
-        if (found != null)
-        {
-            lock (_itemsLock)
-                _tabToItem[tabHandle] = found;
-        }
-
-        return found;
-    }
-
-    /// <summary>
-    /// The item of a tab whose browser the shell has not created yet: the one
-    /// item of the window that belongs to no tab. Only ever returns something
-    /// when exactly one tab and exactly one item are left over, so it cannot
-    /// pick a tab that belongs to something else.
-    /// </summary>
-    private object? FindUnpairedItemForTab(nint tabHandle)
-    {
-        var shell = ConversionShell();
-        if (shell == null) return null;
-
-        var window = WinApi.GetParent(tabHandle);
-        if (window == 0) return null;
-
-        var tabs = WinApi.FindAllWindowsEx("ShellTabWindowClass", window).ToList();
-        if (!tabs.Contains(tabHandle)) return null;
-
-        var pairedTabs = new HashSet<nint>();
-        var unpairedItemList = new List<object>();
-        object? unpairedItem = null;
-        var unpairedItems = 0;
-
-        try
-        {
-            dynamic windows = ((dynamic)shell).Windows();
-            var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
-            {
-                object item;
-                try
-                {
-                    item = (object)windows.Item(i);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (GetWindowHandle(item) != window) continue;
-
-                var itemTab = GetTabHandle(item);
-                if (itemTab != 0)
-                {
-                    pairedTabs.Add(itemTab);
-                    continue;
-                }
-
-                unpairedItem = item;
-                unpairedItems++;
-                unpairedItemList.Add(item);
-            }
-        }
-        catch
-        {
-            return null;
-        }
-
-        var unpairedTabs = tabs.Where(tab => !pairedTabs.Contains(tab)).ToList();
-        if (unpairedItems == 1 && unpairedTabs.Count == 1)
-            return unpairedTabs[0] == tabHandle ? unpairedItem : null;
-
-        // More than one tab can be waiting for its browser at the same time when
-        // folders are opened in a row. They are then told apart by the name each
-        // one carries, which the tab window and the item both have.
-        var wanted = WinApi.GetWindowTitle(tabHandle);
-        if (string.IsNullOrWhiteSpace(wanted)) return null;
-
-        object? match = null;
-        var matches = 0;
-        foreach (var candidate in unpairedItemList)
-        {
-            var name = TryGetDisplayName(candidate);
-            if (!string.Equals(name, wanted, StringComparison.OrdinalIgnoreCase)) continue;
-            match = candidate;
-            matches++;
-        }
-
-        return matches == 1 && unpairedTabs.Count == unpairedItems ? match : null;
-    }
-
-    /// <summary>
-    /// The name the shell shows for one of its items - the folder's own name for
-    /// a folder, or Explorer's own page name. Used to tell one waiting tab from
-    /// another when several are waiting at once.
-    /// </summary>
-    private static string? TryGetDisplayName(object item)
-    {
-        try
-        {
-            var name = (string?)((dynamic)item).LocationName;
-            return string.IsNullOrWhiteSpace(name) ? null : name;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Waits for the Shell item of a tab that has just been created.
-    ///
-    /// Explorer registers a tab with ShellWindows roughly 100 ms after the tab
-    /// window appears. Reading the entry count is one cheap call, so it is done
-    /// first and the list is only walked when that count actually moved - a walk
-    /// over every open tab is several COM calls into the very Explorer that is
-    /// still busy starting this tab. The wait is kept as short as it can be
-    /// because the tab spends it sitting on Explorer's default "Home" page.
-    /// </summary>
-    private async Task<object?> WaitForTabItemAsync(nint tabHandle, int timeMs, int firstNewIndex = 0)
-    {
-        var startTicks = Stopwatch.GetTimestamp();
-        var lastCount = -1;
-        var lastScanTicks = startTicks;
-
-        while (!Helper.IsTimeUp(startTicks, timeMs))
-        {
-            var count = await RunConversionInStaThread(GetShellWindowCount);
-            var lookMs = PendingConversionCount() > 2 ? ItemLookBusyMs : ItemLookMs;
-            if (count > 0 && (count != lastCount || Helper.IsTimeUp(lastScanTicks, lookMs)))
-            {
-                // The entries this tab could be are the ones that appeared with
-                // it, so a look normally starts there instead of walking every
-                // open tab; a full pass every so often still covers an entry
-                // that landed somewhere else in the list. The look is cheap
-                // enough to repeat often, and repeating it is what decides how
-                // long the folder waits: Explorer registers the tab somewhere
-                // in these few hundred milliseconds, and until this app looks at
-                // the moment it did, the folder sits there.
-                var full = Helper.IsTimeUp(lastScanTicks, ItemFullLookMs);
-                var from = full ? 0 : Math.Max(firstNewIndex, 0);
-                lastCount = count;
-                lastScanTicks = Stopwatch.GetTimestamp();
-                var item = await RunConversionInStaThread(() => FindShellItemForTab(tabHandle, from));
-                if (item != null) return item;
-            }
-
-            await Task.Delay(20);
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// How many entries ShellWindows exposes right now: a single COM call, used
-    /// as a cheap "did anything register since the last look" signal.
-    /// </summary>
-    private int PendingConversionCount()
-    {
-        lock (_itemsLock)
-            return _pendingConversions.Count;
-    }
-
-    private int GetShellWindowCount()
-    {
-        var shell = ConversionShell();
-        if (shell == null) return -1;
-
-        try
-        {
-            return (int)((dynamic)shell).Windows().Count;
-        }
-        catch
-        {
-            return -1;
-        }
-    }
-
-    /// <summary>
-    /// Shows the tab that was just created. It was left in the background while
-    /// it loaded so Explorer's default "Home" page never appeared, and by now it
-    /// shows the target folder.
-    /// </summary>
-    private async Task BringNewTabToFrontAsync(nint windowHandle, nint tabHandle)
-    {
-        // The tab was created in the background so it could load the target
-        // folder without Explorer's default page appearing. Show it now that it
-        // holds the folder the user asked for.
-        //
-        // The position is read from the tab strip itself: ShellWindows lists the
-        // tabs of one window in strip order, while enumerating the tab windows
-        // follows activation and therefore keeps changing.
-        for (var attempt = 0; attempt < 8; attempt++)
-        {
-            var tabs = Helper.GetAllExplorerTabs(windowHandle).ToArray();
-            if (tabs.Length == 0) return;
-            if (tabs[0] == tabHandle) return;
-
-            var index = await RunConversionInStaThread(() => FindTabStripIndex(windowHandle, tabHandle));
-            if (index < 0) break;
-
-            SelectTabByIndex(windowHandle, index);
-            await Task.Delay(20);
-        }
-
-        // No strip position was available (the tab is not registered with
-        // ShellWindows yet), so walk the strip instead.
-        await SelectTabByHandle(windowHandle, tabHandle);
-    }
-    /// <summary>
-    /// Position of a tab inside its window's tab strip. ShellWindows lists the
-    /// tabs of one window in strip order, so counting the entries that belong to
-    /// the same window before this one gives the position the tab commands use.
-    /// </summary>
-    /// <summary>
-    /// How long a new tab is given to draw the folder it was navigated to
-    /// before the window switches to it. Measured: 300-650 ms from the moment
-    /// the navigation was issued.
-    /// </summary>
-    private const int TabLoadWaitMs = 900;
-
-    /// <summary>
-    /// Earliest moment the title check is trusted. Explorer's tab window starts
-    /// out titled after the application itself and only picks up the default
-    /// page a moment later, so a title change inside this window would be that
-    /// first step rather than the folder being ready.
-    /// </summary>
-    private const int TabTitleTrustMs = 100;
-
-    /// <summary>
-    /// Waits until a tab shows the folder it was sent to instead of the default
-    /// page, so the window can switch to it without the default page ever being
-    /// visible.
-    ///
-    /// A tab that is not in front keeps reporting the default page's title while
-    /// it loads, so the title cannot be the only signal; the measured load time
-    /// is the part that always holds, and the title is an early exit for the
-    /// runs where Explorer does update it before the tab is shown.
-    /// </summary>
-    private async Task WaitForTabLoadedAsync(nint tabHandle, string defaultTitle, int timeMs)
-    {
-        var startTicks = Stopwatch.GetTimestamp();
-        while (!Helper.IsTimeUp(startTicks, timeMs))
-        {
-            if (!WinApi.IsWindow(tabHandle)) return;
-
-            if (Helper.IsTimeUp(startTicks, TabTitleTrustMs))
-            {
-                var title = WinApi.GetWindowTitle(tabHandle);
-                if (!string.IsNullOrWhiteSpace(title)
-                    && !string.Equals(title, defaultTitle, StringComparison.Ordinal))
+                    windowHandle = WinApi.GetParent(existingTab);
+                    await SelectTabByHandle(windowHandle, existingTab);
+                    WinApi.RestoreWindowToForeground(windowHandle);
                     return;
-            }
-
-            await Task.Delay(15);
-        }
-    }
-    private int FindTabStripIndex(nint windowHandle, nint tabHandle)
-    {
-        var shell = ConversionShell();
-        if (shell == null) return -1;
-
-        var index = 0;
-        try
-        {
-            dynamic windows = ((dynamic)shell).Windows();
-            var count = (int)windows.Count;
-            for (var i = 0; i < count; i++)
-            {
-                object item;
-                try
-                {
-                    item = (object)windows.Item(i);
                 }
-                catch
-                {
-                    continue;
-                }
-
-                var handle = GetTabHandle(item);
-                if (handle == 0) continue;
-                if (WinApi.GetParent(handle) != windowHandle) continue;
-                if (handle == tabHandle) return index;
-                index++;
             }
-        }
-        catch
-        {
-            // ShellWindows can be temporarily unavailable while tabs change.
-        }
 
-        return -1;
-    }
-    /// <summary>
-    /// Forgets every tab of a window, by the window's own handle. Used for the
-    /// window a merge replaced, at the moment it is closed: there is nothing
-    /// worth asking the shell for any more, and asking can cost the whole merge.
-    /// </summary>
-    private void RemoveTabsOfWindow(nint windowHandle)
-    {
-        var removed = 0;
-        lock (_itemsLock)
-        {
-            foreach (var tabHandle in _tabInfos
-                         .Where(pair => pair.Value.WindowHandle == windowHandle)
-                         .Select(pair => pair.Key)
-                         .ToList())
+            // Get the main window
+            var mainWindowHWnd = Helper.IsFileExplorerWindow(windowHandle)
+                ? windowHandle
+                : GetMainWindowHWnd(windowToOpen.Handle);
+
+            if (mainWindowHWnd == 0)
             {
-                _tabInfos.Remove(tabHandle);
-                _tabToItem.TryRemove(tabHandle, out _);
-                removed++;
+                await OpenNewWindowWithSelection(windowToOpen, lockToOpenWindows: false);
+                return;
             }
+
+            // Store the current tabs
+            var currentTabs = Helper.GetAllExplorerTabs(mainWindowHWnd).ToArray();
+
+            // Request to open a new tab
+            await RequestToOpenNewTab(mainWindowHWnd, lockToOpenWindows: false);
+
+            // Wait for the new tab
+            var newTabHandle = await Helper.ListenForNewExplorerTabAsync(mainWindowHWnd, currentTabs, 2_000);
+            if (newTabHandle == 0) return;
+
+            // Get the window object
+            var window = await Helper.DoUntilNotDefaultAsync(() => GetWindowByTabHandle(newTabHandle), 2_000, 50);
+            if (window == null) return;
+
+            var tcs = new TaskCompletionSource<bool>();
+            DWebBrowserEvents2_NavigateComplete2EventHandler navigateHandler = null!;
+            navigateHandler = (object _, ref object _) =>
+            {
+                window.NavigateComplete2 -= navigateHandler;
+                tcs.TrySetResult(true);
+                SelectItems(window, windowToOpen.SelectedItems);
+            };
+
+            window.NavigateComplete2 += navigateHandler;
+            try
+            {
+                await Navigate(window, windowToOpen.Location);
+            }
+            catch
+            {
+                window.NavigateComplete2 -= navigateHandler;
+                tcs.TrySetResult(false);
+            }
+
+            WinApi.RestoreWindowToForeground(mainWindowHWnd);
+
+            var timeoutTask = Task.Delay(5000);
+            await Task.WhenAny(tcs.Task, timeoutTask);
         }
-
-        if (removed > 0)
-            Log.Info($"Forgot {removed} tab(s) of window 0x{windowHandle:X}; {TotalTabs()} tab(s) left in the bookkeeping.");
-    }
-
-    private int TotalTabs()
-    {
-        lock (_itemsLock)
-            return _tabInfos.Count;
-    }
-
-    private void RemoveItem(object item)
-    {
-        var tabHandle = GetTabHandle(item);
-        lock (_itemsLock)
+        finally
         {
-            if (tabHandle == 0) return;
-            _tabToItem.TryRemove(tabHandle, out _);
-            _tabInfos.Remove(tabHandle);
+            _toOpenWindowsLock.Release();
         }
     }
-
-    private static nint GetWindowHandle(object item)
+    private bool TryGetRecentlyClosedWindow(string location, out WindowRecord? closedWindow, int maxAge = 2_000)
     {
+        nint targetPidl = 0;
         try
         {
-            return new IntPtr(Convert.ToInt64(((dynamic)item).HWND));
+            targetPidl = _shellPathComparer.GetPidlFromPath(location);
+            lock (_closedWindowsLock)
+            {
+                for (var i = _closedWindows.Count - 1; i >= 0; i--)
+                {
+                    var record = _closedWindows[i];
+                    if (Environment.TickCount - record.CreatedAt > maxAge) break;
+                    if (!_shellPathComparer.IsEquivalent(location, record.Location, targetPidl)) continue;
+                    _closedWindows.RemoveAt(i);
+                    closedWindow = record;
+                    return true;
+                }
+            }
+            closedWindow = null;
+            return false;
         }
-        catch
+        finally
         {
-            return 0;
+            if (targetPidl != 0)
+                Marshal.FreeCoTaskMem(targetPidl);
         }
     }
-
-    private static string? TryGetLocation(object item)
+    private nint GetMainWindowHWnd(nint otherThan)
     {
-        try
-        {
-            dynamic window = item;
-            var path = (string?)window.LocationURL;
-            if (!string.IsNullOrWhiteSpace(path))
-                return Helper.NormalizeLocation(path);
+        if (Helper.IsFileExplorerWindow(_mainWindowHandle))
+            return _mainWindowHandle;
 
-            var document = window.Document;
-            if (document == null) return null;
+        var allWindows = WinApi.FindAllWindowsEx("CabinetWClass");
 
-            var folder = document.Folder;
-            if (folder == null) return null;
+        // Get another handle other than the newly created one. (In case if it is still alive.)
+        _mainWindowHandle = allWindows
+            .Where(h => h != otherThan)
+            .Reverse() // To get the last one in the z-index (the oldest)
+            .OrderByDescending(h => WinApi.FindAllWindowsEx("ShellTabWindowClass", h).Count()) // The one with the most tabs first
+            .FirstOrDefault();
 
-            var self = folder.Self;
-            if (self == null) return null;
+        if (_mainWindowHandle != 0) return _mainWindowHandle;
 
-            return Helper.NormalizeLocation((string)self.Path);
-        }
-        catch
-        {
-            return null;
-        }
+        return Helper.IsFileExplorerWindow(otherThan) ? otherThan : 0;
     }
-
-    private static string[]? TryGetSelectedItems(object item)
+    private Task<nint> GetTabHandle(InternetExplorer window)
     {
-        try
+        if (_windowEntryDict.TryGetValue(window, out WindowEntry entry) && entry.OptionalKey is { } handle and > 0)
+            return Task.FromResult(handle);
+
+        // Schedule the operation on STA
+        return RunInStaThread(() =>
         {
-            dynamic document = ((dynamic)item).Document;
-            if (document == null) return null;
+            // ReSharper disable once SuspiciousTypeConversion.Global
+            if (window is not Interop.IServiceProvider sp) return 0;
 
-            dynamic selectedItems = document.SelectedItems();
-            var count = (int)selectedItems.Count;
-            if (count == 0) return null;
+            sp.QueryService(ref _shellBrowserGuid, ref _shellBrowserGuid, out var shellBrowser);
+            if (shellBrowser == null) return 0;
 
-            var result = new string[count];
-            for (var i = 0; i < count; i++)
-                result[i] = (string)selectedItems.Item(i).Name;
+            try
+            {
+                shellBrowser.GetWindow(out var hWnd);
 
-            return result;
-        }
-        catch
-        {
-            return null;
-        }
+                if (hWnd != 0)
+                    _windowEntryDict.UpdateOptionalKey(window, hWnd);
+
+                return hWnd;
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(shellBrowser);
+            }
+        });
     }
+    private static nint GetActiveTabHandle(nint windowHandle)
+    {
+        // Active tab always at the top of the z-index
+        return WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
+    }
+    private InternetExplorer? GetWindowByTabHandle(nint tabHandle)
+    {
+        if (tabHandle == 0) return null;
+        return _windowEntryDict.TryGetValue(tabHandle, out InternetExplorer? foundWindow) ? foundWindow : null;
+    }
+    private static string[]? GetSelectedItems(InternetExplorer window)
+    {
+        var selectedItems = (window.Document as ShellFolderView)!.SelectedItems();
+        var count = selectedItems.Count;
+        if (count == 0) return null;
 
-    private static void SelectItems(object item, string[]? names)
+        var result = new string[count];
+        for (var i = 0; i < count; i++)
+        {
+            result[i] = selectedItems.Item(i).Name;
+        }
+
+        return result;
+    }
+    private static void SelectItems(InternetExplorer window, string[]? names)
     {
         if (names == null || names.Length == 0) return;
 
-        try
-        {
-            dynamic document = ((dynamic)item).Document;
-            if (document == null) return;
+        if (window.Document is not ShellFolderView document) return;
 
-            for (var i = 0; i < names.Length; i++)
-            {
-                dynamic selected = document.Folder.ParseName(names[i]);
-                if (selected == null) continue;
-                document.SelectItem(selected, 1);
-            }
-        }
-        catch
+        for (var i = 0; i < names.Length; i++)
         {
-            // Selecting items is best effort.
+            var name = names[i];
+            object item = document.Folder.ParseName(name);
+            if (item == null) continue;
+            document.SelectItem(ref item, 1);
         }
     }
-
-    private async Task Navigate(object item, string path)
+    private static string GetLocation(InternetExplorer window)
     {
-        dynamic window = item;
+        var path = window.LocationURL;
+        if (!string.IsNullOrWhiteSpace(path)) return Helper.NormalizeLocation(path);
+
+        // Recycle Bin, This PC, etc
+        path = ((window.Document as ShellFolderView)!.Folder as Folder2)!.Self.Path;
+        return Helper.NormalizeLocation(path);
+    }
+    private async Task Navigate(InternetExplorer window, string path)
+    {
         if (!path.Contains("#") && !path.Contains("%23"))
         {
             window.Navigate2(path);
             return;
         }
 
-        object? folder = null;
-        await RunConversionInStaThread(() =>
+        var folder = await RunInStaThread(() =>
         {
-            dynamic shell = CreateShell();
+            Shell? shell = null;
+            Folder? folder;
             try
             {
-                folder = (object?)shell.NameSpace(path);
+                shell = new Shell();
+                folder = shell.NameSpace(path);
             }
             finally
             {
-                Marshal.FinalReleaseComObject(shell);
+                if (shell != null)
+                    Marshal.ReleaseComObject(shell);
             }
+            return folder;
         });
 
         try
@@ -2799,222 +858,191 @@ public sealed class ExplorerWatcher : IDisposable
         finally
         {
             if (folder != null)
-                Marshal.FinalReleaseComObject(folder);
+                Marshal.ReleaseComObject(folder);
         }
     }
-
-    private static dynamic CreateShell()
+    private Task RunInStaThread(Action action, TaskCreationOptions tco = default, CancellationToken ct = default)
     {
-        return (dynamic)Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!)!;
+        return Task.Factory.StartNew(action, ct, tco, _staTaskScheduler);
     }
-
-    private Task RunInStaThread(Action action)
+    private Task<T?> RunInStaThread<T>(Func<T?> action, TaskCreationOptions tco = default, CancellationToken ct = default)
     {
-        return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
+        return Task.Factory.StartNew(action, ct, tco, _staTaskScheduler);
     }
-
-    private Task<T> RunInStaThread<T>(Func<T> func)
+    
+    private void StartExplorerProcessCheck() => _explorerCheckTimer = new Timer(CheckForMainExplorer, null, 0, 1000);
+    private void CheckForMainExplorer(object? state)
     {
-        return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _staTaskScheduler);
-    }
-
-    private Task RunConversionInStaThread(Action action)
-    {
-        return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
-    }
-
-    private Task<T> RunConversionInStaThread<T>(Func<T> func)
-    {
-        return Task.Factory.StartNew(func, CancellationToken.None, TaskCreationOptions.None, _conversionStaTaskScheduler);
-    }
-
-    /// <summary>
-    /// Milliseconds since a WinEvent timestamp. WinEvent times are 32-bit
-    /// tick counts, so the difference is taken in 32-bit arithmetic and a
-    /// nonsensical result (clock change, suspended machine) is reported as 0.
-    /// </summary>
-    private static long MsSinceEvent(uint eventTime)
-    {
-        var delta = unchecked((uint)Environment.TickCount64 - eventTime);
-        return delta > 60_000 ? 0 : delta;
-    }
-
-    private void MarkActivity()
-    {
-        Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
-    }
-
-    /// <summary>
-    /// Periodically (every 30s) checks whether the app has been idle for a few
-    /// minutes, then reclaims transient COM/WPF garbage and hands idle
-    /// working-set pages back to the OS. Gated on idleness so it never pauses
-    /// the UI during conversions or rapid tab switching.
-    /// </summary>
-    private void StartMemoryMaintenance()
-    {
-        _maintenanceTimer = new Timer(MemoryMaintenanceTick, null, MaintenanceInterval, MaintenanceInterval);
-    }
-
-    private void MemoryMaintenanceTick(object? state)
-    {
-        if (_disposed) return;
-
-        var idleSeconds = (Stopwatch.GetTimestamp() - Volatile.Read(ref _lastActivityTicks)) / (double)Stopwatch.Frequency;
-        if (idleSeconds < IdleTrimAfterSeconds) return;
-
-        try
-        {
-            GC.Collect(GC.MaxGeneration, GCCollectionMode.Optimized, blocking: false, compacting: false);
-            WinApi.TrimWorkingSet();
-        }
-        catch
-        {
-            // Reclaiming memory must never affect the app.
-        }
-    }
-    private void StartExplorerProcessCheck()
-    {
+        var process = Helper.GetMainExplorerProcess();
+        if (process == null) return;
+        
         _explorerCheckTimer?.Dispose();
         _explorerCheckTimer = null;
-        _explorerCheckTimer = new Timer(CheckForMainExplorer, null, 0, 1_000);
-    }
-
-    private void OnMainExplorerExited(object? sender, EventArgs e)
-    {
-        HandleMainExplorerTerminated();
-    }
-
-    private void HandleMainExplorerTerminated()
-    {
+        
         lock (_processLock)
         {
-            if (_mainExplorerProcessId == 0) return;
-
-            _mainExplorerProcessId = 0;
-            try
+            if (_mainExplorerProcessId != 0) return;
+            
+            _mainExplorerProcessId = process.Id;
+            InitializeShellObjects();
+            OnShellInitialized?.Invoke();
+        }
+    }
+    private void OnExplorerProcessTerminated(object? s, ProcessEventArgs e)
+    {
+        // Main explorer.exe process (_shellWindows must be restarted)
+        lock (_processLock)
+        {
+            if (e.ProcessId == _mainExplorerProcessId)
             {
-                _mainExplorerProcess?.Dispose();
+                _mainExplorerProcessId = 0;
+                DisposeShellObjects();
+                StartExplorerProcessCheck();
+                return;
             }
-            catch
+        }
+        
+        // Other explorer.exe processes
+        lock (_windowEntryDictLock)
+        {
+            if (_windowEntryDict.Count == 0) return;
+            var crashCount = 0;
+            for (var i = _windowEntryDict.Count - 1; i >= 0; i--)
             {
-                // The process object may already be in a terminating state.
+                var (window, info) = _windowEntryDict.ElementAt<WindowEntry>(i);
+                try
+                {
+                    _ = window.HWND;
+                }
+                catch
+                {
+                    if (info.OnNavigateHandler != null)
+                    {
+                        crashCount++;
+                        lock (_closedWindowsLock)
+                            _closedWindows.Add(new WindowRecord(info.Location!, name: info.Name!));
+                    }
+                    
+                    RemoveWindowAndUnhookEvents(window, info, useLock: false);
+                }
             }
-            _mainExplorerProcess = null;
-
-            Log.Warn("Explorer process terminated; reinitializing watcher.");
-            DisposeShellObjects();
-            StartExplorerProcessCheck();
+            if (!SettingsManager.RestorePreviousWindows || _windowEntryDict.Count > 0) return;
+            lock (_closedWindowsLock)
+            {
+                for (var i = 1; i <= crashCount; i++)
+                    _closedWindows[_closedWindows.Count - i].Restore = true;
+            }
         }
     }
 
-    private void DisposeShellObjects(bool restoreHiddenWindows = false)
+    private void InitializeShellObjects()
     {
-        if (_pollTimer != null)
+        _shellPathComparer = new ShellPathComparer();
+        _staTaskScheduler = new StaTaskScheduler();
+        _shellWindows = new ShellWindows();
+
+        _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
+        
+        if (SettingsManager.ClosedWindows != null)
+            lock (_closedWindowsLock) _closedWindows.AddRange(SettingsManager.ClosedWindows);
+
+        // Hook the global "WindowRegistered" event
+        _windowRegisteredHandler = OnShellWindowRegistered;
+        _shellWindows.WindowRegistered += _windowRegisteredHandler;
+
+        // Hook the global "OBJECT_SHOW" event
+        _eventObjectShowHookCallback = OnWindowShown;
+        _eventObjectShowHookId = WinApi.SetWinEventHook(WinApi.EVENT_OBJECT_SHOW, WinApi.EVENT_OBJECT_SHOW, 0, _eventObjectShowHookCallback, 0, 0, 0);
+
+        // Hook the event handlers for already-open windows
+        var hasOpen = false;
+        var count = _shellWindows.Count;
+        for (var i = 0; i < count; i++)
         {
-            _pollTimer.Dispose();
-            _pollTimer = null;
+            if (_shellWindows.Item(i) is not InternetExplorer window)
+                continue;
+            hasOpen = true;
+
+            var windowInfo = new WindowInfo();
+            _windowEntryDict.Add(window, windowInfo);
+            window.PutProperty("seenBefore", true);
+
+            _ = GetTabHandle(window);
+            HookWindowEvents(window, windowInfo);
         }
 
-        if (_eventObjectCreateHookCallback != null)
-        {
-            if (_eventObjectCreateHookId != 0)
-                WinApi.UnhookWinEvent(_eventObjectCreateHookId);
-            _eventObjectCreateHookId = 0;
-            _eventObjectCreateHookCallback = null;
-        }
+        if (!hasOpen) return;
+        lock (_closedWindowsLock)
+            foreach (var window in _closedWindows) window.Restore = false;
+    }
+    private void DisposeShellObjects()
+    {
+        PersistWindows();
 
+        // Unhook global event
+        if (_windowRegisteredHandler != null)
+        {
+            _shellWindows.WindowRegistered -= _windowRegisteredHandler;
+            _windowRegisteredHandler = null;
+        }
         if (_eventObjectShowHookCallback != null)
         {
-            if (_eventObjectShowHookId != 0)
-                WinApi.UnhookWinEvent(_eventObjectShowHookId);
-            _eventObjectShowHookId = 0;
+            WinApi.UnhookWinEvent(_eventObjectShowHookId);
             _eventObjectShowHookCallback = null;
         }
 
-        // Windows hidden by this app are handed back only when the app itself
-        // is going away. Re-initializing the watcher (after a real Explorer
-        // restart, say) must never flash a half-merged window back on screen:
-        // those windows are restored by ScheduleShowFallback, or by the
-        // conversion that owns them, within a second or so.
-        if (restoreHiddenWindows)
+        // Unsubscribe from each InternetExplorer instance's events
+        foreach (var (window, windowInfo) in _windowEntryDict)
         {
-            Helper.RestoreAllHiddenWindows();
+            // Unsubscribe
+            if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
+            if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
+
+            // Release the COM object
+            Marshal.ReleaseComObject(window);
         }
-        else
+        _windowEntryDict.Clear();
+
+        // Release the ShellWindows COM object
+        Marshal.ReleaseComObject(_shellWindows);
+
+        _shellPathComparer.Dispose();
+        _staTaskScheduler.Dispose();
+    }
+
+    private void PersistWindows()
+    {
+        var store = new List<WindowRecord>();
+        lock (_closedWindowsLock)
         {
-            // Handles that died with the old Explorer process must not linger:
-            // a recycled handle could otherwise be mistaken for a window that
-            // this app is still hiding.
-            foreach (var hWnd in Helper.HiddenWindows.Keys.ToList())
+            if (SettingsManager.SaveClosedHistory) store.AddRange(_closedWindows);
+            _closedWindows.Clear();
+        }
+
+        // Save currently open windows (explorer crash / system restart, logoff / AppExit)
+        if (SettingsManager.RestorePreviousWindows)
+            lock (_windowEntryDictLock)
             {
-                if (!WinApi.IsWindow(hWnd))
-                    Helper.HiddenWindows.TryRemove(hWnd, out _);
+                store.AddRange(_windowEntryDict.Values
+                    .Where(w => w.OnNavigateHandler != null)
+                    .Select(w => new WindowRecord(w.Location!, name: w.Name!, restore: true)));
             }
-        }
-
-        lock (_itemsLock)
-        {
-            _tabInfos.Clear();
-            _tabToItem.Clear();
-            _leftAlone.Clear();
-            _windowsAtStartup.Clear();
-            _candidates.Clear();
-            _candidateUntil.Clear();
-            _pendingConversions.Clear();
-        }
-
-        _shellPathComparer?.Dispose();
-        _shellPathComparer = null;
-
-        if (_conversionShellApp != null)
-        {
-            try
-            {
-                Marshal.FinalReleaseComObject(_conversionShellApp);
-            }
-            catch
-            {
-                // Nothing to do while shutting down.
-            }
-            _conversionShellApp = null;
-        }
-
-        if (_shellApp != null)
-        {
-            Marshal.FinalReleaseComObject(_shellApp);
-            _shellApp = null;
-        }
-
-        _mainWindowHandle = 0;
+        
+        // DistinctBy location
+        var distinctItems = store
+            .GroupBy(w => w.Location)
+            .Select(g => g.Last())
+            .ToArray();
+        
+        // TakeLast 100
+        SettingsManager.ClosedWindows = distinctItems.Skip(Math.Max(0, distinctItems.Length - 100)).ToArray();
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        Log.Info("Explorer watcher disposed.");
-
-        _explorerCheckTimer?.Dispose();
-        _explorerCheckTimer = null;
-        _maintenanceTimer?.Dispose();
-
-        lock (_processLock)
-        {
-            try
-            {
-                _mainExplorerProcess?.Dispose();
-            }
-            catch
-            {
-                // Ignore disposal errors during shutdown.
-            }
-            _mainExplorerProcess = null;
-        }
-
-        DisposeShellObjects(restoreHiddenWindows: true);
-        _staTaskScheduler.Dispose();
-        _conversionStaTaskScheduler.Dispose();
-
+        DisposeShellObjects();
+        _instanceRunning = false;
+        _processWatcher.Dispose();
         GC.SuppressFinalize(this);
     }
 }

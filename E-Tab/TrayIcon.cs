@@ -45,10 +45,11 @@ public sealed class TrayIcon : IDisposable
         _autoStartItem.Click += (_, _) => AutoStartManager.SetEnabled(_autoStartItem.Checked);
 
         _autoMergeItem = new ToolStripMenuItem("Auto-merge new windows") { CheckOnClick = true };
-        _autoMergeItem.Checked = _watcher.AutoMerge;
+        _autoMergeItem.Checked = _watcher.IsHookActive;
         _autoMergeItem.Click += (_, _) =>
         {
-            _watcher.AutoMerge = _autoMergeItem.Checked;
+            if (_autoMergeItem.Checked) _watcher.StartHook();
+            else _watcher.StopHook();
             Log.Info("Auto-merge setting changed to " + _autoMergeItem.Checked);
         };
 
@@ -86,7 +87,7 @@ public sealed class TrayIcon : IDisposable
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
         _menu.Opening += (_, _) => _autoStartItem.Checked = AutoStartManager.IsEnabled();
-        _menu.Opening += (_, _) => _autoMergeItem.Checked = _watcher.AutoMerge;
+        _menu.Opening += (_, _) => _autoMergeItem.Checked = _watcher.IsHookActive;
 
         _notifyIcon.ContextMenuStrip = _menu;
         _notifyIcon.MouseUp += (_, e) =>

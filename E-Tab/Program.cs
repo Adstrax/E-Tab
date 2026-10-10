@@ -3,6 +3,7 @@ using System.Threading;
 using System.Windows.Forms;
 using ETab.Helpers;
 using ETab.Hooks;
+using ETab.Managers;
 
 namespace ETab;
 
@@ -76,6 +77,7 @@ internal sealed class ETabApplicationContext : ApplicationContext
         Application.Idle -= OnFirstIdle;
 
         _explorerWatcher = new ExplorerWatcher();
+        if (SettingsManager.AutoMerge) _explorerWatcher.StartHook();
         _trayIcon = new TrayIcon(_explorerWatcher!);
     }
 
