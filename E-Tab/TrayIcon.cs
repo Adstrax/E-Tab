@@ -4,9 +4,11 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using ETab.Helpers;
 using ETab.Hooks;
+using ETab.Managers;
 using ETab.WinAPI;
 using Microsoft.Win32;
 
@@ -25,6 +27,7 @@ public sealed class TrayIcon : IDisposable
     private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _autoStartItem;
     private readonly ToolStripMenuItem _autoMergeItem;
+    private readonly ToolStripMenuItem _updateItem;
     private readonly HotkeyWindow? _hotkey;
     private readonly ExplorerWatcher _watcher;
     private bool _disposed;
@@ -56,6 +59,9 @@ public sealed class TrayIcon : IDisposable
         var mergeAllItem = new ToolStripMenuItem("Merge all windows (Ctrl+Shift+E)");
         mergeAllItem.Click += (_, _) => _watcher.MergeAllWindowsNow();
 
+        _updateItem = new ToolStripMenuItem("Check for updates...");
+        _updateItem.Click += async (_, _) => await CheckForUpdatesAsync();
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitApplication();
 
@@ -76,6 +82,7 @@ public sealed class TrayIcon : IDisposable
         ApplyItemStyle(_autoStartItem, isTitle: false);
         ApplyItemStyle(_autoMergeItem, isTitle: false);
         ApplyItemStyle(mergeAllItem, isTitle: false);
+        ApplyItemStyle(_updateItem, isTitle: false);
         ApplyItemStyle(exitItem, isTitle: false);
 
         _menu.Items.Add(titleItem);
@@ -84,6 +91,7 @@ public sealed class TrayIcon : IDisposable
         _menu.Items.Add(_autoMergeItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(mergeAllItem);
+        _menu.Items.Add(_updateItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
         _menu.Opening += (_, _) => _autoStartItem.Checked = AutoStartManager.IsEnabled();
@@ -206,6 +214,59 @@ public sealed class TrayIcon : IDisposable
         // Graceful exit so the watcher, hooks, COM objects and the single-instance
         // mutex are released (ApplicationContext.ExitThreadCore runs).
         Application.ExitThread();
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        var originalText = _updateItem.Text;
+        try
+        {
+            _updateItem.Enabled = false;
+            _updateItem.Text = "Checking for updates...";
+
+            var update = await UpdateManager.CheckAsync();
+            if (update is null)
+            {
+                MessageBox.Show(
+                    $"E-Tab {UpdateManager.CurrentVersion.ToString(3)} is up to date.",
+                    "E-Tab update",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var answer = MessageBox.Show(
+                $"{update.DisplayName} is available.\n\n" +
+                $"Installed: {UpdateManager.CurrentVersion.ToString(3)}\n" +
+                $"Latest: {update.Version.ToString(3)}\n\n" +
+                "Download it now? E-Tab will restart after installing the update.",
+                "E-Tab update",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes) return;
+
+            _updateItem.Text = "Downloading update...";
+            var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(update);
+
+            _updateItem.Text = "Restarting to update...";
+            UpdateManager.StartUpdater(downloadedExecutable);
+            Log.Info($"Update {update.Version} was downloaded; restarting to install it.");
+            ExitApplication();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Checking for or downloading an update failed.", ex);
+            MessageBox.Show(
+                "E-Tab could not check for or download the update.\n\n" + ex.Message,
+                "E-Tab update",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _updateItem.Text = originalText;
+            _updateItem.Enabled = true;
+        }
     }
 
     public void Dispose()

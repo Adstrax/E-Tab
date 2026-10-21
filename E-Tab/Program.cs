@@ -11,13 +11,33 @@ namespace ETab;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        if (args.Length > 0 &&
+            string.Equals(args[0], "--apply-update", StringComparison.OrdinalIgnoreCase))
+        {
+            UpdateManager.ApplyUpdate(args);
+            return;
+        }
+
         // Declare system DPI awareness so the tray icon is drawn at the
         // real physical size (not a DPI-virtualized 16px that gets upscaled).
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) =>
+        {
+            Log.Error("Unhandled exception on the UI thread.", e.Exception);
+            Helper.RestoreAllHiddenWindows();
+            MessageBox.Show(
+                "E-Tab encountered an unexpected error and needs to restart. " +
+                "The details were written to the E-Tab log.",
+                "E-Tab",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            Environment.Exit(1);
+        };
 
         // Single instance. Keep the same mutex name as the original so a first
         // launch does not get caught by a stale WPF instance.
@@ -35,6 +55,7 @@ internal static class Program
 
         ThemeManager.Initialize();
         Log.Info($"E-Tab started ({typeof(Program).Assembly.GetName().Version}) from '{Environment.ProcessPath}'.");
+        UpdateManager.CleanupStaleUpdaterFiles();
 
         // If "start with Windows" points at a copy that is no longer there, it is
         // pointed at this one: otherwise Windows starts nothing at login and the

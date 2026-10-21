@@ -26,7 +26,6 @@ public class ExplorerWatcher : IHook
 
     private ShellWindows _shellWindows = null!;
     private ShellPathComparer _shellPathComparer = null!;
-    private StaTaskScheduler _staTaskScheduler = null!;
     private nint _mainWindowHandle;
     private readonly ConcurrentDictionary<nint, byte> _processedHWnds = new();
     private readonly DualKeyDictionary<InternetExplorer, nint?, WindowInfo> _windowEntryDict = [];
@@ -34,7 +33,10 @@ public class ExplorerWatcher : IHook
     private readonly object _windowEntryDictLock = new(), _closedWindowsLock = new(), _processLock = new();
     private readonly SemaphoreSlim _toOpenWindowsLock = new(1);
     private readonly ProcessWatcher _processWatcher;
+    private readonly SynchronizationContext _uiContext;
     private int _mainExplorerProcessId;
+    private int _explorerCheckQueued;
+    private bool _shellObjectsInitialized;
     private Timer? _explorerCheckTimer;
 
     private nint _eventObjectShowHookId;
@@ -60,6 +62,14 @@ public class ExplorerWatcher : IHook
         if (_instanceRunning)
             throw new InvalidOperationException("Only one instance of ExplorerWatcher is allowed at a time.");
         _instanceRunning = true;
+
+        // ShellWindows and every InternetExplorer object it returns belong to
+        // one COM apartment. Keep that apartment the WinForms UI thread: event
+        // handlers, the explorer-restart path and the tray menu must all touch
+        // these objects from here. Mixing in a timer or a worker thread makes
+        // IConnectionPoint fail with RPC_E_WRONG_THREAD.
+        _uiContext = SynchronizationContext.Current
+            ?? throw new InvalidOperationException("ExplorerWatcher must be created on the UI thread.");
 
         _processWatcher = new ProcessWatcher("explorer");
         _processWatcher.ProcessTerminated += OnExplorerProcessTerminated;
@@ -88,42 +98,50 @@ public class ExplorerWatcher : IHook
     /// </summary>
     public void MergeAllWindowsNow()
     {
-        _ = Task.Run(async () =>
+        if (SynchronizationContext.Current != _uiContext)
         {
-            try
+            _uiContext.Post(_ => MergeAllWindowsNow(), null);
+            return;
+        }
+
+        _ = MergeAllWindowsOnUiThreadAsync();
+    }
+
+    private async Task MergeAllWindowsOnUiThreadAsync()
+    {
+        try
+        {
+            var main = _mainWindowHandle != 0 ? _mainWindowHandle : Helper.GetAnotherExplorerWindow(0);
+            if (main == 0) return;
+
+            List<WindowEntry> entries;
+            lock (_windowEntryDictLock)
+                entries = new List<WindowEntry>(_windowEntryDict);
+
+            foreach (var (window, info) in entries)
             {
-                var main = _mainWindowHandle != 0 ? _mainWindowHandle : Helper.GetAnotherExplorerWindow(0);
-                if (main == 0) return;
-
-                List<WindowEntry> entries;
-                lock (_windowEntryDictLock)
-                    entries = new List<WindowEntry>(_windowEntryDict);
-
-                foreach (var (window, info) in entries)
+                try
                 {
-                    try
-                    {
-                        var hwnd = new IntPtr(window.HWND);
-                        if (hwnd == main) continue;
-                        if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd)) continue;
+                    var hwnd = new IntPtr(window.HWND);
+                    if (hwnd == main) continue;
+                    if (!WinApi.IsWindow(hwnd) || !WinApi.IsWindowVisible(hwnd)) continue;
 
-                        var location = info.Location ?? GetLocation(window);
-                        if (string.IsNullOrWhiteSpace(location)) continue;
+                    var location = info.Location ?? GetLocation(window);
+                    if (string.IsNullOrWhiteSpace(location)) continue;
 
-                        await SwitchTo(location, 0, GetSelectedItems(window), asTab: true);
-                        window.Quit();
-                    }
-                    catch
-                    {
-                        // One window that will not move must not stop the rest.
-                    }
+                    await SwitchTo(location, 0, GetSelectedItems(window), asTab: true);
+                    window.Quit();
+                }
+                catch
+                {
+                    // One window that will not move must not stop the rest.
                 }
             }
-            catch (Exception ex)
-            {
-                Log.Warn("Merging the open windows failed: " + ex.Message);
-            }
-        });
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Merging the open windows failed: " + ex.Message);
+        }
     }
     public void SetReuseTabs(bool reuseTabs) => _reuseTabs = reuseTabs;
 
@@ -502,7 +520,10 @@ public class ExplorerWatcher : IHook
 
             HookWindowEvents(window, windowInfo);
         }
-        catch {/**/}
+        catch (Exception ex)
+        {
+            Log.Warn($"Converting window 0x{hWnd:X} failed: {ex.Message}");
+        }
         finally
         {
             if (showAgain)
@@ -565,11 +586,25 @@ public class ExplorerWatcher : IHook
                 _windowEntryDict.Remove(window);
         }
     }
-    private void RemoveWindowAndUnhookEvents(InternetExplorer window, WindowInfo windowInfo, bool useLock = true)
+    private void RemoveWindowAndUnhookEvents(
+        InternetExplorer window,
+        WindowInfo windowInfo,
+        bool useLock = true,
+        bool skipEventUnhook = false)
     {
-        // Unsubscribe
-        if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
-        if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
+        if (!skipEventUnhook)
+        {
+            try
+            {
+                // Unsubscribe while the shell server is still alive.
+                if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
+                if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Unhooking an Explorer window failed: " + ex.Message);
+            }
+        }
 
         // Remove from dictionary
         if (useLock)
@@ -581,7 +616,14 @@ public class ExplorerWatcher : IHook
             _windowEntryDict.Remove(window);
 
         // Finally, release the COM reference for this InternetExplorer instance
-        Marshal.ReleaseComObject(window);
+        try
+        {
+            Marshal.ReleaseComObject(window);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Releasing an Explorer window failed: " + ex.Message);
+        }
     }
 
     private async Task RestorePreviousWindows()
@@ -611,7 +653,7 @@ public class ExplorerWatcher : IHook
             Helper.BypassWinForegroundRestrictions();
 
             var location = string.IsNullOrWhiteSpace(windowToOpen.Location) ? _defaultLocation : windowToOpen.Location;
-            await RunInStaThread(() =>
+            await RunOnUiThread(() =>
             {
                 Shell? shell = null;
                 try
@@ -764,27 +806,36 @@ public class ExplorerWatcher : IHook
         if (_windowEntryDict.TryGetValue(window, out WindowEntry entry) && entry.OptionalKey is { } handle and > 0)
             return Task.FromResult(handle);
 
-        // Schedule the operation on STA
-        return RunInStaThread(() =>
+        // QueryService and the returned shell browser must stay in the same
+        // apartment as the InternetExplorer object and its event connection.
+        return RunOnUiThread(() =>
         {
-            // ReSharper disable once SuspiciousTypeConversion.Global
-            if (window is not Interop.IServiceProvider sp) return 0;
-
-            sp.QueryService(ref _shellBrowserGuid, ref _shellBrowserGuid, out var shellBrowser);
-            if (shellBrowser == null) return 0;
-
             try
             {
-                shellBrowser.GetWindow(out var hWnd);
+                // ReSharper disable once SuspiciousTypeConversion.Global
+                if (window is not Interop.IServiceProvider sp) return 0;
 
-                if (hWnd != 0)
-                    _windowEntryDict.UpdateOptionalKey(window, hWnd);
+                sp.QueryService(ref _shellBrowserGuid, ref _shellBrowserGuid, out var shellBrowser);
+                if (shellBrowser == null) return 0;
 
-                return hWnd;
+                try
+                {
+                    shellBrowser.GetWindow(out var hWnd);
+
+                    if (hWnd != 0)
+                        _windowEntryDict.UpdateOptionalKey(window, hWnd);
+
+                    return hWnd;
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(shellBrowser);
+                }
             }
-            finally
+            catch (Exception ex)
             {
-                Marshal.ReleaseComObject(shellBrowser);
+                Log.Warn("Getting the Explorer tab handle failed: " + ex.Message);
+                return 0;
             }
         });
     }
@@ -843,7 +894,7 @@ public class ExplorerWatcher : IHook
             return;
         }
 
-        var folder = await RunInStaThread(() =>
+        var folder = await RunOnUiThread(() =>
         {
             Shell? shell = null;
             Folder? folder;
@@ -870,17 +921,68 @@ public class ExplorerWatcher : IHook
                 Marshal.ReleaseComObject(folder);
         }
     }
-    private Task RunInStaThread(Action action, TaskCreationOptions tco = default, CancellationToken ct = default)
+    private Task RunOnUiThread(Action action)
     {
-        return Task.Factory.StartNew(action, ct, tco, _staTaskScheduler);
+        if (SynchronizationContext.Current == _uiContext)
+        {
+            action();
+            return Task.CompletedTask;
+        }
+
+        var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(_ =>
+        {
+            try
+            {
+                action();
+                tcs.TrySetResult(null);
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        }, null);
+        return tcs.Task;
     }
-    private Task<T?> RunInStaThread<T>(Func<T?> action, TaskCreationOptions tco = default, CancellationToken ct = default)
+
+    private Task<T?> RunOnUiThread<T>(Func<T?> action)
     {
-        return Task.Factory.StartNew(action, ct, tco, _staTaskScheduler);
+        if (SynchronizationContext.Current == _uiContext)
+            return Task.FromResult(action());
+
+        var tcs = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(_ =>
+        {
+            try
+            {
+                tcs.TrySetResult(action());
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        }, null);
+        return tcs.Task;
     }
-    
-    private void StartExplorerProcessCheck() => _explorerCheckTimer = new Timer(CheckForMainExplorer, null, 0, 1000);
-    private void CheckForMainExplorer(object? state)
+
+    private void StartExplorerProcessCheck()
+    {
+        _explorerCheckTimer?.Dispose();
+        _explorerCheckTimer = new Timer(_ => QueueExplorerProcessCheck(), null, 0, 1000);
+    }
+
+    private void QueueExplorerProcessCheck()
+    {
+        if (Interlocked.Exchange(ref _explorerCheckQueued, 1) != 0) return;
+
+        _uiContext.Post(_ =>
+        {
+            Volatile.Write(ref _explorerCheckQueued, 0);
+            CheckForMainExplorer();
+        }, null);
+    }
+
+    private void CheckForMainExplorer()
     {
         var process = Helper.GetMainExplorerProcess();
         if (process == null) return;
@@ -891,10 +993,28 @@ public class ExplorerWatcher : IHook
         lock (_processLock)
         {
             if (_mainExplorerProcessId != 0) return;
-            
-            _mainExplorerProcessId = process.Id;
-            InitializeShellObjects();
-            OnShellInitialized?.Invoke();
+
+            try
+            {
+                _mainExplorerProcessId = process.Id;
+                InitializeShellObjects();
+                Log.Info($"Shell COM objects initialized on the UI thread ({Environment.CurrentManagedThreadId}).");
+                OnShellInitialized?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                _mainExplorerProcessId = 0;
+                Log.Error("Shell COM initialization failed.", ex);
+                try
+                {
+                    DisposeShellObjects();
+                }
+                catch (Exception cleanupException)
+                {
+                    Log.Error("Shell COM cleanup after initialization failure also failed.", cleanupException);
+                }
+                StartExplorerProcessCheck();
+            }
         }
     }
     private void OnExplorerProcessTerminated(object? s, ProcessEventArgs e)
@@ -905,7 +1025,12 @@ public class ExplorerWatcher : IHook
             if (e.ProcessId == _mainExplorerProcessId)
             {
                 _mainExplorerProcessId = 0;
-                DisposeShellObjects();
+                // The shell server is already gone. Asking its dead event
+                // connection to unsubscribe can raise RPC_E_WRONG_THREAD even
+                // though this code runs on the apartment that created it.
+                // The connection died with Explorer, so only local references
+                // need to be released.
+                DisposeShellObjects(skipEventUnhook: true);
                 StartExplorerProcessCheck();
                 return;
             }
@@ -932,7 +1057,7 @@ public class ExplorerWatcher : IHook
                             _closedWindows.Add(new WindowRecord(info.Location!, name: info.Name!));
                     }
                     
-                    RemoveWindowAndUnhookEvents(window, info, useLock: false);
+                    RemoveWindowAndUnhookEvents(window, info, useLock: false, skipEventUnhook: true);
                 }
             }
             if (!SettingsManager.RestorePreviousWindows || _windowEntryDict.Count > 0) return;
@@ -947,8 +1072,8 @@ public class ExplorerWatcher : IHook
     private void InitializeShellObjects()
     {
         _shellPathComparer = new ShellPathComparer();
-        _staTaskScheduler = new StaTaskScheduler();
         _shellWindows = new ShellWindows();
+        _shellObjectsInitialized = true;
 
         _defaultLocation = Helper.GetDefaultExplorerLocation(_shellPathComparer);
         
@@ -984,14 +1109,24 @@ public class ExplorerWatcher : IHook
         lock (_closedWindowsLock)
             foreach (var window in _closedWindows) window.Restore = false;
     }
-    private void DisposeShellObjects()
+    private void DisposeShellObjects(bool skipEventUnhook = false)
     {
+        if (!_shellObjectsInitialized) return;
+        _shellObjectsInitialized = false;
+
         PersistWindows();
 
         // Unhook global event
-        if (_windowRegisteredHandler != null)
+        if (_windowRegisteredHandler != null && !skipEventUnhook)
         {
-            _shellWindows.WindowRegistered -= _windowRegisteredHandler;
+            try
+            {
+                _shellWindows.WindowRegistered -= _windowRegisteredHandler;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Unhooking ShellWindows.WindowRegistered failed: " + ex.Message);
+            }
             _windowRegisteredHandler = null;
         }
         if (_eventObjectShowHookCallback != null)
@@ -1003,20 +1138,51 @@ public class ExplorerWatcher : IHook
         // Unsubscribe from each InternetExplorer instance's events
         foreach (var (window, windowInfo) in _windowEntryDict)
         {
-            // Unsubscribe
-            if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
-            if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
-
-            // Release the COM object
-            Marshal.ReleaseComObject(window);
+            try
+            {
+                if (!skipEventUnhook)
+                {
+                    // Unsubscribe while the shell server is still alive.
+                    if (windowInfo.OnQuitHandler != null) window.OnQuit -= windowInfo.OnQuitHandler;
+                    if (windowInfo.OnNavigateHandler != null) window.NavigateComplete2 -= windowInfo.OnNavigateHandler;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Unhooking an Explorer window failed: " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    Marshal.ReleaseComObject(window);
+                }
+                catch
+                {
+                    // The shell may already have released this window.
+                }
+            }
         }
         _windowEntryDict.Clear();
 
         // Release the ShellWindows COM object
-        Marshal.ReleaseComObject(_shellWindows);
+        try
+        {
+            Marshal.ReleaseComObject(_shellWindows);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Releasing ShellWindows failed: " + ex.Message);
+        }
 
-        _shellPathComparer.Dispose();
-        _staTaskScheduler.Dispose();
+        try
+        {
+            _shellPathComparer.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Releasing the shell path comparer failed: " + ex.Message);
+        }
     }
 
     private void PersistWindows()
@@ -1049,6 +1215,8 @@ public class ExplorerWatcher : IHook
 
     public void Dispose()
     {
+        _explorerCheckTimer?.Dispose();
+        _explorerCheckTimer = null;
         DisposeShellObjects();
         _instanceRunning = false;
         _processWatcher.Dispose();

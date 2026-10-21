@@ -39,6 +39,7 @@ dotnet build -c Release
   - **Start with Windows**：开机自动启动。
   - **Auto-merge new windows**：新窗口自动变成标签页；关掉后新窗口保持独立，需要时用下面的命令合并。
   - **Merge all windows (Ctrl+Shift+E)**：把当前打开的资源管理器窗口合并到最前面的那个窗口。
+  - **Check for updates...**：按需检查 GitHub 上的最新正式版；确认后自动下载、校验、替换并重启。
   - **Exit**：退出。
 - 合并过程不会改动窗口的大小、位置和最大化状态；万一合并失败，窗口会原样还原。
 - 日志位于 `%LOCALAPPDATA%\E-Tab\logs\E-Tab.log`。
