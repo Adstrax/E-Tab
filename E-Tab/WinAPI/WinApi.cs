@@ -13,7 +13,15 @@ namespace ETab.WinAPI;
 
 public static class WinApi
 {
+    public const int EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const int EVENT_SYSTEM_CAPTURESTART = 0x0008;
     public const int EVENT_OBJECT_SHOW = 0x8002;
+
+    public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+    public const uint PM_NOREMOVE = 0x0000;
+    public const uint WM_QUIT = 0x0012;
+    public const uint COINIT_APARTMENTTHREADED = 0x2;
 
     public const int WM_COMMAND = 0x111; // Send a command
 
@@ -32,6 +40,18 @@ public static class WinApi
 
     public const uint SIGDN_URL = 0x80068000;
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NativeMessage
+    {
+        public nint Window;
+        public uint Message;
+        public nint WParam;
+        public nint LParam;
+        public uint Time;
+        public Point Cursor;
+        public uint Private;
+    }
+
     [DllImport("user32.dll")]
     public static extern nint SetWinEventHook(uint eventMin, uint eventMax, nint hModWinEventProc, WinEventDelegate lPfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
@@ -39,7 +59,37 @@ public static class WinApi
     public static extern bool UnhookWinEvent(nint hWinEventHook);
 
     [DllImport("user32.dll")]
+    public static extern bool PeekMessage(out NativeMessage message, nint window, uint filterMin, uint filterMax, uint remove);
+
+    [DllImport("user32.dll")]
+    public static extern int GetMessage(out NativeMessage message, nint window, uint filterMin, uint filterMax);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostThreadMessage(uint threadId, uint message, nint wParam, nint lParam);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("ole32.dll")]
+    public static extern int CoInitializeEx(nint reserved, uint coInit);
+
+    [DllImport("ole32.dll")]
+    public static extern void CoUninitialize();
+
+    [DllImport("user32.dll")]
     public static extern nint GetParent(nint hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern nint GetAncestor(nint hWnd, uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern nint WindowFromPoint(Point point);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out Point point);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForSystem();
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern nint FindWindow(string lpClassName, string? lpWindowName);

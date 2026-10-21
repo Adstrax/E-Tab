@@ -206,7 +206,10 @@ public class DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> :
     /// <exception cref="ArgumentNullException">Thrown if primaryKey is null.</exception>
     /// <exception cref="KeyNotFoundException">Thrown if the primaryKey does not exist.</exception>
     /// <exception cref="ArgumentException">Thrown if the new optional key already exists.</exception>
-    public void UpdateOptionalKey(TPrimaryKey primaryKey, TOptionalKey? newOptionalKey)
+    public void UpdateOptionalKey(
+        TPrimaryKey primaryKey,
+        TOptionalKey? newOptionalKey,
+        bool resolveConflict = false)
     {
         if (!_primaryDict.TryGetValue(primaryKey, out var entry)) throw new ArgumentException(@"Primary key not found", nameof(primaryKey));
 
@@ -214,8 +217,18 @@ public class DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> :
             return;
 
         // Check uniqueness of new optional key if not null
-        if (newOptionalKey is not null && _optionalDict.ContainsKey(newOptionalKey))
-            throw new ArgumentException(@"Optional key is already used by another primary key", nameof(newOptionalKey));
+        if (newOptionalKey is not null &&
+            _optionalDict.TryGetValue(newOptionalKey, out var conflictingPrimaryKey) &&
+            !EqualityComparer<TPrimaryKey>.Default.Equals(primaryKey, conflictingPrimaryKey))
+        {
+            if (!resolveConflict)
+                throw new ArgumentException(@"Optional key is already used by another primary key", nameof(newOptionalKey));
+
+            // Explorer can move a tab handle to a different InternetExplorer
+            // object after tabs are created or reordered. The newest object is
+            // authoritative, so detach the stale mapping first.
+            _primaryDict[conflictingPrimaryKey].OptionalKey = default;
+        }
 
         // Remove old optional key mapping if it existed
         if (entry.OptionalKey is not null)

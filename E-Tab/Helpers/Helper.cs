@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Drawing;
 using System.Threading;
@@ -21,6 +22,7 @@ public static class Helper
     private static int _lastCtrlShiftCheckAt;
     private static bool _lastCtrlShiftCheckValue;
     public static readonly ConcurrentDictionary<nint, RECT?> HiddenWindows = new();
+    private static readonly ConcurrentDictionary<nint, byte> HardHiddenWindows = new();
 
     public static Task DoDelayedBackgroundAsync(Action action, int delayMs = 2_000, CancellationToken cancellationToken = default)
     {
@@ -234,6 +236,91 @@ public static class Helper
         foregroundWindow = WinApi.GetForegroundWindow();
         return IsFileExplorerWindow(foregroundWindow);
     }
+
+    /// <summary>
+    /// Explorer reuses the main window when its first folder is opened from the
+    /// desktop a second time. That path does not create or navigate a window, so
+    /// the only useful signal left is the foreground switch while the pointer is
+    /// still over the folder icon. Resolve that icon back to a real directory.
+    /// </summary>
+    public static string? GetDesktopFolderUnderCursor()
+    {
+        if (!WinApi.GetCursorPos(out var cursor)) return null;
+
+        foreach (var point in GetDesktopAccessibilityPoints(cursor))
+        {
+            var folder = GetDesktopFolderAtPoint(point);
+            if (folder != null) return folder;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<Point> GetDesktopAccessibilityPoints(Point physicalPoint)
+    {
+        yield return physicalPoint;
+
+        // IAccessible may expect logical screen coordinates even when this
+        // System-DPI-aware process receives a physical cursor position.
+        var dpi = WinApi.GetDpiForSystem();
+        if (dpi > 96)
+        {
+            yield return new Point(
+                (int)Math.Round(physicalPoint.X * 96d / dpi),
+                (int)Math.Round(physicalPoint.Y * 96d / dpi));
+        }
+    }
+
+    private static string? GetDesktopFolderAtPoint(Point point)
+    {
+        IAccessible? accessible = null;
+        try
+        {
+            var pointedWindow = WinApi.WindowFromPoint(point);
+            var root = WinApi.GetAncestor(pointedWindow, 2); // GA_ROOT
+            var rootClass = WinApi.GetWindowClassName(root);
+            if (!string.Equals(rootClass, "Progman", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(rootClass, "WorkerW", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            var hr = WinApi.AccessibleObjectFromPoint(point, out accessible, out var childId);
+            if (hr != 0 || accessible == null) return null;
+
+            var role = Convert.ToInt32(accessible.get_accRole(childId));
+            if (role != 0x22) return null; // ROLE_SYSTEM_LISTITEM
+
+            var name = accessible.get_accName(childId);
+            if (string.IsNullOrWhiteSpace(name)) return null;
+
+            foreach (var desktop in new[]
+                     {
+                         Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                         Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)
+                     }.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(desktop)) continue;
+
+                var path = Path.Combine(desktop, name);
+                if (Directory.Exists(path)) return path;
+            }
+        }
+        catch
+        {
+            // The shell's accessibility provider can disappear while Explorer
+            // is changing state. Missing this one signal must never affect it.
+        }
+        finally
+        {
+            if (accessible != null)
+            {
+                try { Marshal.FinalReleaseComObject(accessible); }
+                catch { /* Already released by the shell. */ }
+            }
+        }
+
+        return null;
+    }
+
     public static nint GetAnotherExplorerWindow(nint currentWindow)
     {
         return currentWindow == 0
@@ -332,8 +419,11 @@ public static class Helper
         if (!remove && !isLayered) // Add
             WinApi.SetWindowLong(hWnd, WinApi.GWL_EXSTYLE, exStyle | WinApi.WS_EX_LAYERED);
     }
-    public static void HideWindow(nint hWnd, bool keepTheme = false)
+    public static void HideWindow(nint hWnd, bool keepTheme = false, bool hideCompletely = false)
     {
+        if (hideCompletely && HardHiddenWindows.TryAdd(hWnd, 0))
+            WinApi.ShowWindow(hWnd, 0); // SW_HIDE, before any style changes can repaint it.
+
         HiddenWindows.GetOrAdd(hWnd, static (hWnd, keepTheme) =>
         {
             if (keepTheme)
@@ -358,6 +448,12 @@ public static class Helper
         if (!HiddenWindows.TryGetValue(hWnd, out var originalPos))
             return false;
 
+        // An incoming Explorer window is hidden immediately rather than made
+        // transparent so its first frame cannot reach DWM. Restore the native
+        // visibility before restoring the theme-friendly alpha state.
+        if (HardHiddenWindows.TryRemove(hWnd, out _))
+            WinApi.ShowWindow(hWnd, WinApi.SW_SHOWNOACTIVATE);
+
         if (removeCache)
             HiddenWindows.TryRemove(hWnd, out _);
 
@@ -371,7 +467,6 @@ public static class Helper
         WinApi.SetLayeredWindowAttributes(hWnd, 0, 255, WinApi.LWA_ALPHA);
         return true;
     }
-
     public static bool IsCtrlShiftDown()
     {
         if (_lastCtrlShiftCheckValue && Environment.TickCount - _lastCtrlShiftCheckAt < 1_000)
