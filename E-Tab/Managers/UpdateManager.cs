@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -19,15 +20,23 @@ internal sealed record UpdateInfo(
     string DisplayName,
     string DownloadUrl,
     string AssetName,
-    string? Sha256);
+    string Sha256);
 
 internal static class UpdateManager
 {
     private const string LatestReleaseApi =
         "https://api.github.com/repos/Adstrax/E-Tab/releases/latest";
+    private const long MaxUpdateArchiveBytes = 32 * 1024 * 1024;
+    private const long MaxExecutableBytes = 64 * 1024 * 1024;
 
     public static Version CurrentVersion =>
         Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0);
+
+    public static string DisplayVersion =>
+        Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion
+        ?? CurrentVersion.ToString(3);
 
     public static async Task<UpdateInfo?> CheckAsync(CancellationToken cancellationToken = default)
     {
@@ -73,8 +82,8 @@ internal static class UpdateManager
         var downloadUrl = assetValue.TryGetProperty("browser_download_url", out var urlElement)
             ? urlElement.GetString()
             : null;
-        if (string.IsNullOrWhiteSpace(downloadUrl))
-            throw new InvalidOperationException("The update asset has no download URL.");
+        if (!TryValidateDownloadUrl(downloadUrl, out var validatedDownloadUrl))
+            throw new InvalidOperationException("The update asset has no trusted GitHub download URL.");
 
         var displayName = root.TryGetProperty("name", out var nameElement)
             ? nameElement.GetString()
@@ -91,28 +100,25 @@ internal static class UpdateManager
             }
         }
 
+        if (!IsValidSha256(sha256))
+        {
+            throw new InvalidDataException(
+                $"Release {latestVersion} does not provide a valid SHA-256 digest. " +
+                "The update was not offered because its integrity cannot be verified.");
+        }
+
         return new UpdateInfo(
             latestVersion,
             string.IsNullOrWhiteSpace(displayName) ? $"E-Tab {latestVersion}" : displayName,
-            downloadUrl,
+            validatedDownloadUrl,
             expectedAssetName,
-            sha256);
+            sha256!);
     }
 
     public static async Task<string> DownloadExecutableAsync(
         UpdateInfo update,
         CancellationToken cancellationToken = default)
     {
-        using var client = CreateClient();
-        var archiveBytes = await client.GetByteArrayAsync(update.DownloadUrl, cancellationToken);
-
-        if (!string.IsNullOrWhiteSpace(update.Sha256))
-        {
-            var actualHash = Convert.ToHexString(SHA256.HashData(archiveBytes));
-            if (!string.Equals(actualHash, update.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("The downloaded update did not match GitHub's SHA-256 digest.");
-        }
-
         var updateDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "E-Tab",
@@ -120,26 +126,119 @@ internal static class UpdateManager
             update.Version.ToString(3));
         Directory.CreateDirectory(updateDirectory);
 
+        var archivePath = Path.Combine(updateDirectory, "update.zip.tmp");
         var executablePath = Path.Combine(updateDirectory, "E-Tab.exe");
-        using var archive = new ZipArchive(new MemoryStream(archiveBytes), ZipArchiveMode.Read);
-        var executableEntry = archive.Entries.FirstOrDefault(entry =>
-            string.Equals(Path.GetFileName(entry.FullName), "E-Tab.exe", StringComparison.OrdinalIgnoreCase));
-        if (executableEntry is null)
-            throw new InvalidDataException("The update package does not contain E-Tab.exe.");
+        TryDeleteFile(archivePath);
 
-        await using (var input = executableEntry.Open())
-        await using (var output = new FileStream(
-                         executablePath,
-                         FileMode.Create,
-                         FileAccess.Write,
-                         FileShare.None,
-                         bufferSize: 81920,
-                         useAsync: true))
+        using var client = CreateClient();
+        using var response = await client.GetAsync(
+            update.DownloadUrl,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        if (response.Content.Headers.ContentLength is > MaxUpdateArchiveBytes)
+            throw new InvalidDataException("The update archive is larger than the allowed limit.");
+
+        try
         {
-            await input.CopyToAsync(output, cancellationToken);
-        }
+            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+            await using (var archiveFile = new FileStream(
+                             archivePath,
+                             FileMode.Create,
+                             FileAccess.Write,
+                             FileShare.None,
+                             bufferSize: 81_920,
+                             useAsync: true))
+            {
+                using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                var buffer = ArrayPool<byte>.Shared.Rent(81_920);
+                try
+                {
+                    long totalBytes = 0;
+                    int read;
+                    while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
+                    {
+                        totalBytes += read;
+                        if (totalBytes > MaxUpdateArchiveBytes)
+                            throw new InvalidDataException("The update archive is larger than the allowed limit.");
 
-        return executablePath;
+                        hasher.AppendData(buffer, 0, read);
+                        await archiveFile.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+
+                var actualHash = Convert.ToHexString(hasher.GetHashAndReset());
+                if (!string.Equals(actualHash, update.Sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The downloaded update did not match GitHub's SHA-256 digest.");
+            }
+
+            await using var archiveStream = new FileStream(
+                archivePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 81_920,
+                useAsync: true);
+            using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read);
+            var executableEntry = archive.Entries.FirstOrDefault(entry =>
+                string.Equals(entry.FullName, "E-Tab.exe", StringComparison.OrdinalIgnoreCase));
+            if (executableEntry is null)
+                throw new InvalidDataException("The update package does not contain E-Tab.exe at its root.");
+            if (executableEntry.Length <= 0 || executableEntry.Length > MaxExecutableBytes)
+                throw new InvalidDataException("The executable in the update package has an invalid size.");
+
+            await using (var input = executableEntry.Open())
+            await using (var output = new FileStream(
+                             executablePath,
+                             FileMode.Create,
+                             FileAccess.Write,
+                             FileShare.None,
+                             bufferSize: 81_920,
+                             useAsync: true))
+            {
+                var buffer = ArrayPool<byte>.Shared.Rent(81_920);
+                try
+                {
+                    long extractedBytes = 0;
+                    int read;
+                    while ((read = await input.ReadAsync(buffer, cancellationToken)) > 0)
+                    {
+                        extractedBytes += read;
+                        if (extractedBytes > MaxExecutableBytes)
+                            throw new InvalidDataException("The executable in the update package is too large.");
+
+                        await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    }
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+
+            if (!TryGetFileVersion(executablePath, out var executableVersion) ||
+                NormalizeVersion(executableVersion) != NormalizeVersion(update.Version))
+            {
+                throw new InvalidDataException(
+                    $"The update executable does not report version {update.Version}.");
+            }
+
+            return executablePath;
+        }
+        catch
+        {
+            TryDeleteFile(executablePath);
+            throw;
+        }
+        finally
+        {
+            TryDeleteFile(archivePath);
+        }
     }
 
     /// <summary>
@@ -171,7 +270,8 @@ internal static class UpdateManager
         startInfo.ArgumentList.Add(downloadedExecutable);
         startInfo.ArgumentList.Add(currentExecutable);
 
-        if (Process.Start(startInfo) is null)
+        using var updaterProcess = Process.Start(startInfo);
+        if (updaterProcess is null)
             throw new InvalidOperationException("The update helper could not be started.");
     }
 
@@ -183,28 +283,66 @@ internal static class UpdateManager
             return;
         }
 
-        var downloadedExecutable = args[2];
-        var targetExecutable = args[3];
+        var downloadedExecutable = Path.GetFullPath(args[2]);
+        var targetExecutable = Path.GetFullPath(args[3]);
+        var targetDirectory = Path.GetDirectoryName(targetExecutable)
+            ?? throw new InvalidOperationException("The installed executable has no parent directory.");
+        var stagedExecutable = Path.Combine(
+            targetDirectory,
+            $".E-Tab-update-{Guid.NewGuid():N}.tmp");
+        var backupExecutable = Path.Combine(
+            targetDirectory,
+            $".E-Tab-backup-{Guid.NewGuid():N}.tmp");
         var installed = false;
 
         try
         {
             WaitForParentExit(parentProcessId);
 
-            var backupPath = targetExecutable +
-                             $".bak-{GetFileVersion(targetExecutable)}-before-update";
-            if (!File.Exists(backupPath))
-                File.Copy(targetExecutable, backupPath, overwrite: false);
+            if (!File.Exists(targetExecutable))
+                throw new FileNotFoundException("The installed E-Tab executable was not found.", targetExecutable);
+            if (!File.Exists(downloadedExecutable))
+                throw new FileNotFoundException("The downloaded E-Tab executable was not found.", downloadedExecutable);
 
-            CopyWithRetries(downloadedExecutable, targetExecutable);
-            installed = true;
+            // Stage on the target volume so File.Replace can atomically swap
+            // the executable. Until that call succeeds, the installed file is
+            // never overwritten.
+            CopyWithRetries(downloadedExecutable, stagedExecutable);
+            File.Replace(
+                stagedExecutable,
+                targetExecutable,
+                backupExecutable,
+                ignoreMetadataErrors: true);
+
+            installed = TryStart(targetExecutable);
+            if (!installed)
+                throw new IOException("The updated E-Tab executable could not be started.");
+
             Log.Info($"Update installed successfully: {targetExecutable}");
         }
         catch (Exception ex)
         {
+            if (File.Exists(backupExecutable))
+            {
+                try
+                {
+                    File.Replace(
+                        backupExecutable,
+                        targetExecutable,
+                        destinationBackupFileName: null,
+                        ignoreMetadataErrors: true);
+                    Log.Info("The previous E-Tab executable was restored.");
+                }
+                catch (Exception rollbackException)
+                {
+                    Log.Error("Restoring the previous E-Tab executable failed.", rollbackException);
+                }
+            }
+
             Log.Error("Installing the update failed.", ex);
             MessageBox.Show(
-                "E-Tab could not install the update. The existing version will be started again.\n\n" +
+                "E-Tab could not install the update. The previous version will be " +
+                "started again when possible.\n\n" +
                 ex.Message,
                 "E-Tab update",
                 MessageBoxButtons.OK,
@@ -212,9 +350,17 @@ internal static class UpdateManager
         }
         finally
         {
-            TryStart(targetExecutable);
+            TryDeleteFile(stagedExecutable);
+
             if (installed)
+            {
+                CleanupOldBackups(targetDirectory, backupExecutable);
                 TryDeleteDirectory(Path.GetDirectoryName(downloadedExecutable));
+            }
+            else
+            {
+                TryStart(targetExecutable);
+            }
         }
     }
 
@@ -253,6 +399,41 @@ internal static class UpdateManager
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         client.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
         return client;
+    }
+
+    private static bool TryValidateDownloadUrl(string? value, out string downloadUrl)
+    {
+        downloadUrl = string.Empty;
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) &&
+            !uri.Host.EndsWith(".github.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        downloadUrl = uri.AbsoluteUri;
+        return true;
+    }
+
+    private static bool IsValidSha256(string? value)
+    {
+        if (value is null || value.Length != 64)
+            return false;
+
+        try
+        {
+            _ = Convert.FromHexString(value);
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
     }
 
     private static bool TryParseVersion(string? value, out Version version)
@@ -308,31 +489,66 @@ internal static class UpdateManager
         throw lastError ?? new IOException("The update file could not be copied.");
     }
 
-    private static string GetFileVersion(string path)
+    private static bool TryGetFileVersion(string path, out Version version)
     {
+        version = new Version();
         try
         {
-            return FileVersionInfo.GetVersionInfo(path).FileVersion ?? "unknown";
+            return Version.TryParse(
+                FileVersionInfo.GetVersionInfo(path).FileVersion,
+                out version!);
         }
         catch
         {
-            return "unknown";
+            return false;
         }
     }
 
-    private static void TryStart(string executable)
+    private static bool TryStart(string executable)
     {
         try
         {
-            Process.Start(new ProcessStartInfo(executable)
+            using var process = Process.Start(new ProcessStartInfo(executable)
             {
                 UseShellExecute = true,
                 WorkingDirectory = Path.GetDirectoryName(executable),
             });
+            return process != null;
         }
         catch (Exception ex)
         {
             Log.Error("E-Tab could not be restarted after the update.", ex);
+            return false;
+        }
+    }
+
+    private static void CleanupOldBackups(string directory, string currentBackup)
+    {
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(directory, ".E-Tab-backup-*.tmp"))
+            {
+                if (string.Equals(path, currentBackup, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                TryDeleteFile(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("Old update backups could not be cleaned up: " + ex.Message);
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch
+        {
+            // Stale files are harmless and are retried on later launches.
         }
     }
 

@@ -36,14 +36,17 @@ public sealed class TrayIcon : IDisposable
     {
         _watcher = watcher;
         _icon = LoadTrayIcon();
+        var version = UpdateManager.DisplayVersion;
+        var isTestBuild = version.Contains("-test.", StringComparison.OrdinalIgnoreCase);
         _notifyIcon = new NotifyIcon
         {
             Icon = _icon,
-            Text = "E-Tab - Open folders in new tabs",
+            Text = isTestBuild
+                ? $"E-Tab {version} - Test build"
+                : $"E-Tab {version} - Open folders in new tabs",
             Visible = true,
         };
 
-        var version = typeof(TrayIcon).Assembly.GetName().Version;
         _autoStartItem = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true };
         _autoStartItem.Click += (_, _) => AutoStartManager.SetEnabled(_autoStartItem.Checked);
 
@@ -65,8 +68,16 @@ public sealed class TrayIcon : IDisposable
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitApplication();
 
-        var titleItem = new ToolStripMenuItem($"E-Tab  v{version?.ToString(3) ?? "?"}") { Enabled = false };
+        var titleItem = new ToolStripMenuItem(
+            isTestBuild
+                ? $"E-Tab  v{version}  [TEST BUILD]"
+                : $"E-Tab  v{version}")
+        {
+            Enabled = false,
+        };
         ApplyItemStyle(titleItem, isTitle: true);
+        if (isTestBuild)
+            titleItem.ForeColor = Color.FromArgb(255, 174, 70);
 
         _menu = new ContextMenuStrip
         {
@@ -228,7 +239,7 @@ public sealed class TrayIcon : IDisposable
             if (update is null)
             {
                 MessageBox.Show(
-                    $"E-Tab {UpdateManager.CurrentVersion.ToString(3)} is up to date.",
+                    $"E-Tab {UpdateManager.DisplayVersion} is up to date.",
                     "E-Tab update",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -237,7 +248,7 @@ public sealed class TrayIcon : IDisposable
 
             var answer = MessageBox.Show(
                 $"{update.DisplayName} is available.\n\n" +
-                $"Installed: {UpdateManager.CurrentVersion.ToString(3)}\n" +
+                $"Installed: {UpdateManager.DisplayVersion}\n" +
                 $"Latest: {update.Version.ToString(3)}\n\n" +
                 "Download it now? E-Tab will restart after installing the update.",
                 "E-Tab update",

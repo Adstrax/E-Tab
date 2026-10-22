@@ -23,7 +23,7 @@ public enum SessionFilter
 /// <summary>
 /// Watches for process creation and termination events
 /// </summary>
-public class ProcessWatcher : IDisposable
+public sealed class ProcessWatcher : IDisposable
 {
     private readonly string _processName;
     private readonly TimeSpan _scanInterval;
@@ -33,6 +33,7 @@ public class ProcessWatcher : IDisposable
     private readonly Timer _scanTimer;
     private readonly object _scanLock = new();
     private readonly SynchronizationContext? _syncContext;
+    private long _lastScanErrorAt;
     private bool _isMonitoring = true;
     private bool _disposed;
 
@@ -50,7 +51,8 @@ public class ProcessWatcher : IDisposable
         _processName = processName ?? throw new ArgumentNullException(nameof(processName));
         _scanInterval = TimeSpan.FromMilliseconds(Math.Max(100, scanIntervalMs)); // Minimum 100ms
         _sessionFilter = sessionFilter;
-        _currentSessionId = Process.GetCurrentProcess().SessionId;
+        using (var currentProcess = Process.GetCurrentProcess())
+            _currentSessionId = currentProcess.SessionId;
         _syncContext = SynchronizationContext.Current;
 
         // Start scanning immediately, then at regular intervals
@@ -134,7 +136,11 @@ public class ProcessWatcher : IDisposable
                     process.Exited += OnProcessExited;
                     process.EnableRaisingEvents = true;
 
-                    if (!_trackedProcesses.TryAdd(processId, (process, sessionId))) continue;
+                    if (!_trackedProcesses.TryAdd(processId, (process, sessionId)))
+                    {
+                        SafeDisposeProcess(process);
+                        continue;
+                    }
 
                     // Successfully added - raise ProcessCreated event
                     var args = new ProcessEventArgs(processId, _processName, sessionId);
@@ -145,6 +151,19 @@ public class ProcessWatcher : IDisposable
                     // Individual process handling failed
                     SafeDisposeProcess(process);
                 }
+            }
+        }
+        catch (Exception ex)
+        {
+            // This callback runs on the thread pool. Letting an exception
+            // escape a timer callback can terminate the whole process.
+            var now = Stopwatch.GetTimestamp();
+            var previous = Interlocked.Read(ref _lastScanErrorAt);
+            if (previous == 0 ||
+                Stopwatch.GetElapsedTime(previous, now) >= TimeSpan.FromMinutes(1))
+            {
+                Interlocked.Exchange(ref _lastScanErrorAt, now);
+                Log.Error("Scanning for Explorer processes failed.", ex);
             }
         }
         finally
@@ -203,14 +222,26 @@ public class ProcessWatcher : IDisposable
     {
         if (eventHandler == null) return;
 
+        void Invoke()
+        {
+            try
+            {
+                eventHandler(this, args);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("A process watcher event handler failed.", ex);
+            }
+        }
+
         // Raise event in the original synchronization context if available
         if (_syncContext != null)
         {
-            _syncContext.Post(_ => eventHandler(this, args), null);
+            _syncContext.Post(_ => Invoke(), null);
         }
         else
         {
-            eventHandler(this, args);
+            Invoke();
         }
     }
 
@@ -247,21 +278,41 @@ public class ProcessWatcher : IDisposable
             // ignored
         }
 
-        // Clean up tracked processes
-        foreach (var kvp in _trackedProcesses)
+        // Wait for an in-flight scan before disposing Process objects it may
+        // still be inspecting.
+        var lockTaken = false;
+        try
         {
-            try
+            lockTaken = Monitor.TryEnter(_scanLock, TimeSpan.FromSeconds(2));
+            if (!lockTaken)
             {
-                kvp.Value.Process.Exited -= OnProcessExited;
-            }
-            catch
-            {
-                // ignored
+                Log.Warn("Explorer process watcher did not stop within 2 seconds.");
+                return;
             }
 
-            SafeDisposeProcess(kvp.Value.Process);
+            // Clean up tracked processes
+            foreach (var kvp in _trackedProcesses)
+            {
+                try
+                {
+                    kvp.Value.Process.Exited -= OnProcessExited;
+                }
+                catch
+                {
+                    // ignored
+                }
+
+                SafeDisposeProcess(kvp.Value.Process);
+            }
+
+            _trackedProcesses.Clear();
+        }
+        finally
+        {
+            if (lockTaken)
+                Monitor.Exit(_scanLock);
         }
 
-        _trackedProcesses.Clear();
+        GC.SuppressFinalize(this);
     }
 }

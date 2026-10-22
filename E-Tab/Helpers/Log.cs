@@ -9,6 +9,8 @@ namespace ETab.Helpers;
 /// </summary>
 public static class Log
 {
+    private const long MaxLogBytes = 1_048_576;
+    private const int RetainedLogFiles = 3;
     private static readonly object Gate = new();
     private static string? _logPath;
 
@@ -37,6 +39,7 @@ public static class Log
                 if (!string.IsNullOrEmpty(directory))
                     Directory.CreateDirectory(directory);
 
+                RotateIfNeeded(_logPath);
                 File.AppendAllText(
                     _logPath,
                     $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}{Environment.NewLine}");
@@ -45,6 +48,23 @@ public static class Log
         catch
         {
             // Logging is best-effort and must never crash the application.
+        }
+    }
+
+    private static void RotateIfNeeded(string path)
+    {
+        var file = new FileInfo(path);
+        if (!file.Exists || file.Length < MaxLogBytes)
+            return;
+
+        for (var index = RetainedLogFiles; index >= 1; index--)
+        {
+            var source = index == 1 ? path : $"{path}.{index - 1}";
+            var destination = $"{path}.{index}";
+            if (!File.Exists(source))
+                continue;
+
+            File.Move(source, destination, overwrite: true);
         }
     }
 }

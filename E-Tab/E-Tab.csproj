@@ -7,6 +7,9 @@
         <UseWindowsForms>true</UseWindowsForms>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
         <!-- A long-running tray app has no culture-sensitive UI beyond the
              static English strings it owns. Disabling ICU/globalization data
@@ -18,9 +21,10 @@
         <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
 
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>7.1.1</Version>
-        <AssemblyVersion>7.1.1.0</AssemblyVersion>
-        <FileVersion>7.1.1.0</FileVersion>
+        <Version>7.2.0</Version>
+        <InformationalVersion>7.2.0</InformationalVersion>
+        <AssemblyVersion>7.2.0.0</AssemblyVersion>
+        <FileVersion>7.2.0.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>

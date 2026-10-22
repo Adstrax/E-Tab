@@ -32,12 +32,26 @@ public sealed class ShellPathComparer : IDisposable
     public nint GetPidlFromPath(string path)
     {
         uint pdwAttributes = 0;
-        _desktopFolder.ParseDisplayName(0, 0, path, out _, out var pidl, ref pdwAttributes);
+        var hr = _desktopFolder.ParseDisplayName(
+            0,
+            0,
+            path,
+            out _,
+            out var pidl,
+            ref pdwAttributes);
+        if (hr < 0)
+        {
+            if (pidl != 0)
+                Marshal.FreeCoTaskMem(pidl);
+            Marshal.ThrowExceptionForHR(hr);
+        }
 
         return pidl;
     }
     public static string? GetPathFromPidl(nint pidl, uint sigdnName = WinApi.SIGDN_URL)
     {
+        if (pidl == 0) return null;
+
         var hr = WinApi.SHGetNameFromIDList(pidl, sigdnName, out var path);
         return hr == 0 ? path : null;
     }
@@ -137,16 +151,10 @@ public sealed class ShellPathComparer : IDisposable
     {
         if (_disposed) return;
 
-        // release the RCW
-        Marshal.ReleaseComObject(_desktopFolder);
+        if (Marshal.IsComObject(_desktopFolder))
+            Marshal.ReleaseComObject(_desktopFolder);
         _desktopFolder = null!;
 
         _disposed = true;
-        GC.SuppressFinalize(this);
-    }
-
-    ~ShellPathComparer()
-    {
-        Dispose();
     }
 }

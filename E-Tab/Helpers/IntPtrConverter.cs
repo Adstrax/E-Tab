@@ -4,7 +4,7 @@ using System.Text.Json.Serialization;
 
 namespace ETab.Helpers;
 
-public class IntPtrConverter : JsonConverter<nint>
+public sealed class IntPtrConverter : JsonConverter<nint>
 {
     public override nint Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {

@@ -359,7 +359,8 @@ public static class Helper
                 GetAllExplorerTabs(window)
                     .Except(currentTabs)
                     .FirstOrDefault(),
-            searchTimeMs);
+            searchTimeMs,
+            sleepMs: 5);
     }
     public static List<nint> GetAllExplorerTabs()
     {
@@ -380,10 +381,10 @@ public static class Helper
     }
     public static Process? GetMainExplorerProcess()
     {
-        Process? best = null;
         var windowsFolder = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         var expectedPath = System.IO.Path.Combine(windowsFolder, "explorer.exe");
         var bestStart = DateTime.MaxValue;
+        var bestProcessId = 0;
 
         foreach (var hWnd in WinApi.FindAllWindowsEx("Shell_TrayWnd")) // Taskbar
         {
@@ -396,16 +397,28 @@ public static class Helper
             try
             {
                 // Pick the earliest start
-                var proc = Process.GetProcessById((int)pid);
+                using var proc = Process.GetProcessById((int)pid);
                 if (proc.StartTime < bestStart)
                 {
                     bestStart = proc.StartTime;
-                    best = proc;
+                    bestProcessId = (int)pid;
                 }
             }
             catch { /* The Process might have terminated */ }
         }
-        return best;
+
+        if (bestProcessId == 0)
+            return null;
+
+        try
+        {
+            return Process.GetProcessById(bestProcessId);
+        }
+        catch (ArgumentException)
+        {
+            // Explorer restarted between enumeration and lookup.
+            return null;
+        }
     }
     
     public static void UpdateWindowLayered(nint hWnd, bool remove)
@@ -443,6 +456,14 @@ public static class Helper
             return null;
         }, keepTheme);
     }
+    public static bool MakeWindowTransparent(nint hWnd)
+    {
+        if (hWnd == 0 || HiddenWindows.ContainsKey(hWnd)) return false;
+
+        UpdateWindowLayered(hWnd, remove: false);
+        WinApi.SetLayeredWindowAttributes(hWnd, 0, 0, WinApi.LWA_ALPHA);
+        return HiddenWindows.TryAdd(hWnd, null);
+    }
     public static bool ShowWindow(nint hWnd, bool removeCache)
     {
         if (!HiddenWindows.TryGetValue(hWnd, out var originalPos))
@@ -467,6 +488,12 @@ public static class Helper
         WinApi.SetLayeredWindowAttributes(hWnd, 0, 255, WinApi.LWA_ALPHA);
         return true;
     }
+    public static void ForgetHiddenWindow(nint hWnd)
+    {
+        if (hWnd == 0) return;
+        HiddenWindows.TryRemove(hWnd, out _);
+        HardHiddenWindows.TryRemove(hWnd, out _);
+    }
     public static bool IsCtrlShiftDown()
     {
         if (_lastCtrlShiftCheckValue && Environment.TickCount - _lastCtrlShiftCheckAt < 1_000)
@@ -488,18 +515,45 @@ public static class Helper
 
     public static string NormalizeLocation(string location)
     {
-        if (location.IndexOf('%') > -1)
-            location = Environment.ExpandEnvironmentVariables(location);
+        if (string.IsNullOrWhiteSpace(location))
+            return string.Empty;
 
-        if (location.StartsWith("::", StringComparison.Ordinal))
-            location = $"shell:{location}";
+        var value = location.Trim().Trim('\n', '\r', '\'', '"');
+        if (value.Length == 0)
+            return string.Empty;
 
-        else if (location.StartsWith("{", StringComparison.Ordinal))
-            location = $"shell:::{location}";
+        // Shell namespace names and non-file URIs must not be treated as file
+        // paths. In particular, replacing every '/' with '\' corrupts URLs, and
+        // trimming the leading '\' turns a UNC share into a relative path.
+        if (value.StartsWith("::", StringComparison.Ordinal))
+            return $"shell:{value}";
+        if (value.StartsWith('{'))
+            return $"shell:::{value}";
 
-        location = location.Trim(' ', '/', '\\', '\n', '\'', '"');
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri))
+        {
+            if (!uri.IsFile)
+                return value;
 
-        return location.Replace('/', '\\');
+            value = uri.LocalPath;
+        }
+
+        value = Environment.ExpandEnvironmentVariables(value);
+        if (value.StartsWith("//", StringComparison.Ordinal))
+            value = value.Replace('/', '\\');
+
+        try
+        {
+            if (Path.IsPathRooted(value))
+                return Path.GetFullPath(value);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // Preserve a shell-recognised location even when .NET cannot
+            // normalise it (for example a long or namespace-only path).
+        }
+
+        return value.Replace('/', '\\');
     }
     public static string GetDefaultExplorerLocation(ShellPathComparer? shellPathComparer = null)
     {
@@ -556,49 +610,4 @@ public static class Helper
             ShowWindow(hWnd, removeCache: true);
     }
 
-    public static async Task<List<SupporterInfo>> GetSupporters()
-    {
-        try
-        {
-            using var client = new System.Net.Http.HttpClient();
-            var svgContent = await client.GetStringAsync("https://cdn.jsdelivr.net/gh/w4po/sponsors/sponsors.svg");
-
-            var supporters = new List<SupporterInfo>();
-            var xmlDoc = new System.Xml.XmlDocument();
-            xmlDoc.LoadXml(svgContent);
-
-            // Find all <a> elements (supporters)
-            var linkNodes = xmlDoc.GetElementsByTagName("a");
-
-            foreach (System.Xml.XmlNode linkNode in linkNodes)
-            {
-                if (linkNode is not System.Xml.XmlElement linkElement)
-                    continue;
-
-                var href = linkElement.GetAttribute("href");
-                var id = linkElement.GetAttribute("id");
-
-                // Find the image element inside the link
-                var imageElements = linkElement.GetElementsByTagName("image");
-                if (imageElements.Count <= 0 || imageElements[0] is not System.Xml.XmlElement imageElement)
-                    continue;
-
-                var imageUrl = imageElement.GetAttribute("href");
-
-                supporters.Add(new SupporterInfo
-                {
-                    Name = string.IsNullOrWhiteSpace(id) ? "Unknown" : id,
-                    ProfileUrl = string.IsNullOrEmpty(href) ? string.Empty : href,
-                    ImageUrl = string.IsNullOrEmpty(imageUrl) ? string.Empty : imageUrl
-                });
-            }
-
-            return supporters;
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Error parsing SVG: {ex.Message}");
-            return [];
-        }
-    }
 }

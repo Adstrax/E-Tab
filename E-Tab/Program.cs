@@ -4,7 +4,6 @@ using System.Windows.Forms;
 using ETab.Helpers;
 using ETab.Hooks;
 using ETab.Managers;
-using ETab.WinAPI;
 
 namespace ETab;
 
@@ -54,7 +53,7 @@ internal static class Program
         }
 
         ThemeManager.Initialize();
-        Log.Info($"E-Tab started ({typeof(Program).Assembly.GetName().Version}) from '{Environment.ProcessPath}'.");
+        Log.Info($"E-Tab started ({UpdateManager.DisplayVersion}) from '{Environment.ProcessPath}'.");
         UpdateManager.CleanupStaleUpdaterFiles();
 
         // If "start with Windows" points at a copy that is no longer there, it is
@@ -101,28 +100,6 @@ internal sealed class ETabApplicationContext : ApplicationContext
         _explorerWatcher = new ExplorerWatcher();
         if (SettingsManager.AutoMerge) _explorerWatcher.StartHook();
         _trayIcon = new TrayIcon(_explorerWatcher!);
-        StartIdleMemoryTrim();
-    }
-
-    /// <summary>
-    /// While nothing is happening, the pages the app touched are handed back to
-    /// Windows once a minute. They are faulted in again the moment a folder is
-    /// opened, so this costs nothing and keeps the app from sitting on memory it
-    /// is not using.
-    /// </summary>
-    private static void StartIdleMemoryTrim()
-    {
-        _ = new System.Threading.Timer(
-            _ =>
-            {
-                var idleFor = System.Diagnostics.Stopwatch
-                    .GetElapsedTime(ExplorerWatcher.LastActivityTicks).TotalSeconds;
-                if (idleFor >= 60)
-                    WinApi.TrimWorkingSet();
-            },
-            null,
-            TimeSpan.FromSeconds(30),
-            TimeSpan.FromSeconds(30));
     }
 
     protected override void ExitThreadCore()

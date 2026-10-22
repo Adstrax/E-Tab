@@ -11,20 +11,35 @@ public static class AutoStartManager
 
     public static bool IsEnabled()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
-        var value = key?.GetValue(ValueName) as string;
-        return string.Equals(value, GetLaunchCommand(), StringComparison.OrdinalIgnoreCase);
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            var value = key?.GetValue(ValueName) as string;
+            return string.Equals(value, GetLaunchCommand(), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"The start with Windows setting could not be read: {ex.Message}");
+            return false;
+        }
     }
 
     public static void SetEnabled(bool enabled)
     {
-        using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
-        if (key == null) return;
+        try
+        {
+            using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
+            if (key == null) return;
 
-        if (enabled)
-            key.SetValue(ValueName, GetLaunchCommand(), RegistryValueKind.String);
-        else
-            key.DeleteValue(ValueName, false);
+            if (enabled)
+                key.SetValue(ValueName, GetLaunchCommand(), RegistryValueKind.String);
+            else
+                key.DeleteValue(ValueName, false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"The start with Windows setting could not be changed: {ex.Message}");
+        }
     }
 
     /// <summary>

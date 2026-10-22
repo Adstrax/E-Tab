@@ -15,6 +15,7 @@ public static class WinApi
 {
     public const int EVENT_SYSTEM_FOREGROUND = 0x0003;
     public const int EVENT_SYSTEM_CAPTURESTART = 0x0008;
+    public const int EVENT_OBJECT_CREATE = 0x8000;
     public const int EVENT_OBJECT_SHOW = 0x8002;
 
     public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
@@ -271,26 +272,4 @@ public static class WinApi
     [DllImport("dwmapi.dll", PreserveSig = true)]
     public static extern int DwmSetWindowAttribute(nint hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 
-    [DllImport("kernel32.dll")]
-    private static extern nint GetCurrentProcess();
-
-    [DllImport("psapi.dll")]
-    private static extern bool EmptyWorkingSet(nint hProcess);
-
-    /// <summary>
-    /// Hands idle, private working-set pages back to the OS. Called only while
-    /// the app is idle; it lowers the memory shown in Task Manager and does not
-    /// change any behaviour - the pages come back the moment they are needed.
-    /// </summary>
-    public static void TrimWorkingSet()
-    {
-        try
-        {
-            EmptyWorkingSet(GetCurrentProcess());
-        }
-        catch
-        {
-            // Trimming memory must never throw.
-        }
-    }
 }
