@@ -458,8 +458,10 @@ public static class Helper
     }
     public static bool MakeWindowTransparent(nint hWnd)
     {
-        if (hWnd == 0 || HiddenWindows.ContainsKey(hWnd)) return false;
+        if (hWnd == 0) return false;
 
+        // Reapply both attributes even when the cache already contains this
+        // handle. Explorer can reset extended styles while creating a window.
         UpdateWindowLayered(hWnd, remove: false);
         WinApi.SetLayeredWindowAttributes(hWnd, 0, 0, WinApi.LWA_ALPHA);
         return HiddenWindows.TryAdd(hWnd, null);

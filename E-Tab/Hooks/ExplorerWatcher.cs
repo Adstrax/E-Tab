@@ -30,6 +30,7 @@ public class ExplorerWatcher : IHook
     private readonly ConcurrentDictionary<nint, byte> _processedHWnds = new();
     private readonly ConcurrentDictionary<nint, byte> _trackedExplorerHandles = new();
     private readonly ConcurrentDictionary<nint, byte> _recentlyConvertedHandles = new();
+    private readonly ConcurrentDictionary<nint, long> _duplicateSourceHandles = new();
     private readonly DualKeyDictionary<InternetExplorer, nint?, WindowInfo> _windowEntryDict = [];
     private readonly List<WindowRecord> _closedWindows = new();
     private readonly object _windowEntryDictLock = new(), _closedWindowsLock = new(), _processLock = new();
@@ -55,6 +56,7 @@ public class ExplorerWatcher : IHook
     private int _desktopFolderSwitchRunning;
     private string? _desktopFolderFromInput;
     private long _desktopFolderFromInputAt;
+    private nint _pendingDesktopSourceWindow;
 
     private string _defaultLocation = null!;
     private bool _reuseTabs = true;
@@ -593,7 +595,7 @@ public class ExplorerWatcher : IHook
 
         if (!WinApi.IsWindowHasClassName(hWnd, "CabinetWClass")) return;
 
-        if (_mainWindowHandle == 0 ||
+        if (!HasLiveMergeTarget(hWnd) ||
             hWnd == _mainWindowHandle ||
             Helper.IsCtrlShiftDown())
         {
@@ -601,11 +603,17 @@ public class ExplorerWatcher : IHook
         }
         if (IsTrackedExplorerWindow(hWnd)) return;
 
-        // Hiding a window at OBJECT_CREATE can delay ShellWindowRegistered by
-        // seconds because Explorer finishes registering a window only after its
-        // native show state settles. Make it transparent at creation instead,
-        // then hide it natively at foreground/first-show. That blocks the first
-        // painted frame without delaying the conversion path.
+        // Desktop double-clicks can skip the foreground event for the newly
+        // created Explorer window. Remember it here so a later successful tab
+        // switch can close this concrete source window instead of leaving it
+        // hidden until the safety timeout shows it again.
+        RememberDesktopSourceWindow(hWnd);
+        if (Volatile.Read(ref _pendingDesktopSourceWindow) == hWnd)
+            QueueDesktopFolderSwitch(hWnd);
+
+        // A transparent creation-time window must stay visible to Explorer's
+        // native show-state checks. Hiding it a second time delays
+        // ShellWindowRegistered and can make the window disappear for seconds.
         if (!hideCompletely)
         {
             if (SettingsManager.HaveThemeIssue || Helper.HiddenWindows.ContainsKey(hWnd))
@@ -616,9 +624,16 @@ public class ExplorerWatcher : IHook
         }
         else
         {
-            // Escalate an already transparent creation-time window to a native
-            // hide. Calling GetOrAdd again is harmless and keeps the original
-            // position cache for ShowWindow.
+            // The creation hook normally protected the first frame already.
+            // Keep that window transparent instead of escalating to SW_HIDE.
+            if (!SettingsManager.HaveThemeIssue &&
+                Helper.HiddenWindows.ContainsKey(hWnd))
+            {
+                Helper.MakeWindowTransparent(hWnd);
+                return;
+            }
+
+            // This handles windows created before the hook was ready.
             Helper.HideWindow(hWnd, SettingsManager.HaveThemeIssue, hideCompletely: true);
         }
 
@@ -627,15 +642,47 @@ public class ExplorerWatcher : IHook
         // If the shell never registers this window, keep an invisible window
         // from becoming stranded. A late appearance is recoverable; a window
         // the user cannot see or reach is not.
-        _ = Task.Delay(4_000).ContinueWith(_ => _uiContext.Post(_ =>
+        _ = Task.Delay(1_500).ContinueWith(_ => _uiContext.Post(_ =>
         {
             if (!Helper.HiddenWindows.ContainsKey(hWnd) || !WinApi.IsWindow(hWnd)) return;
+            if (_trackedExplorerHandles.ContainsKey(hWnd)) return;
+            if (IsDuplicateSourceWindow(hWnd))
+            {
+                WinApi.PostMessage(hWnd, WinApi.WM_CLOSE, 0, 0);
+                return;
+            }
 
+            // If Shell never reports the window, keep it open as a normal
+            // Explorer window instead of showing it and merging it later.
+            PreventWindowHiding(hWnd);
             Helper.ShowWindow(hWnd, removeCache: true);
             if (!SettingsManager.HaveThemeIssue)
                 Helper.UpdateWindowLayered(hWnd, remove: true);
             Log.Warn($"Window 0x{hWnd:X} was shown again because the shell never registered it.");
         }, null), TaskScheduler.Default);
+    }
+
+    private bool HasLiveMergeTarget(nint incomingWindow)
+    {
+        var mainWindow = _mainWindowHandle;
+        if (IsLiveExplorerWindow(mainWindow, incomingWindow))
+            return true;
+
+        // _mainWindowHandle can be empty briefly while Shell COM recovers or
+        // while the previous primary window is closing. The actual open-window
+        // list is the source of truth for deciding whether this is the first
+        // Explorer window or a window that should become a tab.
+        return Helper.GetAllExplorerWindows()
+            .Any(window => IsLiveExplorerWindow(window, incomingWindow));
+    }
+
+    private static bool IsLiveExplorerWindow(nint candidate, nint incomingWindow)
+    {
+        return candidate != 0 &&
+               candidate != incomingWindow &&
+               WinApi.IsWindow(candidate) &&
+               WinApi.IsWindowVisible(candidate) &&
+               Helper.IsFileExplorerWindow(candidate);
     }
 
     private void OnSystemForeground(nint hWinEventHook, uint eventType, nint hWnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
@@ -646,6 +693,8 @@ public class ExplorerWatcher : IHook
 
             if (!IsTrackedExplorerWindow(hWnd))
             {
+                RememberDesktopSourceWindow(hWnd);
+
                 // Explorer raises the window and only 30-50 ms later raises
                 // SHOW. Hide it at the earlier foreground signal so its first
                 // frame is never painted while the folder is moved into a tab.
@@ -653,28 +702,36 @@ public class ExplorerWatcher : IHook
                 return;
             }
 
-            if (Interlocked.CompareExchange(ref _desktopFolderSwitchRunning, 1, 0) != 0) return;
-
-            try
-            {
-                // Shell COM objects remain owned by the UI apartment. Only the
-                // time-sensitive WinEvent pump runs on the dedicated thread.
-                _uiContext.Post(
-                    _ => Observe(
-                        SwitchToDesktopFolderAsync(hWnd),
-                        "Switching to a desktop folder"),
-                    null);
-            }
-            catch
-            {
-                Volatile.Write(ref _desktopFolderSwitchRunning, 0);
-                throw;
-            }
+            QueueDesktopFolderSwitch(hWnd);
         }
         catch (Exception ex)
         {
             Volatile.Write(ref _desktopFolderSwitchRunning, 0);
             Log.Warn("Handling an Explorer foreground event failed: " + ex.Message);
+        }
+    }
+
+    private void QueueDesktopFolderSwitch(nint foregroundWindow)
+    {
+        if (Interlocked.CompareExchange(ref _desktopFolderSwitchRunning, 1, 0) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            // Shell COM objects remain owned by the UI apartment. Only the
+            // time-sensitive WinEvent pump runs on the dedicated thread.
+            _uiContext.Post(
+                _ => Observe(
+                    SwitchToDesktopFolderAsync(foregroundWindow),
+                    "Switching to a desktop folder"),
+                null);
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref _desktopFolderSwitchRunning, 0);
+            Log.Warn("Queueing a desktop folder switch failed: " + ex.Message);
         }
     }
 
@@ -695,6 +752,7 @@ public class ExplorerWatcher : IHook
             // Capture the icon while the desktop is still the topmost window.
             // Once Explorer is foreground it may cover the icon, so its position
             // can no longer be resolved with a point hit test.
+            Interlocked.Exchange(ref _pendingDesktopSourceWindow, 0);
             _desktopFolderFromInput = Helper.GetDesktopFolderUnderCursor();
             _desktopFolderFromInputAt = Stopwatch.GetTimestamp();
         }
@@ -702,6 +760,20 @@ public class ExplorerWatcher : IHook
         {
             Log.Warn("Capturing a desktop input event failed: " + ex.Message);
         }
+    }
+
+    private void RememberDesktopSourceWindow(nint hWnd)
+    {
+        if (hWnd == 0 ||
+            string.IsNullOrWhiteSpace(_desktopFolderFromInput) ||
+            Helper.IsTimeUp(_desktopFolderFromInputAt, 2_000))
+        {
+            return;
+        }
+
+        // Keep the first candidate for this desktop click. Later shell helper
+        // windows must not replace the actual source Explorer window.
+        Interlocked.CompareExchange(ref _pendingDesktopSourceWindow, hWnd, 0);
     }
 
     private bool IsTrackedExplorerWindow(nint hWnd)
@@ -719,10 +791,18 @@ public class ExplorerWatcher : IHook
                 return;
 
             var existingTab = await SearchForTab(folder);
-            if (existingTab == 0) return;
+            if (existingTab == 0)
+            {
+                Interlocked.Exchange(ref _pendingDesktopSourceWindow, 0);
+                return;
+            }
 
             var targetWindow = WinApi.GetParent(existingTab);
-            if (targetWindow == 0) return;
+            if (targetWindow == 0)
+            {
+                Interlocked.Exchange(ref _pendingDesktopSourceWindow, 0);
+                return;
+            }
 
             var activeTab = GetActiveTabHandle(foregroundWindow);
             if (activeTab == existingTab &&
@@ -731,6 +811,9 @@ public class ExplorerWatcher : IHook
 
             await SelectTabByHandle(targetWindow, existingTab);
             WinApi.RestoreWindowToForeground(targetWindow);
+            CloseDuplicateSourceWindow(
+                Interlocked.Exchange(ref _pendingDesktopSourceWindow, 0),
+                targetWindow);
             _desktopFolderFromInput = null;
             Log.Info(
                 $"Desktop folder '{folder}' was already open; switched " +
@@ -744,6 +827,35 @@ public class ExplorerWatcher : IHook
         {
             Volatile.Write(ref _desktopFolderSwitchRunning, 0);
         }
+    }
+
+    private void CloseDuplicateSourceWindow(nint sourceWindow, nint targetWindow)
+    {
+        if (sourceWindow == 0 ||
+            sourceWindow == targetWindow ||
+            !WinApi.IsWindow(sourceWindow))
+        {
+            return;
+        }
+
+        // A folder opened from the desktop normally creates a new single-tab
+        // window. Close only that source window; never close a window that may
+        // contain unrelated tabs.
+        if (Helper.GetAllExplorerTabs(sourceWindow).Skip(1).Any())
+        {
+            Log.Warn(
+                $"Duplicate source window 0x{sourceWindow:X} was kept open " +
+                "because it contains more than one tab.");
+            return;
+        }
+
+        MarkDuplicateSourceWindow(sourceWindow);
+        PreventWindowHiding(sourceWindow);
+        MarkRecentlyConvertedWindow(sourceWindow);
+        WinApi.PostMessage(sourceWindow, WinApi.WM_CLOSE, 0, 0);
+        Log.Info(
+            $"Duplicate source window 0x{sourceWindow:X} was closed after " +
+            $"switching to existing tab 0x{targetWindow:X}.");
     }
     private InternetExplorer? GetRecentlyCreatedWindow(out WindowInfo? windowInfo)
     {
@@ -795,8 +907,20 @@ public class ExplorerWatcher : IHook
             hWnd = new IntPtr(window.HWND);
             windowInfo.Handle = hWnd;
             _trackedExplorerHandles.TryAdd(hWnd, 0);
+
+            if (IsDuplicateSourceWindow(hWnd))
+            {
+                showAgain = false;
+                window.Quit();
+                Helper.ForgetHiddenWindow(hWnd);
+                RemoveWindowAndUnhookEvents(window, windowInfo);
+                Log.Info(
+                    $"Duplicate source window 0x{hWnd:X} was suppressed " +
+                    "before it could become another tab.");
+                return;
+            }
             
-            if (shouldOpenAsWindow)
+            if (shouldOpenAsWindow || _processedHWnds.ContainsKey(hWnd))
             {
                 PreventWindowHiding(hWnd);
                 HookWindowEvents(window, windowInfo);
@@ -987,6 +1111,8 @@ public class ExplorerWatcher : IHook
         {
             _trackedExplorerHandles.TryRemove(trackedHandle, out _);
             _processedHWnds.TryRemove(trackedHandle, out _);
+            if (trackedHandle == _mainWindowHandle)
+                _mainWindowHandle = 0;
         }
 
         // Finally, release the COM reference for this InternetExplorer instance
@@ -1422,6 +1548,26 @@ public class ExplorerWatcher : IHook
             TaskScheduler.Default);
     }
 
+    private void MarkDuplicateSourceWindow(nint hWnd)
+    {
+        _duplicateSourceHandles[hWnd] = Stopwatch.GetTimestamp();
+        _ = Task.Delay(5_000).ContinueWith(
+            finishedTask => _duplicateSourceHandles.TryRemove(hWnd, out _),
+            TaskScheduler.Default);
+    }
+
+    private bool IsDuplicateSourceWindow(nint hWnd)
+    {
+        if (!_duplicateSourceHandles.TryGetValue(hWnd, out var markedAt))
+            return false;
+
+        if (!Helper.IsTimeUp(markedAt, 5_000))
+            return true;
+
+        _duplicateSourceHandles.TryRemove(hWnd, out _);
+        return false;
+    }
+
     private void StartExplorerProcessCheck()
     {
         _explorerCheckTimer?.Dispose();
@@ -1618,6 +1764,7 @@ public class ExplorerWatcher : IHook
             }
         }
         _windowEntryDict.Clear();
+        _mainWindowHandle = 0;
 
         // Release the ShellWindows COM object
         try

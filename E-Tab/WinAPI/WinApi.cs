@@ -25,6 +25,7 @@ public static class WinApi
     public const uint COINIT_APARTMENTTHREADED = 0x2;
 
     public const int WM_COMMAND = 0x111; // Send a command
+    public const uint WM_CLOSE = 0x0010;
 
     public const int SW_SHOWNOACTIVATE = 4; // Show window but not activated
 
