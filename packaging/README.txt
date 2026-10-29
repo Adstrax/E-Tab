@@ -10,7 +10,9 @@ E-Tab 是 Windows 11 文件资源管理器增强工具：新打开的文件夹�
 3. 右键托盘图标可以：
    * Auto-merge new windows —— 是否自动把新窗口合并成标签页（默认开启）
    * Merge all windows (Ctrl+Shift+E) —— 把当前所有窗口一次性合并成一个窗口的标签页
+   * Automatic updates —— 自动检查并下载正式版更新（默认开启，每 6 小时检查一次）
    * Check for updates... —— 检查并安装 GitHub 上的最新正式版
+   * Restart to install vX.Y.Z —— 自动更新准备好后出现，选择后重启并安装
    * Start with Windows —— 开机自启
    * Exit —— 退出程序
 

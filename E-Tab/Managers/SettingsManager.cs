@@ -24,6 +24,17 @@ public static class SettingsManager
     }
 
     /// <summary>
+    /// Whether E-Tab checks for a newer stable release in the background and
+    /// downloads it after it has passed GitHub's integrity checks. On by
+    /// default; installation still waits until the user restarts the app.
+    /// </summary>
+    public static bool AutoUpdate
+    {
+        get => ReadBool("AutoUpdate", true);
+        set => WriteBool("AutoUpdate", value);
+    }
+
+    /// <summary>
     /// True when Windows itself is drawing window frames in a way that a hidden
     /// window cannot be made invisible without a visible flicker, in which case
     /// the window is moved out of the way instead.

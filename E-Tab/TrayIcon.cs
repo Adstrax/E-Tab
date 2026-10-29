@@ -4,6 +4,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ETab.Helpers;
@@ -22,14 +23,25 @@ namespace ETab;
 /// </summary>
 public sealed class TrayIcon : IDisposable
 {
+    private static readonly TimeSpan FirstAutomaticUpdateCheckDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan AutomaticUpdateCheckInterval = TimeSpan.FromHours(6);
+
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _icon;
     private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _autoStartItem;
     private readonly ToolStripMenuItem _autoMergeItem;
+    private readonly ToolStripMenuItem _autoUpdateItem;
+    private readonly ToolStripMenuItem _installUpdateItem;
     private readonly ToolStripMenuItem _updateItem;
     private readonly HotkeyWindow? _hotkey;
     private readonly ExplorerWatcher _watcher;
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private CancellationTokenSource? _automaticUpdateCancellation;
+    private Task? _automaticUpdateTask;
+    private UpdateInfo? _downloadedUpdate;
+    private string? _downloadedUpdatePath;
+    private bool _updateOperationInProgress;
     private bool _disposed;
 
     public TrayIcon(ExplorerWatcher watcher)
@@ -59,8 +71,30 @@ public sealed class TrayIcon : IDisposable
             Log.Info("Auto-merge setting changed to " + _autoMergeItem.Checked);
         };
 
+        _autoUpdateItem = new ToolStripMenuItem("Automatic updates")
+        {
+            CheckOnClick = true,
+            Checked = SettingsManager.AutoUpdate,
+        };
+        _autoUpdateItem.Click += (_, _) =>
+        {
+            SettingsManager.AutoUpdate = _autoUpdateItem.Checked;
+            Log.Info("Automatic update setting changed to " + _autoUpdateItem.Checked);
+
+            if (_autoUpdateItem.Checked)
+                StartAutomaticUpdates();
+            else
+                StopAutomaticUpdates();
+        };
+
         var mergeAllItem = new ToolStripMenuItem("Merge all windows (Ctrl+Shift+E)");
         mergeAllItem.Click += (_, _) => _watcher.MergeAllWindowsNow();
+
+        _installUpdateItem = new ToolStripMenuItem
+        {
+            Visible = false,
+        };
+        _installUpdateItem.Click += (_, _) => InstallDownloadedUpdate();
 
         _updateItem = new ToolStripMenuItem("Check for updates...");
         _updateItem.Click += async (_, _) => await CheckForUpdatesAsync();
@@ -92,7 +126,9 @@ public sealed class TrayIcon : IDisposable
 
         ApplyItemStyle(_autoStartItem, isTitle: false);
         ApplyItemStyle(_autoMergeItem, isTitle: false);
+        ApplyItemStyle(_autoUpdateItem, isTitle: false);
         ApplyItemStyle(mergeAllItem, isTitle: false);
+        ApplyItemStyle(_installUpdateItem, isTitle: false);
         ApplyItemStyle(_updateItem, isTitle: false);
         ApplyItemStyle(exitItem, isTitle: false);
 
@@ -102,11 +138,14 @@ public sealed class TrayIcon : IDisposable
         _menu.Items.Add(_autoMergeItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(mergeAllItem);
+        _menu.Items.Add(_autoUpdateItem);
+        _menu.Items.Add(_installUpdateItem);
         _menu.Items.Add(_updateItem);
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(exitItem);
         _menu.Opening += (_, _) => _autoStartItem.Checked = AutoStartManager.IsEnabled();
         _menu.Opening += (_, _) => _autoMergeItem.Checked = _watcher.IsHookActive;
+        _menu.Opening += (_, _) => UpdateMenuState();
 
         _notifyIcon.ContextMenuStrip = _menu;
         _notifyIcon.MouseUp += (_, e) =>
@@ -116,6 +155,7 @@ public sealed class TrayIcon : IDisposable
         };
 
         _hotkey = new HotkeyWindow(_watcher, RestoreTrayIcon);
+        StartAutomaticUpdates();
     }
 
     /// <summary>
@@ -229,13 +269,21 @@ public sealed class TrayIcon : IDisposable
 
     private async Task CheckForUpdatesAsync()
     {
+        if (_disposed || _updateOperationInProgress) return;
+        if (_downloadedUpdate is not null)
+        {
+            PromptToInstallDownloadedUpdate();
+            return;
+        }
+
         var originalText = _updateItem.Text;
+        _updateOperationInProgress = true;
+        UpdateMenuState();
         try
         {
-            _updateItem.Enabled = false;
             _updateItem.Text = "Checking for updates...";
 
-            var update = await UpdateManager.CheckAsync();
+            var update = await UpdateManager.CheckAsync(_lifetimeCancellation.Token);
             if (update is null)
             {
                 MessageBox.Show(
@@ -257,12 +305,20 @@ public sealed class TrayIcon : IDisposable
             if (answer != DialogResult.Yes) return;
 
             _updateItem.Text = "Downloading update...";
-            var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(update);
+            var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(
+                update,
+                _lifetimeCancellation.Token);
+
+            StoreDownloadedUpdate(update, downloadedExecutable, notifyUser: false);
 
             _updateItem.Text = "Restarting to update...";
             UpdateManager.StartUpdater(downloadedExecutable);
             Log.Info($"Update {update.Version} was downloaded; restarting to install it.");
             ExitApplication();
+        }
+        catch (OperationCanceledException) when (_lifetimeCancellation.IsCancellationRequested)
+        {
+            // The app is exiting; there is nobody to show an error to.
         }
         catch (Exception ex)
         {
@@ -275,9 +331,194 @@ public sealed class TrayIcon : IDisposable
         }
         finally
         {
-            _updateItem.Text = originalText;
-            _updateItem.Enabled = true;
+            _updateOperationInProgress = false;
+            if (!_disposed)
+            {
+                _updateItem.Text = originalText;
+                UpdateMenuState();
+            }
         }
+    }
+
+    private void StartAutomaticUpdates()
+    {
+        if (_disposed || !SettingsManager.AutoUpdate)
+            return;
+        if (_automaticUpdateTask is { IsCompleted: false })
+            return;
+
+        _automaticUpdateCancellation?.Cancel();
+        _automaticUpdateCancellation?.Dispose();
+        _automaticUpdateCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            _lifetimeCancellation.Token);
+        _automaticUpdateTask = RunAutomaticUpdateLoopAsync(
+            _automaticUpdateCancellation.Token);
+    }
+
+    private void StopAutomaticUpdates()
+    {
+        var cancellation = _automaticUpdateCancellation;
+        _automaticUpdateCancellation = null;
+        _automaticUpdateTask = null;
+        cancellation?.Cancel();
+        cancellation?.Dispose();
+    }
+
+    private async Task RunAutomaticUpdateLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(FirstAutomaticUpdateCheckDelay, cancellationToken);
+
+            while (!cancellationToken.IsCancellationRequested && !_disposed)
+            {
+                await CheckAndDownloadAutomaticallyAsync(cancellationToken);
+                await Task.Delay(AutomaticUpdateCheckInterval, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Disabling automatic updates or exiting stops the loop promptly.
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("The automatic update loop stopped unexpectedly: " + ex.Message);
+        }
+    }
+
+    private async Task CheckAndDownloadAutomaticallyAsync(CancellationToken cancellationToken)
+    {
+        if (!SettingsManager.AutoUpdate ||
+            _downloadedUpdate is not null ||
+            _updateOperationInProgress)
+        {
+            return;
+        }
+
+        _updateOperationInProgress = true;
+        UpdateMenuState();
+        try
+        {
+            _updateItem.Text = "Checking for updates...";
+            var update = await UpdateManager.CheckAsync(cancellationToken);
+            if (update is null)
+            {
+                Log.Info("Automatic update check found no newer stable release.");
+                return;
+            }
+
+            Log.Info($"Automatic update check found {update.Version}; downloading it.");
+            _updateItem.Text = "Downloading update...";
+            var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(
+                update,
+                cancellationToken);
+
+            if (!SettingsManager.AutoUpdate || cancellationToken.IsCancellationRequested)
+                return;
+
+            StoreDownloadedUpdate(update, downloadedExecutable, notifyUser: true);
+            Log.Info($"Update {update.Version} was downloaded and is ready to install.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Expected when the user turns automatic updates off or exits.
+        }
+        catch (Exception ex)
+        {
+            // Background failures are expected to include being offline. Keep
+            // them out of the user's way and retry on the next scheduled check.
+            Log.Warn("Automatic update check or download failed; will retry later: " + ex.Message);
+        }
+        finally
+        {
+            _updateOperationInProgress = false;
+            if (!_disposed)
+            {
+                _updateItem.Text = "Check for updates...";
+                UpdateMenuState();
+            }
+        }
+    }
+
+    private void StoreDownloadedUpdate(
+        UpdateInfo update,
+        string downloadedExecutable,
+        bool notifyUser)
+    {
+        _downloadedUpdate = update;
+        _downloadedUpdatePath = downloadedExecutable;
+        _installUpdateItem.Text =
+            $"Restart to install v{update.Version.ToString(3)}";
+        UpdateMenuState();
+
+        if (!notifyUser || _disposed)
+            return;
+
+        _notifyIcon.BalloonTipTitle = "E-Tab update ready";
+        _notifyIcon.BalloonTipText =
+            $"Version {update.Version.ToString(3)} was downloaded and verified. " +
+            "Open the tray menu and choose Restart to install.";
+        _notifyIcon.BalloonTipIcon = ToolTipIcon.Info;
+        _notifyIcon.ShowBalloonTip(10_000);
+    }
+
+    private void PromptToInstallDownloadedUpdate()
+    {
+        var version = _downloadedUpdate?.Version.ToString(3) ?? "new";
+        var answer = MessageBox.Show(
+            $"E-Tab {version} has been downloaded and verified.\n\n" +
+            "Restart E-Tab now to install it?",
+            "E-Tab update",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+        if (answer == DialogResult.Yes)
+            InstallDownloadedUpdate();
+    }
+
+    private void InstallDownloadedUpdate()
+    {
+        var downloadedExecutable = _downloadedUpdatePath;
+        if (!string.IsNullOrWhiteSpace(downloadedExecutable) &&
+            System.IO.File.Exists(downloadedExecutable))
+        {
+            try
+            {
+                UpdateManager.StartUpdater(downloadedExecutable);
+                Log.Info("Restarting to install the downloaded update.");
+                ExitApplication();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Starting the downloaded update failed.", ex);
+                MessageBox.Show(
+                    "E-Tab could not start the update installer.\n\n" + ex.Message,
+                    "E-Tab update",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+
+            return;
+        }
+
+        _downloadedUpdate = null;
+        _downloadedUpdatePath = null;
+        UpdateMenuState();
+        MessageBox.Show(
+            "The downloaded update is no longer available. " +
+            "E-Tab will check for it again later.",
+            "E-Tab update",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
+    }
+
+    private void UpdateMenuState()
+    {
+        if (_disposed)
+            return;
+
+        _autoUpdateItem.Checked = SettingsManager.AutoUpdate;
+        _installUpdateItem.Visible = _downloadedUpdatePath is not null;
+        _updateItem.Enabled = !_updateOperationInProgress;
     }
 
     public void Dispose()
@@ -285,12 +526,15 @@ public sealed class TrayIcon : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        _lifetimeCancellation.Cancel();
+        StopAutomaticUpdates();
         _notifyIcon.ContextMenuStrip = null;
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _menu.Dispose();
         _icon.Dispose();
         _hotkey?.Dispose();
+        _lifetimeCancellation.Dispose();
     }
 
     private static bool IsDarkMode()

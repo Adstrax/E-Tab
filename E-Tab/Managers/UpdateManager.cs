@@ -54,7 +54,12 @@ internal static class UpdateManager
         if (!TryParseVersion(tag, out var latestVersion))
             throw new InvalidOperationException("The latest GitHub release has no valid version tag.");
 
-        if (NormalizeVersion(latestVersion) <= NormalizeVersion(CurrentVersion))
+        var latestNormalizedVersion = NormalizeVersion(latestVersion);
+        var currentNormalizedVersion = NormalizeVersion(CurrentVersion);
+        if (latestNormalizedVersion < currentNormalizedVersion)
+            return null;
+        if (latestNormalizedVersion == currentNormalizedVersion &&
+            !DisplayVersion.Contains("-test.", StringComparison.OrdinalIgnoreCase))
             return null;
 
         var expectedAssetName = $"E-Tab-{latestVersion.ToString(3)}-win64.zip";
