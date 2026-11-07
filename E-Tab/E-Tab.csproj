@@ -21,10 +21,10 @@
         <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
 
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>7.3.1</Version>
-        <InformationalVersion>7.3.1</InformationalVersion>
-        <AssemblyVersion>7.3.1.0</AssemblyVersion>
-        <FileVersion>7.3.1.0</FileVersion>
+        <Version>7.3.2</Version>
+        <InformationalVersion>7.3.2</InformationalVersion>
+        <AssemblyVersion>7.3.2.0</AssemblyVersion>
+        <FileVersion>7.3.2.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>

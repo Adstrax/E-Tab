@@ -23,6 +23,10 @@ public class ExplorerWatcher : IHook
 {
     private static bool _instanceRunning;
     private static Guid _shellBrowserGuid = typeof(IShellBrowser).GUID;
+    private static long _lastActivityTicks = Stopwatch.GetTimestamp();
+
+    public static long LastActivityTicks =>
+        Volatile.Read(ref _lastActivityTicks);
 
     private ShellWindows _shellWindows = null!;
     private ShellPathComparer _shellPathComparer = null!;
@@ -87,6 +91,7 @@ public class ExplorerWatcher : IHook
     public void StartHook()
     {
         if (_isForcingTabs) return;
+        MarkActivity();
         _isForcingTabs = true;
         SettingsManager.AutoMerge = true;
         Log.Info("Auto-merge hook is active.");
@@ -95,6 +100,7 @@ public class ExplorerWatcher : IHook
     public void StopHook()
     {
         if (!_isForcingTabs) return;
+        MarkActivity();
         _isForcingTabs = false;
         SettingsManager.AutoMerge = false;
     }
@@ -107,6 +113,7 @@ public class ExplorerWatcher : IHook
     /// </summary>
     public void MergeAllWindowsNow()
     {
+        MarkActivity();
         if (SynchronizationContext.Current != _uiContext)
         {
             _uiContext.Post(_ => MergeAllWindowsNow(), null);
@@ -576,6 +583,7 @@ public class ExplorerWatcher : IHook
                 return;
             }
 
+            MarkActivity();
             HideIncomingWindow(
                 hWnd,
                 eventType == WinApi.EVENT_OBJECT_CREATE ? "creation" : "its first show",
@@ -690,6 +698,7 @@ public class ExplorerWatcher : IHook
         try
         {
             if (!_isForcingTabs || !Helper.IsFileExplorerWindow(hWnd)) return;
+            MarkActivity();
 
             if (!IsTrackedExplorerWindow(hWnd))
             {
@@ -749,6 +758,7 @@ public class ExplorerWatcher : IHook
                 !string.Equals(rootClass, "WorkerW", StringComparison.OrdinalIgnoreCase))
                 return;
 
+            MarkActivity();
             // Capture the icon while the desktop is still the topmost window.
             // Once Explorer is foreground it may cover the icon, so its position
             // can no longer be resolved with a point hit test.
@@ -1189,6 +1199,7 @@ public class ExplorerWatcher : IHook
     }
     private async Task<bool> OpenTabNavigateWithSelection(WindowRecord windowToOpen, nint windowHandle = 0, bool isDuplicate = false, bool forceTabReuse = false)
     {
+        MarkActivity();
         await _toOpenWindowsLock.WaitAsync();
         try
         {
@@ -1398,6 +1409,12 @@ public class ExplorerWatcher : IHook
         // Active tab always at the top of the z-index
         return WinApi.FindWindowEx(windowHandle, 0, "ShellTabWindowClass", null);
     }
+
+    private static void MarkActivity()
+    {
+        Volatile.Write(ref _lastActivityTicks, Stopwatch.GetTimestamp());
+    }
+
     private InternetExplorer? GetWindowByTabHandle(nint tabHandle)
     {
         if (tabHandle == 0) return null;

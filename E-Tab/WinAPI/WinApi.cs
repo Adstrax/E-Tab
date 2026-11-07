@@ -54,6 +54,13 @@ public static class WinApi
         public uint Private;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LastInputInfo
+    {
+        public uint Size;
+        public uint Time;
+    }
+
     [DllImport("user32.dll")]
     public static extern nint SetWinEventHook(uint eventMin, uint eventMax, nint hModWinEventProc, WinEventDelegate lPfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
@@ -71,6 +78,18 @@ public static class WinApi
 
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
+
+    [DllImport("kernel32.dll")]
+    private static extern ulong GetTickCount64();
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("psapi.dll", SetLastError = true)]
+    private static extern bool EmptyWorkingSet(nint process);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LastInputInfo info);
 
     [DllImport("ole32.dll")]
     public static extern int CoInitializeEx(nint reserved, uint coInit);
@@ -181,6 +200,31 @@ public static class WinApi
             yield return handle;
 
         } while (handle != 0);
+    }
+
+    public static TimeSpan GetUserIdleTime()
+    {
+        var info = new LastInputInfo
+        {
+            Size = (uint)Marshal.SizeOf<LastInputInfo>(),
+        };
+        if (!GetLastInputInfo(ref info))
+            return TimeSpan.Zero;
+
+        var elapsedMilliseconds = unchecked((uint)GetTickCount64() - info.Time);
+        return TimeSpan.FromMilliseconds(elapsedMilliseconds);
+    }
+
+    public static bool TrimWorkingSet()
+    {
+        try
+        {
+            return EmptyWorkingSet(GetCurrentProcess());
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>

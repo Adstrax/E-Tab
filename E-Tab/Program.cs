@@ -79,6 +79,7 @@ internal sealed class ETabApplicationContext : ApplicationContext
 {
     private TrayIcon? _trayIcon;
     private ExplorerWatcher? _explorerWatcher;
+    private IdleMemoryTrimmer? _idleMemoryTrimmer;
     private bool _started;
 
     public ETabApplicationContext()
@@ -100,10 +101,13 @@ internal sealed class ETabApplicationContext : ApplicationContext
         _explorerWatcher = new ExplorerWatcher();
         if (SettingsManager.AutoMerge) _explorerWatcher.StartHook();
         _trayIcon = new TrayIcon(_explorerWatcher!);
+        _idleMemoryTrimmer = new IdleMemoryTrimmer(
+            () => ExplorerWatcher.LastActivityTicks);
     }
 
     protected override void ExitThreadCore()
     {
+        _idleMemoryTrimmer?.Dispose();
         _trayIcon?.Dispose();
         _explorerWatcher?.Dispose();
         base.ExitThreadCore();
