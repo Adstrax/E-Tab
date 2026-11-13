@@ -19,8 +19,8 @@ E-Tab 是 Windows 11 文件资源管理器增强工具：新打开的文件夹�
 
 常见问题
 --------
-* 双击没有反应？请先安装 .NET 10 Desktop Runtime：
-  https://dotnet.microsoft.com/download/dotnet/10.0
+* 双击没有反应？请先安装 .NET 11 Desktop Runtime：
+  https://dotnet.microsoft.com/download/dotnet/11.0
 * 如何完全退出？右键托盘图标 → Exit。
 * 想让某个文件夹单独开一个窗口？按住 Ctrl+Shift 再双击它。
 

@@ -38,6 +38,7 @@ public class DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> :
     // Optional key → primary key
     private readonly Dictionary<TPrimaryKey, Entry> _primaryDict;
     private readonly Dictionary<TOptionalKey, TPrimaryKey> _optionalDict;
+    private readonly ValueCollection _values;
 
     private class Entry(TValue value, TOptionalKey? optionalKey)
     {
@@ -56,12 +57,14 @@ public class DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> :
     {
         _primaryDict = new Dictionary<TPrimaryKey, Entry>();
         _optionalDict = new Dictionary<TOptionalKey, TPrimaryKey>();
+        _values = new ValueCollection(this);
     }
 
     public DualKeyDictionary(int capacity)
     {
         _primaryDict = new Dictionary<TPrimaryKey, Entry>(capacity);
         _optionalDict = new Dictionary<TOptionalKey, TPrimaryKey>(capacity);
+        _values = new ValueCollection(this);
     }
 
     TValue IDictionary<TPrimaryKey, TValue>.this[TPrimaryKey key]
@@ -343,9 +346,9 @@ public class DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> :
     public int Count => _primaryDict.Count;
     public bool IsReadOnly => false;
     public ICollection<TPrimaryKey> Keys => _primaryDict.Keys;
-    public ICollection<TValue> Values => new ValueCollection(this);
+    public ICollection<TValue> Values => _values;
     public ICollection<TOptionalKey> OptionalKeys => _optionalDict.Keys;
-    public ICollection<TValue> OptionalValues => new ValueCollection(this);
+    public ICollection<TValue> OptionalValues => _values;
 
     private class ValueCollection(DualKeyDictionary<TPrimaryKey, TOptionalKey, TValue> dict) : ICollection<TValue>
     {

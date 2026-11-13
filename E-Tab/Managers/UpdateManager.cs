@@ -38,6 +38,9 @@ internal static class UpdateManager
             ?.InformationalVersion
         ?? CurrentVersion.ToString(3);
 
+    public static bool IsPreviewVersion =>
+        DisplayVersion.Contains('-', StringComparison.Ordinal);
+
     public static async Task<UpdateInfo?> CheckAsync(CancellationToken cancellationToken = default)
     {
         using var client = CreateClient();
@@ -59,7 +62,7 @@ internal static class UpdateManager
         if (latestNormalizedVersion < currentNormalizedVersion)
             return null;
         if (latestNormalizedVersion == currentNormalizedVersion &&
-            !DisplayVersion.Contains("-test.", StringComparison.OrdinalIgnoreCase))
+            !IsPreviewVersion)
             return null;
 
         var expectedAssetName = $"E-Tab-{latestVersion.ToString(3)}-win64.zip";

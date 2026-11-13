@@ -49,12 +49,12 @@ public sealed class TrayIcon : IDisposable
         _watcher = watcher;
         _icon = LoadTrayIcon();
         var version = UpdateManager.DisplayVersion;
-        var isTestBuild = version.Contains("-test.", StringComparison.OrdinalIgnoreCase);
+        var isPreviewBuild = UpdateManager.IsPreviewVersion;
         _notifyIcon = new NotifyIcon
         {
             Icon = _icon,
-            Text = isTestBuild
-                ? $"E-Tab {version} - Test build"
+            Text = isPreviewBuild
+                ? $"E-Tab {version} - Preview build"
                 : $"E-Tab {version} - Open folders in new tabs",
             Visible = true,
         };
@@ -103,14 +103,14 @@ public sealed class TrayIcon : IDisposable
         exitItem.Click += (_, _) => ExitApplication();
 
         var titleItem = new ToolStripMenuItem(
-            isTestBuild
-                ? $"E-Tab  v{version}  [TEST BUILD]"
+            isPreviewBuild
+                ? $"E-Tab  v{version}  [PREVIEW BUILD]"
                 : $"E-Tab  v{version}")
         {
             Enabled = false,
         };
         ApplyItemStyle(titleItem, isTitle: true);
-        if (isTestBuild)
+        if (isPreviewBuild)
             titleItem.ForeColor = Color.FromArgb(255, 174, 70);
 
         _menu = new ContextMenuStrip

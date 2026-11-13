@@ -20,7 +20,7 @@ Windows 11 File Explorer 增强工具。新打开的文件夹窗口会自动合�
 
 - Windows 11 22H2（Build 22621）或更高版本
 - File Explorer 标签页功能已启用
-- 运行需要 .NET 10 Desktop Runtime；构建需要 .NET 10 SDK
+- 运行需要 .NET 11 Desktop Runtime；构建需要 .NET 11 SDK
 
 ## 构建
 
