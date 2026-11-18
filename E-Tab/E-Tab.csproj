@@ -3,7 +3,7 @@
     <PropertyGroup>
         <OutputType>WinExe</OutputType>
         <TargetFramework>net11.0-windows</TargetFramework>
-        <UseWPF>false</UseWPF>
+        <UseWPF>true</UseWPF>
         <UseWindowsForms>true</UseWindowsForms>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
@@ -21,10 +21,10 @@
         <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
 
         <ApplicationIcon>Icon.ico</ApplicationIcon>
-        <Version>8.0.0</Version>
-        <InformationalVersion>8.0.0</InformationalVersion>
-        <AssemblyVersion>8.0.0.0</AssemblyVersion>
-        <FileVersion>8.0.0.0</FileVersion>
+        <Version>8.1.0</Version>
+        <InformationalVersion>8.1.0</InformationalVersion>
+        <AssemblyVersion>8.1.0.0</AssemblyVersion>
+        <FileVersion>8.1.0.0</FileVersion>
         <RootNamespace>ETab</RootNamespace>
         <AssemblyName>E-Tab</AssemblyName>
         <Title>E-Tab</Title>

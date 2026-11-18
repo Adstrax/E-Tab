@@ -3,9 +3,9 @@ using Microsoft.Win32;
 namespace ETab.Helpers;
 
 /// <summary>
-/// Tracks the Windows app theme (light/dark). With a plain WinForms context menu
-/// the system does the styling for us, so this only exposes whether the OS is in
-/// dark mode and can be extended if a themed item is ever added back.
+/// Tracks the Windows app theme (light/dark) for the custom tray menu. The
+/// notification icon itself follows the system, so this only caches the value
+/// needed by the menu palette and refreshes it when Windows changes themes.
 /// </summary>
 public static class ThemeManager
 {

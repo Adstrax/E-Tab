@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -10,16 +11,16 @@ using System.Windows.Forms;
 using ETab.Helpers;
 using ETab.Hooks;
 using ETab.Managers;
+using ETab.UI;
 using ETab.WinAPI;
-using Microsoft.Win32;
 
 namespace ETab;
 
 /// <summary>
-/// Minimal WinForms tray icon. The tray menu is rarely inspected, so the menu
-/// is a plain system-themed context menu. The tray icon itself is drawn at the
+/// Hosts the notification icon and its WPF-only tray flyout while retaining the
+/// lightweight WinForms application loop. The tray icon itself is drawn at the
 /// exact physical size the notification area uses at the current DPI so it
-/// stays crisp (no downscaling) and fills the cell (not small).
+/// stays crisp (no downscaling) and fills the cell.
 /// </summary>
 public sealed class TrayIcon : IDisposable
 {
@@ -28,12 +29,6 @@ public sealed class TrayIcon : IDisposable
 
     private readonly NotifyIcon _notifyIcon;
     private readonly Icon _icon;
-    private readonly ContextMenuStrip _menu;
-    private readonly ToolStripMenuItem _autoStartItem;
-    private readonly ToolStripMenuItem _autoMergeItem;
-    private readonly ToolStripMenuItem _autoUpdateItem;
-    private readonly ToolStripMenuItem _installUpdateItem;
-    private readonly ToolStripMenuItem _updateItem;
     private readonly HotkeyWindow? _hotkey;
     private readonly ExplorerWatcher _watcher;
     private readonly CancellationTokenSource _lifetimeCancellation = new();
@@ -59,103 +54,122 @@ public sealed class TrayIcon : IDisposable
             Visible = true,
         };
 
-        _autoStartItem = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true };
-        _autoStartItem.Click += (_, _) => AutoStartManager.SetEnabled(_autoStartItem.Checked);
-
-        _autoMergeItem = new ToolStripMenuItem("Auto-merge new windows") { CheckOnClick = true };
-        _autoMergeItem.Checked = _watcher.IsHookActive;
-        _autoMergeItem.Click += (_, _) =>
-        {
-            if (_autoMergeItem.Checked) _watcher.StartHook();
-            else _watcher.StopHook();
-            Log.Info("Auto-merge setting changed to " + _autoMergeItem.Checked);
-        };
-
-        _autoUpdateItem = new ToolStripMenuItem("Automatic updates")
-        {
-            CheckOnClick = true,
-            Checked = SettingsManager.AutoUpdate,
-        };
-        _autoUpdateItem.Click += (_, _) =>
-        {
-            SettingsManager.AutoUpdate = _autoUpdateItem.Checked;
-            Log.Info("Automatic update setting changed to " + _autoUpdateItem.Checked);
-
-            if (_autoUpdateItem.Checked)
-                StartAutomaticUpdates();
-            else
-                StopAutomaticUpdates();
-        };
-
-        var mergeAllItem = new ToolStripMenuItem("Merge all windows (Ctrl+Shift+E)");
-        mergeAllItem.Click += (_, _) => _watcher.MergeAllWindowsNow();
-
-        _installUpdateItem = new ToolStripMenuItem
-        {
-            Visible = false,
-        };
-        _installUpdateItem.Click += (_, _) => InstallDownloadedUpdate();
-
-        _updateItem = new ToolStripMenuItem("Check for updates...");
-        _updateItem.Click += async (_, _) => await CheckForUpdatesAsync();
-
-        var exitItem = new ToolStripMenuItem("Exit");
-        exitItem.Click += (_, _) => ExitApplication();
-
-        var titleItem = new ToolStripMenuItem(
-            isPreviewBuild
-                ? $"E-Tab  v{version}  [PREVIEW BUILD]"
-                : $"E-Tab  v{version}")
-        {
-            Enabled = false,
-        };
-        ApplyItemStyle(titleItem, isTitle: true);
-        if (isPreviewBuild)
-            titleItem.ForeColor = Color.FromArgb(255, 174, 70);
-
-        _menu = new ContextMenuStrip
-        {
-            ShowImageMargin = false,
-            ShowCheckMargin = true,
-            BackColor = FluentMenuRenderer.Background,
-            ForeColor = FluentMenuRenderer.Text,
-            Padding = new Padding(4),
-        };
-        _menu.Renderer = new FluentMenuRenderer();
-        _menu.HandleCreated += (_, _) => ApplyRoundedCorners(_menu);
-
-        ApplyItemStyle(_autoStartItem, isTitle: false);
-        ApplyItemStyle(_autoMergeItem, isTitle: false);
-        ApplyItemStyle(_autoUpdateItem, isTitle: false);
-        ApplyItemStyle(mergeAllItem, isTitle: false);
-        ApplyItemStyle(_installUpdateItem, isTitle: false);
-        ApplyItemStyle(_updateItem, isTitle: false);
-        ApplyItemStyle(exitItem, isTitle: false);
-
-        _menu.Items.Add(titleItem);
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(_autoStartItem);
-        _menu.Items.Add(_autoMergeItem);
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(mergeAllItem);
-        _menu.Items.Add(_autoUpdateItem);
-        _menu.Items.Add(_installUpdateItem);
-        _menu.Items.Add(_updateItem);
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(exitItem);
-        _menu.Opening += (_, _) => _autoStartItem.Checked = AutoStartManager.IsEnabled();
-        _menu.Opening += (_, _) => _autoMergeItem.Checked = _watcher.IsHookActive;
-        _menu.Opening += (_, _) => UpdateMenuState();
-
-        _notifyIcon.ContextMenuStrip = _menu;
         _notifyIcon.MouseUp += (_, e) =>
         {
-            if (e.Button == MouseButtons.Left)
-                _menu.Show(Cursor.Position);
+            if (e.Button is not (MouseButtons.Left or MouseButtons.Right))
+                return;
+
+            if (TrayMenuWindow.IsOpen)
+            {
+                TrayMenuWindow.CloseCurrent();
+                return;
+            }
+
+            TrayMenuWindow.ShowMenu(
+                new System.Windows.Point(Cursor.Position.X, Cursor.Position.Y),
+                BuildMenuEntries(),
+                version,
+                isPreviewBuild);
         };
 
         _hotkey = new HotkeyWindow(_watcher, RestoreTrayIcon);
         StartAutomaticUpdates();
+    }
+
+    private IReadOnlyList<TrayMenuEntry> BuildMenuEntries()
+    {
+        var entries = new List<TrayMenuEntry>
+        {
+            new()
+            {
+                Header = "Start with Windows",
+                Icon = FluentGlyph.Power,
+                IsToggle = true,
+                IsChecked = AutoStartManager.IsEnabled(),
+                Command = ToggleStartWithWindows,
+            },
+            new()
+            {
+                Header = "Auto-merge new windows",
+                Icon = FluentGlyph.Switch,
+                IsToggle = true,
+                IsChecked = _watcher.IsHookActive,
+                Command = ToggleAutoMerge,
+            },
+            TrayMenuEntry.Separator(),
+            new()
+            {
+                Header = "Merge all windows",
+                Icon = FluentGlyph.Folder,
+                Shortcut = "Ctrl+Shift+E",
+                Command = _watcher.MergeAllWindowsNow,
+            },
+            TrayMenuEntry.Separator(),
+            new()
+            {
+                Header = "Automatic updates",
+                Icon = FluentGlyph.Sync,
+                IsToggle = true,
+                IsChecked = SettingsManager.AutoUpdate,
+                Command = ToggleAutomaticUpdates,
+            },
+        };
+
+        if (_downloadedUpdate is not null && _downloadedUpdatePath is not null)
+        {
+            entries.Add(new TrayMenuEntry
+            {
+                Header = $"Restart to install v{_downloadedUpdate.Version.ToString(3)}",
+                Icon = FluentGlyph.UpdateRestore,
+                IsAccent = true,
+                Command = InstallDownloadedUpdate,
+            });
+        }
+
+        entries.Add(new TrayMenuEntry
+        {
+            Header = _updateOperationInProgress ? "Update check in progress..." : "Check for updates",
+            Icon = FluentGlyph.Download,
+            IsEnabled = !_updateOperationInProgress,
+            Command = () => _ = CheckForUpdatesAsync(),
+        });
+        entries.Add(TrayMenuEntry.Separator());
+        entries.Add(new TrayMenuEntry
+        {
+            Header = "Exit",
+            Icon = FluentGlyph.SignOut,
+            IsDanger = true,
+            Command = ExitApplication,
+        });
+        return entries;
+    }
+
+    private void ToggleStartWithWindows()
+    {
+        var enabled = !AutoStartManager.IsEnabled();
+        AutoStartManager.SetEnabled(enabled);
+        Log.Info("Start with Windows changed to " + enabled);
+    }
+
+    private void ToggleAutoMerge()
+    {
+        var enabled = !_watcher.IsHookActive;
+        if (enabled)
+            _watcher.StartHook();
+        else
+            _watcher.StopHook();
+        Log.Info("Auto-merge setting changed to " + enabled);
+    }
+
+    private void ToggleAutomaticUpdates()
+    {
+        var enabled = !SettingsManager.AutoUpdate;
+        SettingsManager.AutoUpdate = enabled;
+        Log.Info("Automatic update setting changed to " + enabled);
+        if (enabled)
+            StartAutomaticUpdates();
+        else
+            StopAutomaticUpdates();
     }
 
     /// <summary>
@@ -276,13 +290,9 @@ public sealed class TrayIcon : IDisposable
             return;
         }
 
-        var originalText = _updateItem.Text;
         _updateOperationInProgress = true;
-        UpdateMenuState();
         try
         {
-            _updateItem.Text = "Checking for updates...";
-
             var update = await UpdateManager.CheckAsync(_lifetimeCancellation.Token);
             if (update is null)
             {
@@ -304,14 +314,12 @@ public sealed class TrayIcon : IDisposable
                 MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return;
 
-            _updateItem.Text = "Downloading update...";
             var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(
                 update,
                 _lifetimeCancellation.Token);
 
             StoreDownloadedUpdate(update, downloadedExecutable, notifyUser: false);
 
-            _updateItem.Text = "Restarting to update...";
             UpdateManager.StartUpdater(downloadedExecutable);
             Log.Info($"Update {update.Version} was downloaded; restarting to install it.");
             ExitApplication();
@@ -332,11 +340,6 @@ public sealed class TrayIcon : IDisposable
         finally
         {
             _updateOperationInProgress = false;
-            if (!_disposed)
-            {
-                _updateItem.Text = originalText;
-                UpdateMenuState();
-            }
         }
     }
 
@@ -396,10 +399,8 @@ public sealed class TrayIcon : IDisposable
         }
 
         _updateOperationInProgress = true;
-        UpdateMenuState();
         try
         {
-            _updateItem.Text = "Checking for updates...";
             var update = await UpdateManager.CheckAsync(cancellationToken);
             if (update is null)
             {
@@ -408,7 +409,6 @@ public sealed class TrayIcon : IDisposable
             }
 
             Log.Info($"Automatic update check found {update.Version}; downloading it.");
-            _updateItem.Text = "Downloading update...";
             var downloadedExecutable = await UpdateManager.DownloadExecutableAsync(
                 update,
                 cancellationToken);
@@ -432,11 +432,6 @@ public sealed class TrayIcon : IDisposable
         finally
         {
             _updateOperationInProgress = false;
-            if (!_disposed)
-            {
-                _updateItem.Text = "Check for updates...";
-                UpdateMenuState();
-            }
         }
     }
 
@@ -447,9 +442,6 @@ public sealed class TrayIcon : IDisposable
     {
         _downloadedUpdate = update;
         _downloadedUpdatePath = downloadedExecutable;
-        _installUpdateItem.Text =
-            $"Restart to install v{update.Version.ToString(3)}";
-        UpdateMenuState();
 
         if (!notifyUser || _disposed)
             return;
@@ -502,23 +494,12 @@ public sealed class TrayIcon : IDisposable
 
         _downloadedUpdate = null;
         _downloadedUpdatePath = null;
-        UpdateMenuState();
         MessageBox.Show(
             "The downloaded update is no longer available. " +
             "E-Tab will check for it again later.",
             "E-Tab update",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
-    }
-
-    private void UpdateMenuState()
-    {
-        if (_disposed)
-            return;
-
-        _autoUpdateItem.Checked = SettingsManager.AutoUpdate;
-        _installUpdateItem.Visible = _downloadedUpdatePath is not null;
-        _updateItem.Enabled = !_updateOperationInProgress;
     }
 
     public void Dispose()
@@ -531,134 +512,9 @@ public sealed class TrayIcon : IDisposable
         _notifyIcon.ContextMenuStrip = null;
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
-        _menu.Dispose();
         _icon.Dispose();
         _hotkey?.Dispose();
         _lifetimeCancellation.Dispose();
-    }
-
-    private static bool IsDarkMode()
-    {
-        try
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
-            return key?.GetValue("AppsUseLightTheme") is int v && v == 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static void ApplyRoundedCorners(ContextMenuStrip menu)
-    {
-        if (menu.Handle == 0) return;
-        var corner = WinApi.DWMWCP_ROUND;
-        WinApi.DwmSetWindowAttribute(menu.Handle, WinApi.DWMWA_WINDOW_CORNER_PREFERENCE, ref corner, sizeof(int));
-    }
-
-    private static void ApplyItemStyle(ToolStripMenuItem item, bool isTitle)
-    {
-        item.ForeColor = isTitle ? FluentMenuRenderer.TextDisabled : FluentMenuRenderer.Text;
-        item.Padding = new Padding(10, 7, 10, 7);
-    }
-
-    internal sealed class FluentMenuRenderer : ToolStripProfessionalRenderer
-    {
-        private static bool Dark => IsDarkMode();
-
-        public static Color Background => Dark ? Color.FromArgb(44, 44, 44) : Color.FromArgb(251, 251, 251);
-        public static Color Text => Dark ? Color.FromArgb(240, 240, 240) : Color.FromArgb(26, 26, 26);
-        public static Color TextDisabled => Dark ? Color.FromArgb(130, 130, 130) : Color.FromArgb(150, 150, 150);
-        private static Color Hover => Dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(232, 232, 232);
-        private static Color Separator => Dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(226, 226, 226);
-
-        public FluentMenuRenderer() : base(new FluentColorTable())
-        {
-            RoundedEdges = false;
-        }
-
-        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
-        {
-            if (!e.Item.Selected || !e.Item.Enabled) return;
-            var bounds = new Rectangle(0, 0, e.Item.Width, e.Item.Height);
-            using var brush = new SolidBrush(Hover);
-            FilledRoundRect(e.Graphics, bounds, 6f, brush);
-        }
-
-        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-        {
-            e.TextColor = e.Item.Enabled ? e.Item.ForeColor : TextDisabled;
-            base.OnRenderItemText(e);
-        }
-
-        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
-        {
-            var item = e.Item as ToolStripMenuItem;
-            if (item == null || !item.Checked) return;
-
-            var r = e.ImageRectangle;
-            if (r.Width <= 0 || r.Height <= 0) return;
-
-            var cx = r.X + r.Width / 2f;
-            var cy = r.Y + r.Height / 2f;
-            var w = Math.Min(r.Width, r.Height) * 0.62f;
-
-            using var pen = new Pen(Text, Math.Max(2f, w * 0.16f))
-            {
-                StartCap = LineCap.Round,
-                EndCap = LineCap.Round,
-                LineJoin = LineJoin.Round,
-            };
-
-            var p1 = new PointF(cx - w * 0.42f, cy - w * 0.02f);
-            var p2 = new PointF(cx - w * 0.12f, cy + w * 0.28f);
-            var p3 = new PointF(cx + w * 0.46f, cy - w * 0.34f);
-            e.Graphics.DrawLines(pen, new[] { p1, p2, p3 });
-        }
-
-        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
-        {
-            using var pen = new Pen(Separator);
-            var y = e.Item.Height / 2;
-            e.Graphics.DrawLine(pen, 10, y, e.Item.Width - 10, y);
-        }
-
-        private static void FilledRoundRect(Graphics g, Rectangle r, float radius, Brush brush)
-        {
-            using var path = new GraphicsPath();
-            var d = radius * 2f;
-            path.AddArc(r.X, r.Y, d, d, 180, 90);
-            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            g.FillPath(brush, path);
-        }
-    }
-
-    private sealed class FluentColorTable : ProfessionalColorTable
-    {
-        private static bool Dark => IsDarkMode();
-        private static Color Bg => Dark ? Color.FromArgb(44, 44, 44) : Color.FromArgb(251, 251, 251);
-        private static Color Hover => Dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(232, 232, 232);
-        private static Color Sep => Dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(226, 226, 226);
-
-        public override Color ToolStripDropDownBackground => Bg;
-        public override Color MenuBorder => Bg;
-        public override Color MenuItemSelected => Hover;
-        public override Color MenuItemBorder => Hover;
-        public override Color SeparatorDark => Sep;
-        public override Color SeparatorLight => Sep;
-        public override Color ImageMarginGradientBegin => Bg;
-        public override Color ImageMarginGradientMiddle => Bg;
-        public override Color ImageMarginGradientEnd => Bg;
-        public override Color CheckBackground => Bg;
-        public override Color CheckSelectedBackground => Hover;
-        public override Color CheckPressedBackground => Hover;
-        public override Color ButtonSelectedHighlight => Hover;
-        public override Color ButtonSelectedHighlightBorder => Hover;
-
     }
 
     /// <summary>
